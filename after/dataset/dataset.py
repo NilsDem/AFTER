@@ -22,6 +22,10 @@ class SimpleDataset(torch.utils.data.Dataset):
     ) -> None:
         super().__init__()
 
+        self.path = path
+
+        keys = keys
+
         self.num_sequential = num_sequential
         self.max_samples = max_samples
         self.recache_every = recache_every
@@ -120,7 +124,11 @@ class SimpleDataset(torch.utils.data.Dataset):
                 try:
                     out[key] = ae.get(key)
                 except:
-                    print("key: ", key, " not found")
+                    # key = key.replace("augment_shift_stretch_", "z_aug_")
+                    # print(key)
+                    # out[key] = ae.get(key)
+                    # print(out[key])
+                    print("key: ", key, " not found in : ", self.path)
 
         if "midi" in out.keys():
             midi = out["midi"]
@@ -156,7 +164,7 @@ class CombinedDataset(torch.utils.data.Dataset):
             self.datasets = {
                 k:
                 SimpleDataset(v["path"],
-                              keys=keys,
+                              keys=keys + ["metadata"],
                               max_samples=num_samples,
                               init_cache=init_cache,
                               split=config)
@@ -240,6 +248,6 @@ class CombinedDataset(torch.utils.data.Dataset):
 
         dataset_id = self.dataset_ids[idx]
         data = self.datasets[dataset_id][self.all_indexes[idx]]
-        data["label"] = dataset_id
+        data["metadata"]["label"] = dataset_id
 
         return data

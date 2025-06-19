@@ -24,9 +24,11 @@ flags.DEFINE_integer("step", default=0, help="Step number of checkpoint")
 flags.DEFINE_string("emb_model_path",
                     default="./pretrained/test.ts",
                     help="Path to audio codec")
-flags.DEFINE_integer("chunk_size", default=4, help="Chunk size")
+flags.DEFINE_integer("chunk_size", default=8, help="Chunk size")
 flags.DEFINE_integer("max_cache_size", default=128, help="Max cache size")
-flags.DEFINE_integer("n_poly", default=4, help="Number of polyphonic voices")
+flags.DEFINE_integer("n_poly", default=8, help="Number of polyphonic voices")
+flags.DEFINE_multi_float("ranges", [1., 1., 1., 1.],
+                         "Range to scale the latents")
 
 
 def main(argv):
@@ -35,7 +37,8 @@ def main(argv):
     checkpoint_path = folder + "/checkpoint" + str(FLAGS.step) + "_EMA.pt"
     config = folder + "/config.gin"
 
-    out_name = os.path.join(folder, "after.midi." + folder.split("/")[-1] + ".ts")
+    out_name = os.path.join(folder,
+                            "after.midi." + folder.split("/")[-1] + ".ts")
     # Parse config
     gin.parse_config_file(config)
     SR = gin.query_parameter("%SR")
@@ -61,7 +64,7 @@ def main(argv):
     # Get some parameters
     n_signal = gin.query_parameter('%N_SIGNAL')
     n_signal_timbre = gin.query_parameter('%N_SIGNAL')
-    zt_channels = gin.query_parameter("%ZT_CHANNELS")
+    zt_channels = 2  #gin.query_parameter("%ZT_CHANNELS")
     ae_latents = gin.query_parameter("%IN_SIZE")
 
     ## Trace the unet
@@ -78,6 +81,7 @@ def main(argv):
 
             self.net = blender.net
             self.encoder = blender.encoder
+            self.post_encoder = blender.post_encoder
             self.encoder_time = blender.encoder_time
 
             self.n_signal = n_signal
@@ -86,8 +90,7 @@ def main(argv):
             self.n_poly = FLAGS.n_poly
             self.zt_channels = zt_channels
             self.ae_latents = ae_latents
-            self.emb_model_timbre = torch.jit.load(
-                FLAGS.emb_model_path).eval()
+            self.emb_model_timbre = torch.jit.load(FLAGS.emb_model_path).eval()
 
             self.drop_value = blender.drop_value
 
@@ -98,6 +101,11 @@ def main(argv):
 
             self.sr = gin.query_parameter("%SR")
             self.zt_buffer = self.n_signal_timbre * self.ae_ratio
+
+            self.minx = FLAGS.ranges[0]
+            self.maxx = FLAGS.ranges[1]
+            self.miny = FLAGS.ranges[2]
+            self.maxy = FLAGS.ranges[3]
 
             ## ATTRIBUTES ##
             self.register_attribute("nb_steps", 1)
@@ -185,6 +193,23 @@ def main(argv):
                 output_labels=[f"(signal) Audio output"],
                 test_buffer_size=self.chunk_size * self.ae_ratio,
             )
+
+        @torch.jit.export
+        def unscale_to_original(self, zsem: torch.Tensor) -> torch.Tensor:
+            """
+            Rescales a (batch, 2) tensor from [-1, 1] back to original coordinate bounds.
+
+            Args:
+                coords: Tensor of shape (batch, 2) in range [-1, 1]
+                minx, maxx: Original bounds for x-axis
+                miny, maxy: Original bounds for y-axis
+
+            Returns:
+                Tensor of shape (batch, 2) in original coordinate space
+            """
+            x = 0.5 * (zsem[:, 0] + 1) * (self.maxx - self.minx) + self.minx
+            y = 0.5 * (zsem[:, 1] + 1) * (self.maxy - self.miny) + self.miny
+            return torch.stack([x, y], dim=1)
 
         @torch.jit.export
         def get_learn_zsem(self) -> bool:
@@ -301,6 +326,7 @@ def main(argv):
 
             zsem = self.encoder.forward_stream(
                 self.previous_timbre[:x.shape[0]])
+            zsem = self.post_encoder.forward_stream(zsem)
 
             zsem = zsem.unsqueeze(-1).repeat((1, 1, x.shape[-1]))
             return zsem
@@ -310,11 +336,11 @@ def main(argv):
 
             n = x.shape[0]
             zsem = x[:, -self.zt_channels:].mean(-1)
+            zsem = self.unscale_to_original(zsem)
 
             # Get the notes
             notes = x[:, :2 * self.n_poly]
             time_cond = torch.zeros((1, 128, x.shape[-1]))
-
 
             for i in range(self.n_poly):
                 for j in range(x.shape[-1]):

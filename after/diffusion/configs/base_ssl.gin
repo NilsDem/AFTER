@@ -14,10 +14,11 @@ N_SIGNAL_TIMBRE = None
 MAX_STEPS = 1000000
 
 ZS_CHANNELS = 12
-ZT_CHANNELS = 2
+ZT_CHANNELS = 64
+ZT_CHANNELS_OUT = 2
 SR = 44100
 STRUCTURE_TYPE = "audio"
-PHASE_1_STEP = 100000
+PHASE_1_STEP = 50000
 
 # Data
 diffusion.utils.collate_fn:
@@ -25,7 +26,7 @@ diffusion.utils.collate_fn:
     n_signal_timbre = %N_SIGNAL_TIMBRE
     structure_type = %STRUCTURE_TYPE
 
-diffusion.networks.transformer.MHAttention.local_window_size = 4
+diffusion.networks.transformer.MHAttention.local_window_size = 8
 
 ecapa_encoder_ssl.ECAPATDNN:
     attention_channels = 128
@@ -39,9 +40,8 @@ ecapa_encoder_ssl.ECAPATDNN:
     pooling = True
     res2net_scale = 8
     se_channels = 128
-    spherical_normalisation = False
+    spherical_normalisation = True
     use_tanh = False
-    regularisation = "ac"
 
 encoder_time/diffusion.networks.Encoder1D:
     in_size = %IN_SIZE
@@ -56,6 +56,15 @@ encoder_time/diffusion.networks.Encoder1D:
 
 encoder_time/convs.get_padding.mode = 'causal'
 
+
+post_encoder/diffusion.networks.LinearEncoder:
+    in_size=64
+    channels=[512, 1024, 1024, 256, %ZT_CHANNELS_OUT]
+    drop_out=0.15
+    use_tanh = False
+    regularisation = "ac"
+
+
 classifier/diffusion.networks.Encoder1D:
     in_size = %ZS_CHANNELS
     channels = [64, 64, 64, 64, %ZT_CHANNELS]
@@ -69,7 +78,7 @@ diffusion.networks.transformer.Denoiser:
     n_channels = %IN_SIZE
     seq_len = %N_SIGNAL   
     embed_dim = 512
-    cond_dim = %ZT_CHANNELS
+    cond_dim = %ZT_CHANNELS_OUT
     noise_embed_dims = 64
     n_layers = 6
     mlp_multiplier = 3
@@ -87,6 +96,7 @@ diffusion.model.Base:
     sr = %SR
     net= @diffusion.networks.transformer.Denoiser()
     encoder = @ecapa_encoder_ssl.ECAPATDNN()  
+    post_encoder = @post_encoder/diffusion.networks.LinearEncoder()
     encoder_time = @encoder_time/diffusion.networks.Encoder1D()    
     classifier = @classifier/diffusion.networks.Encoder1D()
     time_transform = None
@@ -97,7 +107,7 @@ diffusion.model.Base:
  
 diffusion.model.Base.fit: 
     max_steps = %MAX_STEPS
-    train_encoder = True
+    train_encoder = False
     train_encoder_time = True
 
     ## Adversarial
@@ -107,7 +117,7 @@ diffusion.model.Base.fit:
     stop_training_encoder_time_step = %MAX_STEPS
     update_classifier_every = 3
     adversarial_loss = "cosine"
-    adversarial_weight = 0.1
+    adversarial_weight = 0.125
 
     # Noise augmentation to smooth the latent space
     zsem_noise_aug = 0.025
@@ -122,7 +132,7 @@ diffusion.model.Base.fit:
     cycle_consistency = False
 
     ### DATA ###
-    shuffle_zsem = [4, 8]
+    shuffle_zsem = None
 
     ## Log ## 
     steps_valid = 10000

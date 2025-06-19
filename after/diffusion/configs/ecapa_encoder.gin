@@ -5,9 +5,9 @@ from after import diffusion
 encoder/diffusion.networks.ECAPATDNN:
     in_size = %IN_SIZE
     channels = [64,128,256,512, %ZT_CHANNELS]
-    use_tanh = False
+    use_tanh = True
     spherical_normalization = False
-    ac_regularisation = True
+    ac_regularisation = False
     pooling = True
     global_context = True
     attention_channels = 128

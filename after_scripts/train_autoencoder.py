@@ -209,7 +209,6 @@ def main(argv):
         trainer.load_model(path, step_restart, load_discrim=True)
     
     accelerator = Accelerator()
-
     dataloader, _, trainer.model, trainer.discriminator, trainer.opt, trainer.opt_dis = accelerator.prepare(
         dataloader, validloader,  trainer.model, trainer.discriminator, trainer.opt, trainer.opt_dis
     )

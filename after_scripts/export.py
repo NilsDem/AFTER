@@ -24,10 +24,12 @@ flags.DEFINE_integer("step", default=0, help="Step number of checkpoint")
 flags.DEFINE_string("emb_model_path",
                     default="./pretrained/test.ts",
                     help="Path to encoder model")
-flags.DEFINE_integer("chunk_size", default=8, help="Chunk size")
+flags.DEFINE_integer("chunk_size", default=4, help="Chunk size")
 flags.DEFINE_integer("max_cache_size",
                      default=128,
                      help="Training length (in number of latent samples)")
+flags.DEFINE_multi_float("ranges", [1., 1., 1., 1.],
+                         "Range to scale the latents")
 
 
 def main(argv):
@@ -54,6 +56,12 @@ def main(argv):
 
     # Load checkpoints
     state_dict = torch.load(checkpoint_path, map_location="cpu")["model_state"]
+
+    state_dict = {
+        k.replace("._orig_mod", ""): v
+        for k, v in state_dict.items()
+    }
+
     blender.load_state_dict(state_dict, strict=False)
 
     # Emb model
@@ -63,7 +71,7 @@ def main(argv):
     # Get some parameters
     n_signal = gin.query_parameter('%N_SIGNAL')
     n_signal_timbre = gin.query_parameter('%N_SIGNAL')
-    zt_channels = gin.query_parameter("%ZT_CHANNELS")
+    zt_channels = 2  #gin.query_parameter("%ZT_CHANNELS_POST")
     zs_channels = gin.query_parameter("%ZS_CHANNELS")
     ae_latents = gin.query_parameter("%IN_SIZE")
 
@@ -74,6 +82,7 @@ def main(argv):
 
             self.net = blender.net
             self.encoder = blender.encoder
+            self.post_encoder = blender.post_encoder
             self.encoder_time = blender.encoder_time
 
             self.n_signal = n_signal
@@ -87,6 +96,11 @@ def main(argv):
 
             self.emb_model_timbre = torch.jit.load(FLAGS.emb_model_path).eval()
 
+            self.minx = FLAGS.ranges[0]
+            self.maxx = FLAGS.ranges[1]
+            self.miny = FLAGS.ranges[2]
+            self.maxy = FLAGS.ranges[3]
+
             self.drop_value = blender.drop_value
 
             # Get the ae ratio
@@ -96,6 +110,18 @@ def main(argv):
 
             self.sr = gin.query_parameter("%SR")
             self.zt_buffer = self.n_signal_timbre * self.ae_ratio
+
+            ## LOAD THE PCA
+            pca_path = os.path.join(folder, "pca.pt")
+            if os.path.exists(pca_path):
+                pca = torch.load(pca_path)
+                self.mean = pca["mean"]
+                self.components = pca["components"]
+                print("Loading PCA")
+                self.use_pca = True
+            else:
+                self.use_pca = False
+                print("PCA Not Found")
 
             ## ATTRIBUTES ##
             self.register_attribute("nb_steps", 6)
@@ -247,6 +273,39 @@ def main(argv):
             self.nb_steps = (nb_steps, )
             return 0
 
+        def project_pca(self, data):
+            data = torch.permute(data, (0, 2, 1))
+            data_centered = data - self.mean
+            projected = torch.matmul(data_centered,
+                                     self.components.T)  # [N, n_components]
+            # project = projected.T  # return as [n_components, N]
+            return torch.permute(projected, (0, 2, 1))  # [N, n_components]
+
+        def backproject_pca(self, projected):
+            projected = torch.permute(projected,
+                                      (0, 2, 1))  # [N, n_components]
+            # projected = projected.T  # [N, n_components]
+            reconstructed = torch.matmul(projected,
+                                         self.components) + self.mean
+            return torch.permute(reconstructed, (0, 2, 1))  # [C, N]
+
+        @torch.jit.export
+        def unscale_to_original(self, zsem: torch.Tensor) -> torch.Tensor:
+            """
+            Rescales a (batch, 2) tensor from [-1, 1] back to original coordinate bounds.
+
+            Args:
+                coords: Tensor of shape (batch, 2) in range [-1, 1]
+                minx, maxx: Original bounds for x-axis
+                miny, maxy: Original bounds for y-axis
+
+            Returns:
+                Tensor of shape (batch, 2) in original coordinate space
+            """
+            x = 0.5 * (zsem[:, 0] + 1) * (self.maxx - self.minx) + self.minx
+            y = 0.5 * (zsem[:, 1] + 1) * (self.maxy - self.miny) + self.miny
+            return torch.stack([x, y], dim=1)
+
         def model_forward(self, x: torch.Tensor, time: torch.Tensor,
                           cond: torch.Tensor, time_cond: torch.Tensor,
                           cache_index: int) -> torch.Tensor:
@@ -316,13 +375,15 @@ def main(argv):
 
             zsem = self.encoder.forward_stream(
                 self.previous_timbre[:x.shape[0]])
-
+            zsem = self.post_encoder.forward_stream(zsem)
             return zsem.unsqueeze(-1).repeat((1, 1, self.chunk_size))
 
         @torch.jit.export
         def structure(self, x) -> torch.Tensor:
             x = self.emb_model_structure.encode(x)
             x = self.encoder_time.forward_stream(x)
+            if self.use_pca:
+                x = self.project_pca(x)
             return x
 
         @torch.jit.export
@@ -330,8 +391,14 @@ def main(argv):
 
             n = x.shape[0]
             zsem = x[:, -self.zt_channels:].mean(-1)
+            zsem = self.unscale_to_original(zsem)
             time_cond = x[:, :self.zs_channels]
+
+            if self.use_pca:
+                time_cond = self.backproject_pca(time_cond)
+
             x = torch.randn(n, self.ae_latents, x.shape[-1])
+
             x = self.sample(x[:1], time_cond=time_cond[:1], cond=zsem[:1])
 
             if n > 1:
@@ -362,7 +429,7 @@ def main(argv):
 
     streamer = Streamer()
 
-    dummmy = torch.randn(1, zs_channels + zt_channels, 128)
+    dummmy = torch.randn(1, zs_channels + zt_channels, FLAGS.max_cache_size)
     out = streamer.diffuse(dummmy)
     streamer.export_to_ts(out_name)
 

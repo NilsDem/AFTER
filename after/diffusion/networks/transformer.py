@@ -58,6 +58,47 @@ def chunk_wise_causal_mask(seq_len: int, chunk_size: int):
     return 1 - mask  # Convert to mask format (1 = masked, 0 = allowed)
 
 
+def combined_sliding_chunkwise_mask(seq_len: int, chunk_size: int,
+                                    window_size: int) -> torch.Tensor:
+    """
+    Combined chunk-wise + sliding window causal mask.
+
+    - Full attention within each chunk.
+    - Attend to all previous chunks.
+    - Optionally: attend to sliding window before chunk.
+
+    Args:
+        seq_len: total sequence length
+        chunk_size: size of each chunk
+        window_size: size of sliding window (set to -1 for no window)
+
+    Returns:
+        mask: Tensor (seq_len, seq_len), with 1 = masked, 0 = allowed
+    """
+    mask = torch.ones(seq_len, seq_len)  # Start fully masked
+
+    for i in range(0, seq_len, chunk_size):
+        end = min(i + chunk_size, seq_len)
+
+        # Allow full attention within chunk
+        mask[i:end, i:end] = 0
+
+        # Allow attention to all past tokens (pure chunk-wise)
+
+        # Optionally limit past attention with a sliding window
+        if window_size >= 0:
+            for j in range(i, end):
+
+                sliding_start = max(0, j - window_size + 1)
+
+                mask[j, sliding_start:
+                     i] = 0  # Overwrite earlier full-past with limited window
+        else:
+            mask[i:end, :i] = 0
+
+    return mask
+
+
 #@torch.jit.interface
 #class ModuleInterface(torch.nn.Module):
 #
@@ -83,6 +124,7 @@ class CacheModule(nn.Module):
         self.v_cache = v
 
 
+@gin.configurable
 class MHAttention(nn.Module):
 
     def __init__(self,
@@ -93,6 +135,7 @@ class MHAttention(nn.Module):
                  rotary_emb: nn.Module = None,
                  embed_dim: int = 256,
                  min_chunk_size: int = 1,
+                 local_window_size: int = -1,
                  max_num_cache=16,
                  max_batch_size=4):
         super().__init__()
@@ -105,10 +148,10 @@ class MHAttention(nn.Module):
             self.register_buffer('last_v', None)
 
             k_cache = torch.zeros((max_batch_size, max_num_cache, n_heads,
-                                max_cache_size, embed_dim // n_heads))
+                                   max_cache_size, embed_dim // n_heads))
 
             v_cache = torch.zeros((max_batch_size, max_num_cache, n_heads,
-                                max_cache_size, embed_dim // n_heads))
+                                   max_cache_size, embed_dim // n_heads))
             self.register_buffer('k_cache', k_cache)
             self.register_buffer('v_cache', v_cache)
 
@@ -124,6 +167,9 @@ class MHAttention(nn.Module):
 
         self.rearrange_heads2 = Rearrange("bs h n d -> bs n (h d)",
                                           h=self.n_heads)
+
+        self.save_attn = False
+        self.local_window_size = local_window_size
 
     def get_buffers(self, i: int):
         k_cache, v_cache = self.k_cache[:, i], self.v_cache[:, i]
@@ -152,6 +198,10 @@ class MHAttention(nn.Module):
 
         self.set_buffers(k_cache, v_cache, cache_index)
 
+        # if cache_index == 0:
+        #     print(k_cache.shape)
+        #     print(k_cache[0, 0, :, 0])
+
     def forward(self, q, k, v, cache_index: int):
         q, k, v = [self.rearrange_heads1(x) for x in [q, k, v]]
 
@@ -174,8 +224,8 @@ class MHAttention(nn.Module):
             full_v = v
 
         if self.is_causal:
-            attn_mask = chunk_wise_causal_mask(full_k.shape[2],
-                                               self.min_chunk_size)
+            attn_mask = combined_sliding_chunkwise_mask(
+                full_k.shape[2], self.min_chunk_size, self.local_window_size)
             attn_mask = attn_mask[-q.shape[2]:]
             attn_mask = attn_mask.masked_fill(attn_mask == 1,
                                               float('-inf')).to(k)
@@ -185,6 +235,20 @@ class MHAttention(nn.Module):
         if self.rotary_emb is not None:
             q, full_k = self.rotary_emb.rotate_queries_with_cached_keys(
                 q, full_k)
+
+        # if self.save_attn:
+        #     # Manual scaled dot-product attention
+        #     d = q.shape[-1]
+        #     scores = torch.matmul(q, full_k.transpose(
+        #         -2, -1)) / d**0.5  # [B, H, T, T]
+
+        #     if attn_mask is not None:
+        #         scores = scores + attn_mask
+
+        #     attn = torch.softmax(scores, dim=-1)
+
+        #     self.attn_weights = attn.detach().cpu(
+        #     )  # Save for later inspection
 
         out = nn.functional.scaled_dot_product_attention(
             q,

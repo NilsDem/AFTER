@@ -109,13 +109,17 @@ class Base(nn.Module):
     def init_train(self, lr, dataloader):
         params = list(self.net.parameters())
 
-        if self.encoder is not None:
+        if self.encoder is not None and self.train_encoder:
             print("training encoder")
             params += list(self.encoder.parameters())
 
         if self.encoder_time is not None:
             print("training encoder_time")
             params += list(self.encoder_time.parameters())
+
+        if self.post_encoder is not None:
+            print("training post_encoder")
+            params += list(self.post_encoder.parameters())
 
         if self.classifier is not None:
             self.opt_classifier = AdamW(self.classifier.parameters(),
@@ -221,7 +225,8 @@ class Base(nn.Module):
             cycle_loss_type="cosine",
             cycle_swap_target="cond",
             cycle_scaling=False,
-            regularisation_weight=0.0,
+            regularisation_weight_encoder=1.0,
+            regularisation_weight_encoder_time=1.0,
             regularisation_warmup=50000,
             drop_targets="both",
             steps_valid=5000,
@@ -233,7 +238,9 @@ class Base(nn.Module):
             update_classifier_every=2,
             load_encoders=[True, True, True],
             zsem_noise_aug=0.,
-            time_cond_noise_aug=0.):
+            time_cond_noise_aug=0.,
+            compile=False,
+            **kwargs):
 
         self.train_encoder = train_encoder
         self.train_encoder_time = train_encoder_time
@@ -241,6 +248,16 @@ class Base(nn.Module):
         self.max_steps = max_steps
 
         self.init_train(lr=lr, dataloader=validloader)
+
+        if compile:
+            print("Compiling model...")
+            self.net = torch.compile(self.net)
+            self.encoder = torch.compile(self.encoder)
+            self.encoder_time = torch.compile(self.encoder_time)
+            if self.post_encoder is not None:
+                self.post_encoder = torch.compile(self.post_encoder)
+            if self.classifier is not None:
+                self.classifier = torch.compile(self.classifier)
 
         if restart_step is not None and restart_step > 0:
             state_dict = torch.load(f"{model_dir}/checkpoint" +
@@ -280,7 +297,7 @@ class Base(nn.Module):
 
         # Loging
         logger = SummaryWriter(log_dir=model_dir + "/logs")
-        self.tepoch = tqdm(total=max_steps, unit="batch")
+        self.tepoch = tqdm(total=max_steps, unit="batch", initial=self.step)
 
         n_epochs = max_steps // len(dataloader) + 1
         if restart_step is not None:
@@ -332,7 +349,17 @@ class Base(nn.Module):
                     cond, cond_mean, cond_reg = self.encoder(x1_cond,
                                                              return_full=True)
 
-                cond = cond + zsem_noise_aug * torch.randn_like(cond)
+                if self.post_encoder is not None:
+                    cond_diffusion, _, cond_post_reg = self.post_encoder(
+                        cond, return_full=True)
+                    cond_diffusion = cond_diffusion + zsem_noise_aug * torch.randn_like(
+                        cond_diffusion)
+
+                    cond_reg = cond_post_reg
+
+                else:
+                    cond_diffusion = cond + zsem_noise_aug * torch.randn_like(
+                        cond)
 
                 if self.encoder_time is not None:
                     if self.step < timbre_warmup:
@@ -364,7 +391,10 @@ class Base(nn.Module):
                                         ] if drop_targets == "both" else [1]
 
                     cond_drop, time_cond_drop = self.cfgdrop(
-                        [cond, time_cond],
+                        [
+                            cond_diffusion
+                            if cond_diffusion is not None else cond, time_cond
+                        ],
                         bsize=x1.shape[0],
                         drop_targets=drop_targets,
                         drop_rate=self.drop_rate)
@@ -422,8 +452,9 @@ class Base(nn.Module):
 
                     if cycle_consistency and self.step > cycle_start_step:
                         cond_cycle_loss, time_cond_cycle_loss = self.cycle_step(
-                            interpolant, t, time_cond, cond, cycle_mode,
-                            cycle_swap_target, cycle_loss_type, cycle_scaling)
+                            interpolant, t, time_cond, cond, cond_diffusion,
+                            cycle_mode, cycle_swap_target, cycle_loss_type,
+                            cycle_scaling)
 
                     else:
                         cond_cycle_loss = torch.tensor(0.)
@@ -434,9 +465,14 @@ class Base(nn.Module):
                         adversarial_weight * (self.step - timbre_warmup) /
                         (adversarial_warmup), adversarial_weight)
 
-                    regularisation_weight_cur = min(
-                        regularisation_weight * self.step /
-                        (regularisation_warmup), regularisation_weight)
+                    regularisation_weight_encoder_cur = min(
+                        regularisation_weight_encoder * self.step /
+                        (regularisation_warmup), regularisation_weight_encoder)
+
+                    regularisation_weight_encoder_time_cur = min(
+                        regularisation_weight_encoder_time * self.step /
+                        (regularisation_warmup),
+                        regularisation_weight_encoder_time)
 
                     # log losses
                     cycle_weights_cur = cycle_weights if self.step > cycle_start_step else [
@@ -448,8 +484,10 @@ class Base(nn.Module):
                         "Classifier loss": classifier_loss.item(),
                         "Adversarial Regularisation weight":
                         adversarial_weight_cur,
-                        "Latent Regularisation weight":
-                        regularisation_weight_cur,
+                        "Latent Regularisation weight encoder":
+                        regularisation_weight_encoder_cur,
+                        "Latent Regularisation weight encoder_time":
+                        regularisation_weight_encoder_time_cur,
                         "Cycle loss - cond": cond_cycle_loss.item(),
                         "Cycle loss - time_cond": time_cond_cycle_loss.item(),
                         "Cycle weight - cond": cycle_weights_cur[0],
@@ -460,8 +498,8 @@ class Base(nn.Module):
 
                     loss = diffusion_loss - adversarial_weight_cur * classifier_loss + cycle_weights_cur[
                         0] * cond_cycle_loss + cycle_weights_cur[
-                            1] * time_cond_cycle_loss + regularisation_weight_cur * cond_reg.mean(
-                            ) + regularisation_weight_cur * time_cond_reg.mean(
+                            1] * time_cond_cycle_loss + regularisation_weight_encoder_cur * cond_reg.mean(
+                            ) + regularisation_weight_encoder_time_cur * time_cond_reg.mean(
                             )
 
                     self.opt.zero_grad()
@@ -507,8 +545,12 @@ class Base(nn.Module):
                                 time_cond = self.drop_value * torch.ones_like(
                                     time_cond)
 
+                            if self.post_encoder is not None:
+                                cond_diffusion = self.post_encoder(cond)
+                            else:
+                                cond_diffusion = cond
                             diffusion_loss, _, _ = self.diffusion_step(
-                                x1, time_cond=time_cond, cond=cond)
+                                x1, time_cond=time_cond, cond=cond_diffusion)
 
                             lossdict = {
                                 "Diffusion loss": diffusion_loss.item(),
@@ -545,7 +587,7 @@ class Base(nn.Module):
                         ## SAMPLING
                         x1 = x1[:6].to(self.device)
                         time_cond = time_cond[:6] if time_cond is not None else None
-                        cond = cond[:6] if cond is not None else None
+                        cond = cond_diffusion[:6] if cond is not None else None
                         x0 = self.sample_prior(x1.shape)
 
                         audio_true = self.emb_model.decode(x1.cpu()).cpu()
@@ -590,11 +632,34 @@ class RectifiedFlow(Base):
     def smooth_function_cond(self, x, slope=7):
         return 0.5 * (1 + torch.tanh(slope * (0.4 - x)))
 
+    def cycle_loss(self, rec, target, loss):
+        if loss == "mse":
+            cycle_loss = torch.nn.functional.mse_loss(rec,
+                                                      target.detach(),
+                                                      reduction='none')
+
+        elif "mse_margin" in loss:
+            margin = float(loss.split("_")[-1])
+            cycle_loss = torch.maximum(
+                torch.tensor(margin),
+                torch.nn.functional.mse_loss(rec,
+                                             target.detach(),
+                                             reduction='none'))
+
+        elif loss == "cosine":
+            cycle_loss = (1 - torch.nn.functional.cosine_similarity(
+                rec, target.detach(), dim=1, eps=1e-8))
+
+        else:
+            raise ValueError("Invalid cycle loss type : " + loss)
+        return cycle_loss
+
     def cycle_step(self,
                    interpolant,
                    t,
                    time_cond,
                    cond,
+                   cond_diffusion,
                    cycle_mode="interpolant",
                    cycle_swap_target="cond",
                    cycle_loss_type="cosine",
@@ -604,10 +669,17 @@ class RectifiedFlow(Base):
             time_cond_target = time_cond[torch.randperm(time_cond.shape[0])]
             cond_target = cond
 
+            indices_tc_swap = permutation
+            indices_c_swap = None
+
         elif cycle_swap_target == "cond":
             permutation = torch.randperm(cond.shape[0])
             time_cond_target = time_cond
             cond_target = cond[permutation]
+            cond_target_diffusion = cond_diffusion[permutation]
+
+            indices_tc_swap = None
+            indices_c_swap = permutation
 
         elif cycle_swap_target == "alternate":
             n = time_cond.shape[0]
@@ -617,17 +689,29 @@ class RectifiedFlow(Base):
             cond_target = cond.clone()
             cond_target[indices[n // 2:]] = cond[indices[:n // 2]]
 
+            cond_target_diffusion = cond_diffusion.clone()
+            cond_target_diffusion[indices[n //
+                                          2:]] = cond_diffusion[indices[:n //
+                                                                        2]]
+
+            indices_tc_swap = indices[:n // 2]
+            indices_c_swap = indices[n // 2:]
+
         time_cond_target = time_cond_target.detach()
         cond_target = cond_target.detach()
+        cond_target_diffusion = cond_target_diffusion.detach()
 
         if cycle_mode == "interpolant":
             model_output_transfer = self.net(interpolant,
                                              time=t,
                                              time_cond=time_cond_target,
-                                             cond=cond_target)
+                                             cond=cond_target_diffusion)
             x_transfer = interpolant + (1 - t) * model_output_transfer
 
             cond_rec = self.encoder(x_transfer)
+            # cond_rec = self.post_encoder(
+            #     cond_rec) if self.post_encoder is not None else cond_rec
+
             time_cond_rec = self.encoder_time(x_transfer)
 
         elif cycle_mode == "sample":
@@ -648,39 +732,24 @@ class RectifiedFlow(Base):
                                              cond=cond_target)
             x_transfer = interpolant + (1 - t) * model_output_transfer
             cond_rec = self.encoder(x_transfer)
+            # cond_rec = self.post_encoder(
+            #     cond_rec) if self.post_encoder is not None else cond_rec
             time_cond_rec = self.encoder_time(x_transfer)
 
-        if cycle_loss_type == "mse":
-            cond_cycle_loss = torch.nn.functional.mse_loss(
-                cond_rec, cond_target.detach(), reduction='none')
-
-            time_cond_cycle_loss = torch.nn.functional.mse_loss(
-                time_cond_rec, time_cond_target, reduction="none")
-
-        elif "mse_margin" in cycle_loss_type:
-            margin = float(cycle_loss_type.split("_")[-1])
-            cond_cycle_loss = torch.maximum(
-                torch.tensor(margin),
-                torch.nn.functional.mse_loss(cond_rec,
-                                             cond_target.detach(),
-                                             reduction='none'))
-
-            time_cond_cycle_loss = torch.maximum(
-                torch.tensor(margin),
-                torch.nn.functional.mse_loss(time_cond_rec,
-                                             time_cond_target,
-                                             reduction="none"))
-
-        elif cycle_loss_type == "cosine":
-            cond_cycle_loss = (1 - torch.nn.functional.cosine_similarity(
-                cond_rec, cond_target.detach(), dim=1, eps=1e-8)).mean()
-
-            time_cond_cycle_loss = (1 - torch.nn.functional.cosine_similarity(
-                time_cond_rec, time_cond_target.detach(), dim=1,
-                eps=1e-8)).mean()
+        if indices_tc_swap is not None:
+            cond_cycle_loss = self.cycle_loss(cond_rec[indices_tc_swap],
+                                              cond_target[indices_tc_swap],
+                                              loss=cycle_loss_type[0])
         else:
-            raise ValueError("Invalid cycle loss type : " + cycle_loss_type)
+            cond_cycle_loss = torch.tensor(0.)
 
+        if indices_c_swap is not None:
+            time_cond_cycle_loss = self.cycle_loss(
+                time_cond_rec[indices_c_swap],
+                time_cond_target[indices_c_swap],
+                loss=cycle_loss_type[1])
+        else:
+            time_cond_cycle_loss = torch.tensor(0.)
         if cycle_scaling == "natural":
             with torch.no_grad():
                 model_output_nocond = self.net(interpolant,
@@ -733,26 +802,67 @@ class RectifiedFlow(Base):
 
         return loss, interpolant, t
 
-    def model_forward(self,
-                      x,
-                      time,
-                      cond,
-                      time_cond,
-                      guidance_cond_factor,
-                      guidance_joint_factor,
-                      total_guidance,
-                      cache_index=0):
+    # def model_forward(self,
+    #                   x,
+    #                   time,
+    #                   cond,
+    #                   time_cond,
+    #                   guidance_cond_factor,
+    #                   guidance_joint_factor,
+    #                   total_guidance,
+    #                   cache_index=0):
 
-        full_time = time.repeat(4, 1, 1)
-        full_x = x.repeat(4, 1, 1)
+    #     full_time = time.repeat(4, 1, 1)
+    #     full_x = x.repeat(4, 1, 1)
+
+    #     full_cond = torch.cat([
+    #         cond, self.drop_value * torch.ones_like(cond),
+    #         self.drop_value * torch.ones_like(cond), cond
+    #     ])
+    #     full_time_cond = torch.cat([
+    #         time_cond, self.drop_value * torch.ones_like(time_cond), time_cond,
+    #         self.drop_value * torch.ones_like(time_cond)
+    #     ])
+
+    #     dx = self.net(full_x,
+    #                   time=full_time,
+    #                   cond=full_cond,
+    #                   time_cond=full_time_cond,
+    #                   cache_index=cache_index)
+
+    #     dx_full, dx_none, dx_time_cond, dx_cond = torch.chunk(dx, 4, dim=0)
+
+    #     dx = dx_none + total_guidance * (guidance_joint_factor *
+    #                                      (dx_full - dx_none) +
+    #                                      (1 - guidance_joint_factor) *
+    #                                      (guidance_cond_factor *
+    #                                       (dx_cond - dx_none) +
+    #                                       (1 - guidance_cond_factor) *
+    #                                       (dx_time_cond - dx_none)))
+    #     return dx
+
+    def model_forward(self,
+                      x: torch.Tensor,
+                      time: torch.Tensor,
+                      cond: torch.Tensor,
+                      time_cond: torch.Tensor,
+                      guidance_timbre: float,
+                      guidance_structure: float,
+                      cache_index: int = 0) -> torch.Tensor:
+
+        full_time = time.repeat(3, 1, 1)
+        full_x = x.repeat(3, 1, 1)
 
         full_cond = torch.cat([
-            cond, self.drop_value * torch.ones_like(cond),
-            self.drop_value * torch.ones_like(cond), cond
+            cond,
+            self.drop_value * torch.ones_like(cond),
+            self.drop_value * torch.ones_like(cond),
         ])
+
         full_time_cond = torch.cat([
-            time_cond, self.drop_value * torch.ones_like(time_cond), time_cond,
-            self.drop_value * torch.ones_like(time_cond)
+            time_cond,
+            time_cond,
+            self.drop_value * torch.ones_like(time_cond),
         ])
 
         dx = self.net(full_x,
@@ -761,15 +871,15 @@ class RectifiedFlow(Base):
                       time_cond=full_time_cond,
                       cache_index=cache_index)
 
-        dx_full, dx_none, dx_time_cond, dx_cond = torch.chunk(dx, 4, dim=0)
+        dx_full, dx_time_cond, dx_none = torch.chunk(dx, 3, dim=0)
 
-        dx = dx_none + total_guidance * (guidance_joint_factor *
-                                         (dx_full - dx_none) +
-                                         (1 - guidance_joint_factor) *
-                                         (guidance_cond_factor *
-                                          (dx_cond - dx_none) +
-                                          (1 - guidance_cond_factor) *
-                                          (dx_time_cond - dx_none)))
+        total_guidance = 0.5 * (guidance_structure + guidance_timbre)
+
+        guidance_cond_factor = guidance_timbre / (max(guidance_structure, 0.1))
+
+        dx = dx_none + total_guidance * (dx_time_cond + guidance_cond_factor *
+                                         (dx_full - dx_time_cond) - dx_none)
+
         return dx
 
     @torch.no_grad()
@@ -778,18 +888,27 @@ class RectifiedFlow(Base):
                cond,
                time_cond,
                nb_steps,
-               guidance_cond_factor=0.,
-               guidance_joint_factor=1.,
-               total_guidance=1.):
+               guidance_timbre=1.,
+               guidance_structure=1.):
         dt = 1 / nb_steps
         t_values = torch.linspace(0, 1, nb_steps + 1).to(self.device)[:-1]
         x = x0.to(self.device)
-
-        for t in t_values:
+        for i, t in enumerate(t_values):
             t = t.reshape(1, 1, 1).repeat(x.shape[0], 1, 1)
             x = x + self.model_forward(
-                x, t, cond, time_cond, guidance_cond_factor,
-                guidance_joint_factor, total_guidance) * dt
+                x=x,
+                time=t,
+                cond=cond,
+                time_cond=time_cond,
+                guidance_timbre=guidance_timbre,
+                guidance_structure=guidance_structure,
+                cache_index=i,
+            ) * dt
+
+            #self.net.roll_cache(x.shape[-1], i)
+
+
+# cache_index=i/
 
         return x
 

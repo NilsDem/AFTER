@@ -112,7 +112,7 @@ class TimeStretch(BaseTransform):
 
         if random_silence:
             self.silence_transform = TimeMask(
-                min_band_part=0.075,
+                min_band_part=0.05,
                 max_band_part=0.1,
                 fade=True,
                 p=1.0,
@@ -155,7 +155,7 @@ class PSTS(BaseTransform):
         if random_silence:
             self.silence_transform = TimeMask(
                 min_band_part=0.07,
-                max_band_part=0.15,
+                max_band_part=0.12,
                 fade=True,
                 p=1.0,
             )
@@ -207,6 +207,7 @@ class PSTS(BaseTransform):
     def __call__(self, audio):
         audio = self.process_audio(audio)
         if self.silence_transform is not None:
+            audio = self.silence_transform(audio, sample_rate=self.sr)
             audio = self.silence_transform(audio, sample_rate=self.sr)
             audio = self.silence_transform(audio, sample_rate=self.sr)
         return audio

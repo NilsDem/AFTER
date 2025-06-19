@@ -41,7 +41,7 @@ ecapa_encoder_ssl.ECAPATDNN:
     se_channels = 128
     spherical_normalisation = False
     use_tanh = False
-    regularisation = "ac"
+    regularisation = "vae"
 
 encoder_time/diffusion.networks.Encoder1D:
     in_size = %IN_SIZE
@@ -110,11 +110,11 @@ diffusion.model.Base.fit:
     adversarial_weight = 0.1
 
     # Noise augmentation to smooth the latent space
-    zsem_noise_aug = 0.025
+    zsem_noise_aug = 0.
     time_cond_noise_aug = 0.
 
     ## Encoder regularisation
-    regularisation_weight_encoder = 1.
+    regularisation_weight_encoder = 0.0001
     regularisation_weight_encoder_time = 0.0001
     regularisation_warmup = 1
 
@@ -127,6 +127,6 @@ diffusion.model.Base.fit:
     ## Log ## 
     steps_valid = 10000
     steps_save = 50000
-    
+   
     use_ema = True
     lr = 1e-4

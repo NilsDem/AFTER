@@ -2,6 +2,7 @@ import gin
 
 #gin.add_config_file_search_path('./after/diffusion/configs')
 import torch
+import torch.nn as nn
 import os
 import numpy as np
 
@@ -9,6 +10,7 @@ import after
 from after.dataset import SimpleDataset, CombinedDataset
 from after.diffusion.utils import collate_fn
 from tqdm import tqdm
+from music2latent import EncoderDecoder
 
 from absl import flags, app
 
@@ -25,7 +27,8 @@ flags.DEFINE_string("model", "rectified", "Model type.")
 flags.DEFINE_integer("bsize", 32, "Batch size.")
 flags.DEFINE_integer("n_signal", 128,
                      "Training length in number of latent steps")
-
+flags.DEFINE_integer("n_signal_timbre", None,
+                     "Training length at the timbre encoder input")
 # DATASET
 flags.DEFINE_multi_string(
     "db_path", None, "Database path. Use multiple for combined datasets.")
@@ -42,6 +45,10 @@ flags.DEFINE_multi_string("augmentation_keys", ["all"],
                           "List of augmentation keys.")
 
 flags.DEFINE_bool("use_validation", True, "Use a train/validation split")
+flags.DEFINE_bool("load_config", True, "Load config from restart")
+
+flags.DEFINE_string("load_encoder", None, "Path to encoder to load")
+flags.DEFINE_integer("load_encoder_step", None, "Step to load encoder")
 
 
 def add_gin_extension(config_name: str) -> str:
@@ -50,16 +57,32 @@ def add_gin_extension(config_name: str) -> str:
     return config_name
 
 
+class M2LWrapper(nn.Module):
+
+    def __init__(self):
+        super(M2LWrapper, self).__init__()
+        self.model = EncoderDecoder()
+
+    def encode(self, x):
+        x = x.squeeze(1)
+        return self.model.encode(x)
+
+    def decode(self, x):
+        return self.model.decode(x)
+
+
 def main(argv):
 
     print(FLAGS.config)
+
+    torch.set_float32_matmul_precision('high')
 
     gin.parse_config_files_and_bindings(
         map(add_gin_extension, FLAGS.config),
         [],
     )
 
-    if FLAGS.restart is not None:
+    if FLAGS.restart is not None and FLAGS.load_config:
         config_path = os.path.join(FLAGS.out_path, FLAGS.name, "config.gin")
         with gin.unlock_config():
             gin.parse_config_files_and_bindings([config_path], [])
@@ -67,12 +90,18 @@ def main(argv):
     device = "cuda:" + str(FLAGS.gpu) if FLAGS.gpu >= 0 else "cpu"
 
     ######### BUILD MODEL #########
+    if FLAGS.emb_model_path == "music2latent":
+        emb_model = M2LWrapper()
+        ae_ratio = 4096
+        ae_emb_size = 64
+    else:
+        emb_model = torch.jit.load(FLAGS.emb_model_path)  #.to(device)
 
-    emb_model = torch.jit.load(FLAGS.emb_model_path)  #.to(device)
-    dummy = torch.randn(1, 1, 4096)  #.to(device)
-    z = emb_model.encode(dummy)
-    ae_emb_size = z.shape[1]
-    ae_ratio = 4096 // z.shape[-1]
+        dummy = torch.randn(1, 1, 4096 * 4)  #.to(device)
+        z = emb_model.encode(dummy)
+        ae_emb_size = z.shape[1]
+        print(z.shape)
+        ae_ratio = (4096 * 4) // z.shape[-1]
 
     print("using a codec with - compression ratio : ", ae_ratio,
           " - emb size : ", ae_emb_size)
@@ -80,10 +109,17 @@ def main(argv):
     with gin.unlock_config():
         gin.bind_parameter("diffusion.utils.collate_fn.ae_ratio", ae_ratio)
         gin.bind_parameter("%IN_SIZE", ae_emb_size)
+        print(ae_emb_size)
 
         if gin.query_parameter("%N_SIGNAL") is None:
             print("setting n_signal with FLAGS")
             gin.bind_parameter("%N_SIGNAL", FLAGS.n_signal)
+
+            if FLAGS.n_signal_timbre is not None:
+                gin.bind_parameter("%N_SIGNAL_TIMBRE", FLAGS.n_signal_timbre)
+            else:
+                gin.bind_parameter("%N_SIGNAL_TIMBRE",
+                                   gin.query_parameter("%N_SIGNAL"))
 
     if FLAGS.model == "rectified":
         from after.diffusion import RectifiedFlow
@@ -93,6 +129,23 @@ def main(argv):
         blender = EDM(device=device, emb_model=emb_model)
     else:
         raise ValueError("Model not recognized")
+
+    ######### LOAD THE ENCODER ########
+    if FLAGS.load_encoder is not None:
+        print("Loading encoder from ", FLAGS.load_encoder)
+        state_dict = torch.load(os.path.join(
+            FLAGS.load_encoder,
+            "checkpoint" + str(FLAGS.load_encoder_step) + ".pt"),
+                                map_location="cpu")["model_state"]
+        state_dict = {
+            k.replace("student.", ""): v
+            for k, v in state_dict.items()
+            if "student" in k and "head" not in k
+        }
+
+        print("Encoder state dict keys", state_dict.keys())
+        blender.encoder.load_state_dict(state_dict, strict=True)
+        print("Encoder loaded")
 
     ######### GET THE DATASET #########
     n_signal = gin.query_parameter("%N_SIGNAL")
@@ -125,6 +178,7 @@ def main(argv):
     else:
         print("No augmentation keys")
 
+    data_keys += ["metadata"]
     if len(FLAGS.db_path) > 1:
         path_dict = {f: {"name": f, "path": f} for f in FLAGS.db_path}
 
@@ -220,6 +274,12 @@ def main(argv):
         for p in blender.classifier.parameters():
             num_el += p.numel()
         print("Number of parameters - classifier : ", num_el / 1e6, "M")
+
+    if blender.post_encoder is not None:
+        num_el = 0
+        for p in blender.post_encoder.parameters():
+            num_el += p.numel()
+        print("Number of parameters - post_encoder : ", num_el / 1e6, "M")
 
     ######### TRAINING #########
     d = {

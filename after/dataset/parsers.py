@@ -5,7 +5,7 @@ from typing import Callable, Iterable, Sequence, Tuple
 import pathlib
 
 
-def slakh(audio_path, midi_path, extensions, exclude):
+def slakh(audio_path, midi_path, extensions, exclude, *args, **kwargs):
     tracks = [
         os.path.join(audio_path, subfolder)
         for subfolder in os.listdir(audio_path)
@@ -101,11 +101,11 @@ def simple_audio(audio_folder, midi_folder, extensions, exclude, include):
     return audio_files, midi_files, metadatas
 
 
-def simple_midi(audio_folder, midi_folder, extensions, exclude):
+def simple_midi(audio_folder, midi_folder, extensions, exclude, include):
     if midi_folder is None:
         midi_folder = audio_folder
     audio_files, _, _ = simple_audio(audio_folder, midi_folder, extensions,
-                                     exclude)
+                                     exclude, include)
 
     midi_func = lambda x: x[:-4] + ".midi"
     midi_files = map(midi_func, audio_files)
