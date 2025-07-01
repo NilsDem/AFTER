@@ -590,8 +590,6 @@ class ECAPATDNN(nn.Module):
         if self.pooling:
             Z = Z.squeeze(dim=2)
 
-        #
-
         if self.use_tanh:
             Z = torch.tanh(Z)
 
