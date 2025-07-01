@@ -282,11 +282,11 @@ class Base(nn.Module):
 
             self.load_state_dict(state_dict_model, strict=False)
 
-            try:
-                self.opt.load_state_dict(state_dict["opt_state"])
-            except Exception as e:
-                print(e)
-                print("Could not load optimizer state")
+            # try:
+            #     self.opt.load_state_dict(state_dict["opt_state"])
+            # except Exception as e:
+            #     print(e)
+            #     print("Could not load optimizer state")
             self.step = restart_step + 1
 
             print("Restarting from step ", self.step)

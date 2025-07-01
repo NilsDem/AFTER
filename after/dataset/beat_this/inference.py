@@ -13,7 +13,7 @@ from .utils import replace_state_dict_key, save_beat_tsv
 CHECKPOINT_URL = "https://cloud.cp.jku.at/index.php/s/7ik4RrBKTS273gp"
 
 
-def load_checkpoint(checkpoint_path: str, device = "cpu") -> dict:
+def load_checkpoint(checkpoint_path: str, device="cpu") -> dict:
     """
     Load a BeatThis checkpoint as a dictionary.
 
@@ -29,10 +29,8 @@ def load_checkpoint(checkpoint_path: str, device = "cpu") -> dict:
         return torch.load(checkpoint_path, map_location=device)
     except FileNotFoundError:
         try:
-            if not (
-                str(checkpoint_path).startswith("https://")
-                or str(checkpoint_path).startswith("http://")
-            ):
+            if not (str(checkpoint_path).startswith("https://")
+                    or str(checkpoint_path).startswith("http://")):
                 # interpret it as a name of one of our checkpoints
                 checkpoint_url = (
                     f"{CHECKPOINT_URL}/download?path=%2F&files={checkpoint_path}.ckpt"
@@ -54,9 +52,7 @@ def load_checkpoint(checkpoint_path: str, device = "cpu") -> dict:
             )
 
 
-def load_model(
-    checkpoint_path = "final0", device = "cpu"
-) -> BeatThis:
+def load_model(checkpoint_path="final0", device="cpu") -> BeatThis:
     """
     Load a BeatThis model from a checkpoint.
 
@@ -81,7 +77,8 @@ def load_model(
         model = BeatThis(**hparams)
         # The PLBeatThis (LightningModule) state_dict contains the BeatThis
         # state_dict under the "model." prefix; remove the prefix to load it
-        state_dict = replace_state_dict_key(checkpoint["state_dict"], "model.", "")
+        state_dict = replace_state_dict_key(checkpoint["state_dict"], "model.",
+                                            "")
         model.load_state_dict(state_dict)
     else:
         model = BeatThis()
@@ -118,20 +115,18 @@ def split_piece(
         avoid_short_end (bool, optional): If True, the last chunk is shifted left to end at the end of the piece. Defaults to True.
     """
     # generate the start and end indices
-    starts = np.arange(
-        -border_size, len(spect) - border_size, chunk_size - 2 * border_size
-    )
+    starts = np.arange(-border_size,
+                       len(spect) - border_size, chunk_size - 2 * border_size)
     if avoid_short_end and len(spect) > chunk_size - 2 * border_size:
         # if we avoid short ends, move the last index to the end of the piece - (chunk_size - border_size)
         starts[-1] = len(spect) - (chunk_size - border_size)
     # generate the chunks
     chunks = [
         zeropad(
-            spect[max(start, 0) : min(start + chunk_size, len(spect))],
+            spect[max(start, 0):min(start + chunk_size, len(spect))],
             left=max(0, -start),
             right=max(0, min(border_size, start + chunk_size - len(spect))),
-        )
-        for start in starts
+        ) for start in starts
     ]
     return chunks, starts
 
@@ -162,27 +157,26 @@ def aggregate_prediction(
     """
     if border_size > 0:
         # cut the predictions to discard the border
-        pred_chunks = [
-            {
-                "beat": pchunk["beat"][border_size:-border_size],
-                "downbeat": pchunk["downbeat"][border_size:-border_size],
-            }
-            for pchunk in pred_chunks
-        ]
+        pred_chunks = [{
+            "beat":
+            pchunk["beat"][border_size:-border_size],
+            "downbeat":
+            pchunk["downbeat"][border_size:-border_size],
+        } for pchunk in pred_chunks]
     # aggregate the predictions for the whole piece
-    piece_prediction_beat = torch.full((full_size,), -1000.0, device=device)
-    piece_prediction_downbeat = torch.full((full_size,), -1000.0, device=device)
+    piece_prediction_beat = torch.full((full_size, ), -1000.0, device=device)
+    piece_prediction_downbeat = torch.full((full_size, ),
+                                           -1000.0,
+                                           device=device)
     if overlap_mode == "keep_first":
         # process in reverse order, so predictions of earlier excerpts overwrite later ones
         pred_chunks = reversed(list(pred_chunks))
         starts = reversed(list(starts))
     for start, pchunk in zip(starts, pred_chunks):
-        piece_prediction_beat[
-            start + border_size : start + chunk_size - border_size
-        ] = pchunk["beat"]
-        piece_prediction_downbeat[
-            start + border_size : start + chunk_size - border_size
-        ] = pchunk["downbeat"]
+        piece_prediction_beat[start + border_size:start + chunk_size -
+                              border_size] = pchunk["beat"]
+        piece_prediction_downbeat[start + border_size:start + chunk_size -
+                                  border_size] = pchunk["downbeat"]
     return piece_prediction_beat, piece_prediction_downbeat
 
 
@@ -209,15 +203,18 @@ def split_predict_aggregate(
         dict: the model framewise predictions for the hole piece as a dictionary containing 'beat' and 'downbeat' predictions.
     """
     # split the piece into chunks
-    chunks, starts = split_piece(
-        spect, chunk_size, border_size=border_size, avoid_short_end=True
-    )
+    chunks, starts = split_piece(spect,
+                                 chunk_size,
+                                 border_size=border_size,
+                                 avoid_short_end=True)
     # run the model
     pred_chunks = [model(chunk.unsqueeze(0)) for chunk in chunks]
     # remove the extra dimension in beat and downbeat prediction due to batch size 1
-    pred_chunks = [
-        {"beat": p["beat"][0], "downbeat": p["downbeat"][0]} for p in pred_chunks
-    ]
+    pred_chunks = [{
+        "beat": p["beat"][0],
+        "downbeat": p["downbeat"][0]
+    } for p in pred_chunks]
+
     piece_prediction_beat, piece_prediction_downbeat = aggregate_prediction(
         pred_chunks,
         starts,
@@ -228,7 +225,10 @@ def split_predict_aggregate(
         spect.device,
     )
     # save it to model_prediction
-    return {"beat": piece_prediction_beat, "downbeat": piece_prediction_downbeat}
+    return {
+        "beat": piece_prediction_beat,
+        "downbeat": piece_prediction_downbeat
+    }
 
 
 class Spect2Frames:
@@ -244,7 +244,8 @@ class Spect2Frames:
 
     def spect2frames(self, spect):
         with torch.inference_mode():
-            with torch.autocast(enabled=self.float16, device_type=self.device.type):
+            with torch.autocast(enabled=self.float16,
+                                device_type=self.device.type):
                 model_prediction = split_predict_aggregate(
                     spect=spect,
                     chunk_size=1500,
@@ -252,7 +253,9 @@ class Spect2Frames:
                     border_size=6,
                     model=self.model,
                 )
-        return model_prediction["beat"].float(), model_prediction["downbeat"].float()
+
+        return model_prediction["beat"].float(
+        ), model_prediction["downbeat"].float()
 
     def __call__(self, spect):
         return self.spect2frames(spect)
@@ -271,8 +274,9 @@ class Audio2Frames(Spect2Frames):
         if signal.ndim == 2:
             signal = signal.mean(1)
         elif signal.ndim != 1:
-            raise ValueError(f"Expected 1D or 2D signal, got shape {signal.shape}")
-        
+            raise ValueError(
+                f"Expected 1D or 2D signal, got shape {signal.shape}")
+
         if sr != 22050:
             signal = soxr.resample(signal, in_rate=sr, out_rate=22050)
         signal = torch.tensor(signal, dtype=torch.float32, device=self.device)
@@ -294,9 +298,11 @@ class Audio2Beats(Audio2Frames):
         dbn (bool): Whether to use the madmom DBN for post-processing. Default is False.
     """
 
-    def __init__(
-        self, checkpoint_path="final0", device="cpu", float16=False, dbn=False
-    ):
+    def __init__(self,
+                 checkpoint_path="final0",
+                 device="cpu",
+                 float16=False,
+                 dbn=False):
         super().__init__(checkpoint_path, device, float16)
         self.frames2beats = Postprocessor(type="dbn" if dbn else "minimal")
 
@@ -306,12 +312,14 @@ class Audio2Beats(Audio2Frames):
 
 
 class File2Beats(Audio2Beats):
+
     def __call__(self, audio_path):
         signal, sr = load_audio(audio_path)
         return super().__call__(signal, sr)
 
 
 class File2File(File2Beats):
+
     def __call__(self, audio_path, output_path):
         downbeats, beats = super().__call__(audio_path)
         save_beat_tsv(downbeats, beats, output_path)

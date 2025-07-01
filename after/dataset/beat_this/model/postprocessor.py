@@ -22,27 +22,30 @@ class Postprocessor:
     """
 
     def __init__(self, type: str = "minimal", fps: int = 50):
-        
+
         print(fps)
         assert type in ["minimal", "dbn"]
         self.type = type
         self.fps = fps
         if type == "dbn":
+            print("using dbn")
             from madmom.features.downbeats import DBNDownBeatTrackingProcessor
 
             self.dbn = DBNDownBeatTrackingProcessor(
-                beats_per_bar=[3, 4],
+                beats_per_bar=[4],
                 min_bpm=55.0,
-                max_bpm=215.0,
+                max_bpm=190,
                 fps=self.fps,
                 transition_lambda=100,
             )
+        else:
+            print("no using dbn")
 
     def __call__(
         self,
         beat: torch.Tensor,
         downbeat: torch.Tensor,
-        padding_mask= None,
+        padding_mask=None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Apply postprocessing to the input beat and downbeat tensors. Works with batched and unbatched inputs.
@@ -69,10 +72,10 @@ class Postprocessor:
 
         if self.type == "minimal":
             postp_beat, postp_downbeat = self.postp_minimal(
-                beat, downbeat, padding_mask
-            )
+                beat, downbeat, padding_mask)
         elif self.type == "dbn":
-            postp_beat, postp_downbeat = self.postp_dbn(beat, downbeat, padding_mask)
+            postp_beat, postp_downbeat = self.postp_dbn(
+                beat, downbeat, padding_mask)
         else:
             raise ValueError("Invalid postprocessing type")
 
@@ -86,33 +89,36 @@ class Postprocessor:
 
     def postp_minimal(self, beat, downbeat, padding_mask):
         # concatenate beat and downbeat in the same tensor of shape (B, T, 2)
-        packed_pred = rearrange(
-            [beat, downbeat], "c b t -> b t c", b=beat.shape[0], t=beat.shape[1], c=2
-        )
+        packed_pred = rearrange([beat, downbeat],
+                                "c b t -> b t c",
+                                b=beat.shape[0],
+                                t=beat.shape[1],
+                                c=2)
         # set padded elements to -1000 (= probability zero even in float64) so they don't influence the maxpool
-        pred_logits = packed_pred.masked_fill(~padding_mask.unsqueeze(-1), -1000)
+        pred_logits = packed_pred.masked_fill(~padding_mask.unsqueeze(-1),
+                                              -1000)
         # reshape to (2*B, T) to apply max pooling
         pred_logits = rearrange(pred_logits, "b t c -> (c b) t")
         # pick maxima within +/- 70ms
         pred_peaks = pred_logits.masked_fill(
-            pred_logits != F.max_pool1d(pred_logits, 7, 1, 3), -1000
-        )
+            pred_logits != F.max_pool1d(pred_logits, 7, 1, 3), -1000)
         # keep maxima with over 0.5 probability (logit > 0)
         pred_peaks = pred_peaks > 0
         #  rearrange back to two tensors of shape (B, T)
-        beat_peaks, downbeat_peaks = rearrange(
-            pred_peaks, "(c b) t -> c b t", b=beat.shape[0], t=beat.shape[1], c=2
-        )
+        beat_peaks, downbeat_peaks = rearrange(pred_peaks,
+                                               "(c b) t -> c b t",
+                                               b=beat.shape[0],
+                                               t=beat.shape[1],
+                                               c=2)
         # run the piecewise operations
         with ThreadPoolExecutor() as executor:
             postp_beat, postp_downbeat = zip(
-                *executor.map(
-                    self._postp_minimal_item, beat_peaks, downbeat_peaks, padding_mask
-                )
-            )
+                *executor.map(self._postp_minimal_item, beat_peaks,
+                              downbeat_peaks, padding_mask))
         return postp_beat, postp_downbeat
 
-    def _postp_minimal_item(self, padded_beat_peaks, padded_downbeat_peaks, mask):
+    def _postp_minimal_item(self, padded_beat_peaks, padded_downbeat_peaks,
+                            mask):
         """Function to compute the operations that must be computed piece by piece, and cannot be done in batch."""
         # unpad the predictions by truncating the padding positions
         beat_peaks = padded_beat_peaks[mask]
@@ -127,9 +133,8 @@ class Postprocessor:
         beat_time = beat_frame / self.fps
         downbeat_time = downbeat_frame / self.fps
         # move the downbeat to the nearest beat
-        if (
-            len(beat_time) > 0
-        ):  # skip if there are no beats, like in the first training steps
+        if (len(beat_time) > 0
+            ):  # skip if there are no beats, like in the first training steps
             for i, d_time in enumerate(downbeat_time):
                 beat_idx = np.argmin(np.abs(beat_time - d_time))
                 downbeat_time[i] = beat_time[beat_idx]
@@ -145,11 +150,8 @@ class Postprocessor:
         beat_prob = beat_prob * (1 - epsilon) + epsilon / 2
         downbeat_prob = downbeat_prob * (1 - epsilon) + epsilon / 2
         with ThreadPoolExecutor() as executor:
-            postp_beat, postp_downbeat = zip(
-                *executor.map(
-                    self._postp_dbn_item, beat_prob, downbeat_prob, padding_mask
-                )
-            )
+            postp_beat, postp_downbeat = zip(*executor.map(
+                self._postp_dbn_item, beat_prob, downbeat_prob, padding_mask))
         return postp_beat, postp_downbeat
 
     def _postp_dbn_item(self, padded_beat_prob, padded_downbeat_prob, mask):
@@ -160,14 +162,11 @@ class Postprocessor:
         # build an artificial multiclass prediction, as suggested by Böck et al.
         # again we limit the lower bound to avoid problems with the DBN
         epsilon = 1e-5
-        combined_act = np.vstack(
-            (
-                np.maximum(
-                    beat_prob.cpu().numpy() - downbeat_prob.cpu().numpy(), epsilon / 2
-                ),
-                downbeat_prob.cpu().numpy(),
-            )
-        ).T
+        combined_act = np.vstack((
+            np.maximum(beat_prob.cpu().numpy() - downbeat_prob.cpu().numpy(),
+                       epsilon / 2),
+            downbeat_prob.cpu().numpy(),
+        )).T
         # run the DBN
         dbn_out = self.dbn(combined_act)
         postp_beat = dbn_out[:, 0]

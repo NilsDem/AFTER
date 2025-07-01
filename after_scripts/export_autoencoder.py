@@ -40,7 +40,7 @@ class AE_notcausal(nn_tilde.Module):
         z, _ = self.model.encode(test_array)
 
         self.comp_ratio = test_array.shape[-1] // z.shape[-1]
-        self.n_fade = 4
+        self.n_fade = 3
 
         self.latent_size = gin.query_parameter("%LATENT_SIZE")
         self.target_channels = 1
@@ -61,30 +61,36 @@ class AE_notcausal(nn_tilde.Module):
             test_buffer_size=self.comp_ratio,
         )
 
-        self.register_method("decode",
-                             in_channels=self.latent_size,
-                             in_ratio=self.comp_ratio,
-                             out_channels=self.target_channels,
-                             out_ratio=1,
-                             input_labels=[
-                                 f'(signal) Latent dimension {i+1}'
-                                 for i in range(self.latent_size)
-                             ],
-                             output_labels=[
-                                 '(signal) Channel %d' % d
-                                 for d in range(1, self.target_channels + 1)
-                             ])
+        self.register_method(
+            "decode",
+            in_channels=self.latent_size,
+            in_ratio=self.comp_ratio,
+            out_channels=self.target_channels,
+            out_ratio=1,
+            input_labels=[
+                f'(signal) Latent dimension {i+1}'
+                for i in range(self.latent_size)
+            ],
+            output_labels=[
+                '(signal) Channel %d' % d
+                for d in range(1, self.target_channels + 1)
+            ],
+            test_buffer_size=self.comp_ratio,
+        )
 
-        self.register_method("forward",
-                             in_channels=1,
-                             in_ratio=1,
-                             out_channels=1,
-                             out_ratio=1,
-                             input_labels=['(signal) input 1'],
-                             output_labels=[
-                                 '(signal) Channel %d' % d
-                                 for d in range(1, self.target_channels + 1)
-                             ])
+        self.register_method(
+            "forward",
+            in_channels=1,
+            in_ratio=1,
+            out_channels=1,
+            out_ratio=1,
+            input_labels=['(signal) input 1'],
+            output_labels=[
+                '(signal) Channel %d' % d
+                for d in range(1, self.target_channels + 1)
+            ],
+            test_buffer_size=self.comp_ratio,
+        )
 
     @torch.jit.export
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -260,8 +266,6 @@ def main(argv):
         print("Error in gin query: ", e)
         print("This is normal if your model is not causal")
         is_causal = False
-
-    is_causal = True
 
     print("is causal: ", is_causal)
 

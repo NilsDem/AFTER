@@ -72,7 +72,7 @@ flags.DEFINE_integer('sample_rate',
                      help='Sampling rate to use during training')
 
 flags.DEFINE_integer('db_size',
-                     200,
+                     100,
                      help='Maximum size (in GB) of the dataset')
 
 flags.DEFINE_string(
@@ -126,6 +126,22 @@ flags.DEFINE_multi_string('descriptors',
                           default=[],
                           help="Audio descriptors to compute")
 
+from music2latent import EncoderDecoder
+
+
+class M2LWrapper():
+    """Wrapper for the EncoderDecoder model to use it with the AudioExample class."""
+
+    def __init__(self, device="cpu"):
+        self.model = EncoderDecoder(device=device)
+
+    def encode(self, x):
+        x = x.squeeze(1)
+        return self.model.encode(x)
+
+    def decode(self, z):
+        return self.model.decode(z).unsqueeze(1)
+
 
 def normalize_signal(x: np.ndarray,
                      max_gain_db: int = 30,
@@ -161,8 +177,13 @@ def main(dummy):
     device = "cuda:" + str(
         FLAGS.gpu) if torch.cuda.is_available() and FLAGS.gpu >= 0 else "cpu"
     print("Using device : ", device)
-    emb_model = None if FLAGS.emb_model_path is None else torch.jit.load(
-        FLAGS.emb_model_path).to(device).eval()
+
+    if FLAGS.emb_model_path == "music2latent":
+
+        emb_model = M2LWrapper(device=device)
+    else:
+        emb_model = None if FLAGS.emb_model_path is None else torch.jit.load(
+            FLAGS.emb_model_path).to(device).eval()
 
     env = lmdb.open(
         FLAGS.output_path,
@@ -206,7 +227,7 @@ def main(dummy):
             from after.dataset.transforms import TimeStretch
 
             waveform_augmentation = TimeStretch(sr=FLAGS.sample_rate,
-                                                ts_min=0.7,
+                                                ts_min=0.51,
                                                 ts_max=1.6,
                                                 random_silence=True)
 

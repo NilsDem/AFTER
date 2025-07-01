@@ -127,7 +127,7 @@ class TimeStretch(BaseTransform):
             audio = self.silence_transform(audio, sample_rate=self.sr)
             audio = self.silence_transform(audio, sample_rate=self.sr)
             audio = self.silence_transform(audio, sample_rate=self.sr)
-            audio = self.silence_transform(audio, sample_rate=self.sr)
+            # audio = self.silence_transform(audio, sample_rate=self.sr)
         return audio
 
 
@@ -345,11 +345,11 @@ from after.dataset.beat_this.inference import Audio2Beats
 
 class BeatTrack(BaseTransform):
 
-    def __init__(self, sr, device="cpu") -> None:
+    def __init__(self, sr, device="cpu", dbn=True) -> None:
         super().__init__(sr, "beat_this")
 
         self.audio2beats = Audio2Beats(checkpoint_path="final0",
-                                       dbn=False,
+                                       dbn=dbn,
                                        float16=False,
                                        device=device)
 
@@ -413,4 +413,9 @@ class BeatTrack(BaseTransform):
                                               z_length,
                                               sr=self.sr,
                                               zero_value=0.)
-        return {"beat_clock": beat_clock, "downbeat_clock": downbeat_clock}
+        return {
+            "beat_clock": beat_clock,
+            "downbeat_clock": downbeat_clock,
+            "beats": beats,
+            "downbeats": downbeats
+        }

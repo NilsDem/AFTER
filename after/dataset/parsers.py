@@ -158,6 +158,38 @@ def vital_parser(audio_folder, midi_folder, extensions, exclude):
     return audio_files, midis, metadatas
 
 
+import pandas as pd
+
+
+def load_metadata_row(df, target_audio_filename):
+    match = df[df["audio_filename"] == target_audio_filename]
+    if match.empty:
+        raise ValueError(
+            f"Audio filename '{target_audio_filename}' not found in CSV.")
+    return match.iloc[0]  # Return the matched row as a Series
+
+
+def gmd(audio_folder, midi_folder, extensions, exclude, include):
+    audio_files, midi_files, metadatas = simple_midi(audio_folder, midi_folder,
+                                                     extensions, exclude,
+                                                     include)
+
+    csv_path = "/data/nils/datasets/drums/expended_gmd/audio/e-gmd-v1.0.0/e-gmd-v1.0.0.csv"
+    df = pd.read_csv(csv_path)
+    metadatas = []
+
+    for file, midi_file in zip(audio_files, midi_files):
+        audio_file_name = "/".join(file.split("/")[-3:])
+        metadata_row = load_metadata_row(df, audio_file_name)
+        meta = {"path": file, "midi_path": midi_file}
+
+        meta.update(metadata_row.to_dict())
+        metadatas.append(meta)
+    print(len(metadatas), " files found")
+    print("Example : \n ", metadatas[0])
+    return audio_files, midi_files, metadatas
+
+
 def get_parser(parser_name):
     if parser_name == "simple_audio":
         return simple_audio
@@ -167,5 +199,7 @@ def get_parser(parser_name):
         return slakh
     if parser_name == "vital_parser":
         return vital_parser
+    if parser_name == "gmd":
+        return gmd
     else:
         raise ValueError(f"Parser {parser_name} not available")

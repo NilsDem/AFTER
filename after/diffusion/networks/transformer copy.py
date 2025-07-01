@@ -432,14 +432,14 @@ class DecoderBlock(nn.Module):
 
         self.mlp = mlp_class(embed_dim, mlp_multiplier, dropout_level)
         self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(embed_dim)
         self.norm3 = nn.LayerNorm(embed_dim)
 
         if self.cond_dim > 0:
             self.linear = nn.Linear(cond_dim, 2 * embed_dim)
 
         if self.tcond_dim > 0 and not self.use_ca:
-            self.norm0 = nn.LayerNorm(embed_dim, elementwise_affine=False)
+            self.norm0 = nn.LayerNorm(embed_dim)
             self.tcond_linear = nn.Linear(tcond_dim, 2 * embed_dim)
         else:
             self.norm0 = nn.Identity()
@@ -533,7 +533,7 @@ class DenoiserTransBlock(nn.Module):
                 self.patchify_and_embed_tcond = nn.Sequential(
                     Rearrange("b c t -> b t c"),
                     nn.Linear(tcond_dim, tcond_dim),
-                    # nn.LayerNorm(tcond_dim),
+                    nn.LayerNorm(tcond_dim),
                 )
                 self.pos_embed_ca = nn.Identity()
 

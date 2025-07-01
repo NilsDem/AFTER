@@ -17,7 +17,7 @@ ZS_CHANNELS = 12
 ZT_CHANNELS = 2
 SR = 44100
 STRUCTURE_TYPE = "audio"
-PHASE_1_STEP = 100000
+PHASE_1_STEP = 200000
 
 # Data
 diffusion.utils.collate_fn:
@@ -111,11 +111,11 @@ diffusion.model.Base.fit:
 
     # Noise augmentation to smooth the latent space
     zsem_noise_aug = 0.
-    time_cond_noise_aug = 0.
+    time_cond_noise_aug = 0.025
 
     ## Encoder regularisation
     regularisation_weight_encoder = 0.0001
-    regularisation_weight_encoder_time = 0.0001
+    regularisation_weight_encoder_time = 1.
     regularisation_warmup = 1
 
     ## Cycle loss
@@ -127,6 +127,6 @@ diffusion.model.Base.fit:
     ## Log ## 
     steps_valid = 10000
     steps_save = 50000
-   
+    
     use_ema = True
     lr = 1e-4
