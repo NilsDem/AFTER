@@ -285,13 +285,15 @@ def main(dummy):
 
         audio = audio[:audio.shape[-1] // FLAGS.num_signal * FLAGS.num_signal]
 
-        if audio.shape[-1] > 4 * FLAGS.num_signal:
-            chunk_size = 4 * FLAGS.num_signal
-            audios = [
-                audio[..., i:i + chunk_size]
-                for i in range(0, audio.shape[-1], chunk_size)
-            ]
-            audios = [a for a in audios if a.shape[-1] >= FLAGS.num_signal]
+        if (midi_file is None
+                and BP is not None) and audio.shape[-1] > 4 * FLAGS.num_signal:
+            if audio.shape[-1] > 4 * FLAGS.num_signal:
+                chunk_size = 4 * FLAGS.num_signal
+                audios = [
+                    audio[..., i:i + chunk_size]
+                    for i in range(0, audio.shape[-1], chunk_size)
+                ]
+                audios = [a for a in audios if a.shape[-1] >= FLAGS.num_signal]
         else:
             audios = [audio]
 
