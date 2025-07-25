@@ -156,7 +156,8 @@ def simple_audio(audio_folder, midi_folder, extensions, exclude, include):
     audio_files = [*audio_files]
 
     audio_files = [
-        f for f in audio_files if not any([excl in f for excl in exclude])
+        f for f in audio_files
+        if not any([excl.lower() in f.lower() for excl in exclude])
     ]
 
     if include is not None:

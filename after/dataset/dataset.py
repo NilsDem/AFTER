@@ -19,6 +19,7 @@ class SimpleDataset(torch.utils.data.Dataset):
         recache_every=None,
         init_cache=False,
         validation_size=0.02,
+        map_size=None,
         split=None,
         readonly=True,
         filter={
@@ -38,8 +39,8 @@ class SimpleDataset(torch.utils.data.Dataset):
                              readonly=readonly,
                              readahead=True,
                              map_async=False,
-                             map_size=50 *
-                             1024**3 if readonly == False else None)
+                             map_size=None if map_size is None else map_size *
+                             1024**3)
 
         with self.env.begin() as txn:
             self.keys = list(txn.cursor().iternext(values=False))

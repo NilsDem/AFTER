@@ -893,6 +893,13 @@ class RectifiedFlow(Base):
                       guidance_structure: float,
                       cache_index: int = 0) -> torch.Tensor:
 
+        if guidance_timbre == guidance_structure == 1:
+            return self.net(x,
+                            time=time,
+                            cond=cond,
+                            time_cond=time_cond,
+                            cache_index=cache_index)
+
         full_time = time.repeat(3, 1, 1)
         full_x = x.repeat(3, 1, 1)
 
