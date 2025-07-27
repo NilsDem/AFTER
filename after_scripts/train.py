@@ -9,9 +9,10 @@ import after
 from after.dataset import SimpleDataset, CombinedDataset
 from after.diffusion.utils import collate_fn, get_datasets
 from after.diffusion.model import Base
+import after.diffusion.model
 from after.autoencoder import M2LWrapper
 from tqdm import tqdm
-
+from after.diffusion.model import RectifiedFlow, Base
 from absl import flags, app
 
 FLAGS = flags.FLAGS
@@ -30,19 +31,21 @@ flags.DEFINE_integer("n_signal", 32,
 
 # DATASET
 flags.DEFINE_multi_string(
-    "db_path", None, "Database path. Use multiple for combined datasets.")
-flags.DEFINE_multi_float("freqs", None,
+    "db_path", ["/fast-1/nils/instruments/real_m2l/", "/fast-1/nils/instruments/synthetic_m2l/"], "Database path. Use multiple for combined datasets.")
+flags.DEFINE_multi_float("freqs", [1., 1.],
                          "Sampling frequencies for multiple datasets.")
 flags.DEFINE_string("out_path", "./after_runs", "Output path.")
-flags.DEFINE_string("emb_model_path", None, "Path to the embedding model.")
+flags.DEFINE_string("emb_model_path", "music2latent", "Path to the embedding model.")
 
 # Puts the dataset in cache prior to training for slow hard drives
 flags.DEFINE_bool("use_cache", False, "Whether to cache the dataset.")
 flags.DEFINE_integer("max_samples", None, "Maximum number of samples.")
-flags.DEFINE_integer("num_workers", 0, "Number of workers.")
+flags.DEFINE_integer("num_workers", 2, "Number of workers.")
 flags.DEFINE_multi_string("augmentation_keys", ["all"],
                           "List of augmentation keys.")
-flags.DEFINE_multi_string("augmentation_keys_exclude", ["stacked"],
+flags.DEFINE_multi_string("augmentation_keys_exclude", [],
+                          "List of augmentation keys.")
+flags.DEFINE_multi_string("augmentation_keys_include", [],
                           "List of augmentation keys.")
 flags.DEFINE_multi_string("filter_include", [],
                           "Keyword to include based on file path")
@@ -51,6 +54,7 @@ flags.DEFINE_multi_string("filter_exclude", [],
 flags.DEFINE_float("adv", None, "Adversarial strengh")
 flags.DEFINE_integer("zs", None, "Adversarial strengh")
 flags.DEFINE_integer("zt", None, "Adversarial strengh")
+flags.DEFINE_bool("shuffle", True, "Shuffle?")
 
 flags.DEFINE_bool("use_validation", True, "Use a train/validation split")
 
@@ -110,9 +114,14 @@ def main(argv):
         if FLAGS.zt is not None:
             print("changing zt to", FLAGS.zt)
             gin.bind_parameter("%ZT_CHANNELS", FLAGS.zt) 
+            
+        if FLAGS.shuffle:
+            gin.bind_parameter("%SHUFFLE", [2])
+        else:
+            gin.bind_parameter("%SHUFFLE", None)
 
     if FLAGS.model == "rectified":
-        from after.diffusion import RectifiedFlow
+        
         blender = RectifiedFlow(device=device, emb_model=emb_model)
     elif FLAGS.model == "edm":
         from after.diffusion import EDM
@@ -138,7 +147,7 @@ def main(argv):
         dataset = SimpleDataset(path=FLAGS.db_path[0])
         allkeys = dataset.get_keys()
         augmentation_keys = [
-            k for k in allkeys if ("augment" in k or "aug" in k) and not(any([excl in k for excl in FLAGS.augmentation_keys_exclude]))
+            k for k in allkeys if ("augment" in k or "aug" in k) and (not(any([excl in k for excl in FLAGS.augmentation_keys_exclude])) if FLAGS.augmentation_keys_exclude else True) and (any([excl in k for excl in FLAGS.augmentation_keys_include]) if FLAGS.augmentation_keys_include else True)
         ]
 
     if augmentation_keys is not None:
