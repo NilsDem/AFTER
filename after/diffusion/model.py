@@ -104,11 +104,11 @@ class Base(nn.Module):
     def init_train(self, lr, dataloader):
         params = list(self.net.parameters())
 
-        if self.encoder is not None:
+        if self.encoder is not None and self.train_encoder:
             print("training encoder")
             params += list(self.encoder.parameters())
 
-        if self.encoder_time is not None:
+        if self.encoder_time is not None and self.train_encoder_time:
             print("training encoder_time")
             params += list(self.encoder_time.parameters())
 
