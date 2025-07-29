@@ -59,8 +59,10 @@ flags.DEFINE_float("adv", None, "Adversarial strengh")
 flags.DEFINE_integer("zs", None, "Adversarial strengh")
 flags.DEFINE_integer("zt", None, "Adversarial strengh")
 flags.DEFINE_bool("shuffle", True, "Shuffle?")
-
 flags.DEFINE_bool("use_validation", True, "Use a train/validation split")
+
+flags.DEFINE_string("load_encoder", None, "Path to encoder to load")
+flags.DEFINE_integer("load_encoder_step", None, "Step to load encoder")
 
 
 def add_gin_extension(config_name: str) -> str:
@@ -131,6 +133,23 @@ def main(argv):
         blender = EDM(device=device, emb_model=emb_model)
     else:
         raise ValueError("Model not recognized")
+        
+    ######### LOAD AN EXTERNAL ENCODER #######
+    if FLAGS.load_encoder is not None:
+        print("Loading encoder from ", FLAGS.load_encoder)
+        state_dict = torch.load(os.path.join(
+            FLAGS.load_encoder,
+            "checkpoint" + str(FLAGS.load_encoder_step) + ".pt"),
+                                map_location="cpu")["model_state"]
+        state_dict = {
+            k.replace("student.", ""): v
+            for k, v in state_dict.items()
+            if "student" in k and "head" not in k
+        }
+
+        print("Encoder state dict keys", state_dict.keys())
+        blender.encoder.load_state_dict(state_dict, strict=True)
+        print("Encoder loaded")
 
     ######### GET THE DATASET #########
     n_signal = gin.query_parameter("%N_SIGNAL")
