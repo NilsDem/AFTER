@@ -31,11 +31,15 @@ flags.DEFINE_integer("n_signal", 32,
 
 # DATASET
 flags.DEFINE_multi_string(
-    "db_path", ["/fast-1/nils/instruments/real_m2l/", "/fast-1/nils/instruments/synthetic_m2l/"], "Database path. Use multiple for combined datasets.")
+    "db_path", [
+        "/data/nils/datasets/instruments/real_m2l/",
+        "/data/nils/datasets/instruments/synthetic_m2l/"
+    ], "Database path. Use multiple for combined datasets.")
 flags.DEFINE_multi_float("freqs", [1., 1.],
                          "Sampling frequencies for multiple datasets.")
 flags.DEFINE_string("out_path", "./after_runs", "Output path.")
-flags.DEFINE_string("emb_model_path", "music2latent", "Path to the embedding model.")
+flags.DEFINE_string("emb_model_path", "music2latent",
+                    "Path to the embedding model.")
 
 # Puts the dataset in cache prior to training for slow hard drives
 flags.DEFINE_bool("use_cache", False, "Whether to cache the dataset.")
@@ -101,27 +105,26 @@ def main(argv):
         if gin.query_parameter("%N_SIGNAL") is None:
             print("setting n_signal with FLAGS")
             gin.bind_parameter("%N_SIGNAL", FLAGS.n_signal)
-            
+
         if FLAGS.adv is not None:
             print("changing adversarial to", FLAGS.adv)
-            gin.bind_parameter("%ADV_WEIGHT", FLAGS.adv) 
-            
+            gin.bind_parameter("%ADV_WEIGHT", FLAGS.adv)
+
         if FLAGS.zs is not None:
             print("changing zs to", FLAGS.zs)
-            gin.bind_parameter("%ZS_CHANNELS", FLAGS.zs) 
-   
-            
+            gin.bind_parameter("%ZS_CHANNELS", FLAGS.zs)
+
         if FLAGS.zt is not None:
             print("changing zt to", FLAGS.zt)
-            gin.bind_parameter("%ZT_CHANNELS", FLAGS.zt) 
-            
+            gin.bind_parameter("%ZT_CHANNELS", FLAGS.zt)
+
         if FLAGS.shuffle:
             gin.bind_parameter("%SHUFFLE", [2])
         else:
             gin.bind_parameter("%SHUFFLE", None)
 
     if FLAGS.model == "rectified":
-        
+
         blender = RectifiedFlow(device=device, emb_model=emb_model)
     elif FLAGS.model == "edm":
         from after.diffusion import EDM
@@ -147,7 +150,12 @@ def main(argv):
         dataset = SimpleDataset(path=FLAGS.db_path[0])
         allkeys = dataset.get_keys()
         augmentation_keys = [
-            k for k in allkeys if ("augment" in k or "aug" in k) and (not(any([excl in k for excl in FLAGS.augmentation_keys_exclude])) if FLAGS.augmentation_keys_exclude else True) and (any([excl in k for excl in FLAGS.augmentation_keys_include]) if FLAGS.augmentation_keys_include else True)
+            k for k in allkeys if ("augment" in k or "aug" in k) and
+            (not (any([excl in k
+                       for excl in FLAGS.augmentation_keys_exclude])) if FLAGS.
+             augmentation_keys_exclude else True) and (
+                 any([excl in k for excl in FLAGS.augmentation_keys_include]
+                     ) if FLAGS.augmentation_keys_include else True)
         ]
 
     if augmentation_keys is not None:

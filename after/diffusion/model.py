@@ -160,6 +160,21 @@ class Base(nn.Module):
 
                 torch.save(
                     d, model_dir + "/checkpoint" + str(self.step) + "_EMA.pt")
+
+            state_dict = self.state_dict()
+            state_dict = {
+                k: v
+                for k, v in state_dict.items() if "emb_model" not in k
+            }
+            d = {
+                "model_state": {
+                    k: v
+                    for k, v in state_dict.items() if "emb_model" not in k
+                },
+                "opt_state": self.opt.state_dict()
+            }
+
+            torch.save(d, model_dir + "/checkpoint" + str(self.step) + ".pt")
         else:
             state_dict = self.state_dict()
             state_dict = {
@@ -257,7 +272,7 @@ class Base(nn.Module):
             distill_transfer_step=None,
             discriminator_pretrained_class=None,
             discriminator_head_class=None):
-        
+
         print(adversarial_weight)
 
         self.train_encoder = train_encoder
@@ -284,7 +299,10 @@ class Base(nn.Module):
                 for key, value in state_dict_model.items()
                 if (load_encoders[2] or "net." not in key)
             }
-            self.load_state_dict(state_dict_model, strict=False)
+
+            print("RELOADING")
+            print(state_dict_model.keys())
+            self.load_state_dict(state_dict_model, strict=True)
 
             try:
                 self.opt.load_state_dict(state_dict["opt_state"])
@@ -614,6 +632,7 @@ class Base(nn.Module):
                         ## VALIDATION
 
                         lossval = {}
+                        nloss = 0
 
                         for i, batch in enumerate(validloader):
                             x1, x1_cond, x1_time_cond = self.prep_data(
@@ -659,13 +678,14 @@ class Base(nn.Module):
 
                             for k in lossdict:
                                 lossval[k] = lossval.get(k, 0.) + lossdict[k]
+                            nloss+=1
 
                             if i == 100:
                                 break
 
                         for k in lossval:
                             logger.add_scalar('Loss/valid/' + k,
-                                              lossval[k] / 100,
+                                              lossval[k] / nloss,
                                               global_step=self.step)
 
                         ## SAMPLING
@@ -750,11 +770,15 @@ class RectifiedFlow(Base):
         if cycle_swap_target == "time_cond":
             time_cond_target = time_cond[torch.randperm(time_cond.shape[0])]
             cond_target = cond
+            indices_time_cond = permutation
+            indices_cond = None
 
         elif cycle_swap_target == "cond":
             permutation = torch.randperm(cond.shape[0])
             time_cond_target = time_cond
             cond_target = cond[permutation]
+            indices_time_cond = None
+            indices_cond = permutation
 
         elif cycle_swap_target == "alternate":
             n = time_cond.shape[0]
@@ -764,13 +788,16 @@ class RectifiedFlow(Base):
             cond_target = cond.clone()
             cond_target[indices[n // 2:]] = cond[indices[:n // 2]]
 
-        time_cond_target = time_cond_target
-        cond_target = cond_target
+            indices_time_cond = indices[:n // 2]
+            indices_cond = indices[n // 2:]
+
+        time_cond_target = time_cond_target.detach()
+        cond_target = cond_target.detach()
 
         if cycle_mode == "interpolant":
             x0 = torch.randn_like(x)
-            t = self.sample_pdisc(x.size(0), mu=0.0, sigma=1.0,
-                                  shift=-1.25).reshape(-1, 1, 1).to(x)
+            t = self.sample_pdisc(x.size(0), mu=0.0, sigma=1.2,
+                                  shift=-1.5).reshape(-1, 1, 1).to(x)
 
             interpolant = (1 - t) * x0 + t * x
 
@@ -827,10 +854,10 @@ class RectifiedFlow(Base):
 
         elif cycle_loss_type == "cosine":
             cond_cycle_loss = (1 - torch.nn.functional.cosine_similarity(
-                cond_rec, cond_target, dim=1, eps=1e-8)).mean()
+                cond_rec, cond_target, dim=1, eps=1e-8))
 
             time_cond_cycle_loss = (1 - torch.nn.functional.cosine_similarity(
-                time_cond_rec, time_cond_target, dim=1, eps=1e-8)).mean()
+                time_cond_rec, time_cond_target, dim=1, eps=1e-8))
         else:
             raise ValueError("Invalid cycle loss type : " + cycle_loss_type)
 
@@ -861,6 +888,16 @@ class RectifiedFlow(Base):
             pass
         else:
             raise ValueError("Invalid cycle scaling : " + cycle_scaling)
+
+        if indices_cond is not None:
+            time_cond_cycle_loss = time_cond_cycle_loss[indices_cond]
+        else:
+            time_cond_cycle_loss = torch.tensor(0.).to(time_cond_target)
+
+        if indices_time_cond is not None:
+            cond_cycle_loss = cond_cycle_loss[indices_time_cond]
+        else:
+            cond_cycle_loss = torch.tensor(0.).to(cond_target)
 
         cond_cycle_loss = cond_cycle_loss.mean()
         time_cond_cycle_loss = time_cond_cycle_loss.mean()

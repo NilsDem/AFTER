@@ -115,7 +115,7 @@ flags.DEFINE_string(
 )
 
 flags.DEFINE_bool('augmentation_stacking',
-                  True,
+                  False,
                   help='Stack the augmentations for same example',
                   required=False)
 
@@ -124,7 +124,7 @@ flags.DEFINE_integer('num_augments',
                      help="Number of augmentations to perform")
 
 flags.DEFINE_integer('num_multiprocesses',
-                     default=4,
+                     default=3,
                      help="Number of processes for the data augmentation")
 flags.DEFINE_multi_string('descriptors',
                           default=[],
@@ -392,8 +392,8 @@ def main(dummy):
                     except Exception as e:
                         print(e)
                         silence_test = True
+                        print("Error processing midi file : ", e)
                         midi = None
-                        print("Error processing midi file : ", midi_file)
 
                 else:
                     midi = None

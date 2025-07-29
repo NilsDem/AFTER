@@ -281,7 +281,14 @@ def medley_solos_mono(audio_folder, midi_folder, extensions, exclude, include,
                               uuid]["instrument"].values[0]
         if instrument.lower() in ["piano", "distorted electric guitar"]:
             continue
+
         else:
+            if instrument == "female singer":
+                instrument = "voice"
+            elif instrument == "tenor saxophone":
+                instrument = "saxophone"
+            elif instrument == "violin":
+                instrument = "strings"
             metadatas.append({"path": file, "instrument": instrument})
             out_files.append(file)
 
