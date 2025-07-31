@@ -125,7 +125,7 @@ diffusion.model.Base.fit:
 
     ## Log ## 
     steps_valid = 10000
-    steps_save = 25000
+    steps_save = 50000
     
     use_ema = True
     lr = 1e-4
