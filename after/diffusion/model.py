@@ -302,7 +302,7 @@ class Base(nn.Module):
 
             print("RELOADING")
             print(state_dict_model.keys())
-            self.load_state_dict(state_dict_model, strict=True)
+            self.load_state_dict(state_dict_model, strict=False)
 
             try:
                 self.opt.load_state_dict(state_dict["opt_state"])

@@ -32,8 +32,8 @@ flags.DEFINE_integer("n_signal", 32,
 # DATASET
 flags.DEFINE_multi_string(
     "db_path", [
-        "/data/nils/datasets/instruments/real_m2l/",
-        "/data/nils/datasets/instruments/synthetic_m2l/"
+        "/fast-1/nils/instruments/real_m2l/",
+        "/fast-1/nils/instruments/synthetic_m2l/"
     ], "Database path. Use multiple for combined datasets.")
 flags.DEFINE_multi_float("freqs", [1., 1.],
                          "Sampling frequencies for multiple datasets.")
@@ -63,6 +63,7 @@ flags.DEFINE_bool("use_validation", True, "Use a train/validation split")
 
 flags.DEFINE_string("load_encoder", None, "Path to encoder to load")
 flags.DEFINE_integer("load_encoder_step", None, "Step to load encoder")
+flags.DEFINE_bool("random_crop", True, "Use random croping for timbre")
 
 
 def add_gin_extension(config_name: str) -> str:
@@ -102,6 +103,7 @@ def main(argv):
 
     with gin.unlock_config():
         gin.bind_parameter("diffusion.utils.collate_fn.ae_ratio", ae_ratio)
+        gin.bind_parameter("diffusion.utils.collate_fn.random_crop", FLAGS.random_crop)
         gin.bind_parameter("%IN_SIZE", ae_emb_size)
 
         if gin.query_parameter("%N_SIGNAL") is None:
