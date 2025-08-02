@@ -58,7 +58,7 @@ flags.DEFINE_multi_string("filter_exclude", [],
 flags.DEFINE_float("adv", None, "Adversarial strengh")
 flags.DEFINE_integer("zs", None, "Adversarial strengh")
 flags.DEFINE_integer("zt", None, "Adversarial strengh")
-flags.DEFINE_bool("shuffle", True, "Shuffle?")
+flags.DEFINE_bool("shuffle", False, "Shuffle?")
 flags.DEFINE_bool("use_validation", True, "Use a train/validation split")
 
 flags.DEFINE_string("load_encoder", None, "Path to encoder to load")
@@ -103,7 +103,8 @@ def main(argv):
 
     with gin.unlock_config():
         gin.bind_parameter("diffusion.utils.collate_fn.ae_ratio", ae_ratio)
-        gin.bind_parameter("diffusion.utils.collate_fn.random_crop", FLAGS.random_crop)
+        gin.bind_parameter("diffusion.utils.collate_fn.random_crop",
+                           FLAGS.random_crop)
         gin.bind_parameter("%IN_SIZE", ae_emb_size)
 
         if gin.query_parameter("%N_SIGNAL") is None:
@@ -124,8 +125,8 @@ def main(argv):
 
         if FLAGS.shuffle:
             gin.bind_parameter("%SHUFFLE", [2])
-        else:
-            gin.bind_parameter("%SHUFFLE", None)
+        # else:
+        #     gin.bind_parameter("%SHUFFLE", None)
 
     if FLAGS.model == "rectified":
 
