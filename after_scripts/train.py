@@ -103,7 +103,8 @@ def main(argv):
 
     with gin.unlock_config():
         gin.bind_parameter("diffusion.utils.collate_fn.ae_ratio", ae_ratio)
-        gin.bind_parameter("diffusion.utils.collate_fn.random_crop", FLAGS.random_crop)
+        gin.bind_parameter("diffusion.utils.collate_fn.random_crop",
+                           FLAGS.random_crop)
         gin.bind_parameter("%IN_SIZE", ae_emb_size)
 
         if gin.query_parameter("%N_SIGNAL") is None:
@@ -124,8 +125,8 @@ def main(argv):
 
         if FLAGS.shuffle:
             gin.bind_parameter("%SHUFFLE", [2])
-        else:
-            gin.bind_parameter("%SHUFFLE", None)
+        # else:
+        #     gin.bind_parameter("%SHUFFLE", None)
 
     if FLAGS.model == "rectified":
 

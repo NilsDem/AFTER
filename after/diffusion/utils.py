@@ -52,6 +52,11 @@ def collate_fn(batch,
                timbre_augmentation_keys=[],
                random_crop=True):
 
+    max_size = max([b["z"].shape[-1] for b in batch])
+    for i, b in enumerate([b["z"] for b in batch]):
+        if b.shape[-1] < max_size:
+            batch[i]["z"] = np.tile(b, (1, max_size // b.shape[-1]))
+
     x = torch.from_numpy(np.stack([b["z"] for b in batch], axis=0))
     batch_size = x.shape[0]
 
@@ -63,7 +68,8 @@ def collate_fn(batch,
     else:
         i0 = np.random.randint(0, x.shape[-1] - n_signal, x.shape[0])
     x_target = crop([x], n_signal, i0)[0]
-    if not random_crop :
+
+    if not random_crop:
         x_timbre = x_target
     else:
         try:
@@ -77,14 +83,18 @@ def collate_fn(batch,
                     current_x = all_timbre[indexes[i]][i]
                     if current_x.shape[-1] < n_signal:
                         current_x = x[i]
-                        print("Warning: timbre signal too short, using original signal")
+                        print(
+                            "Warning: timbre signal too short, using original signal"
+                        )
                         current_x = np.pad(current_x,
                                            (0, n_signal - current_x.shape[-1]),
                                            mode="constant")
-                    if n_signal == x.shape[-1]:
+                    if n_signal == current_x.shape[-1]:
                         i1 = 0
                     else:
-                        i1 = np.random.randint(0, current_x.shape[-1] - n_signal, 1)[0]
+                        i1 = np.random.randint(0,
+                                               current_x.shape[-1] - n_signal,
+                                               1)[0]
                     current_x = current_x[..., i1:i1 + n_signal]
                     x_timbre.append(current_x)
 
@@ -95,7 +105,8 @@ def collate_fn(batch,
                     if n_signal == x.shape[-1]:
                         i1 = np.zeros(x.shape[0], dtype=int)
                     else:
-                        i1 = np.random.randint(0, x.shape[-1] - n_signal, x.shape[0])
+                        i1 = np.random.randint(0, x.shape[-1] - n_signal,
+                                               x.shape[0])
                 else:
                     nmax = int(n_signal * timbre_limit)
                     i1 = np.random.randint(-nmax, nmax, x.shape[0])
@@ -105,11 +116,11 @@ def collate_fn(batch,
                     ]
                 x_timbre = crop([x], n_signal, i1)[0]
 
-        except:
+        except Exception as e:
+            print(e)
             print("error with data augmentations")
             i1 = np.random.randint(0, x.shape[-1] - n_signal, x.shape[0])
             x_timbre = crop([x], n_signal, i1)[0]
-    
     if structure_type == "audio":
         time_cond_target = x_target
     elif structure_type == "midi":
