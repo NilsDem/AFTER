@@ -44,7 +44,7 @@ flags.DEFINE_string("emb_model_path", "music2latent",
 # Puts the dataset in cache prior to training for slow hard drives
 flags.DEFINE_bool("use_cache", False, "Whether to cache the dataset.")
 flags.DEFINE_integer("max_samples", None, "Maximum number of samples.")
-flags.DEFINE_integer("num_workers", 4, "Number of workers.")
+flags.DEFINE_integer("num_workers", 2, "Number of workers.")
 flags.DEFINE_multi_string("augmentation_keys", ["all"],
                           "List of augmentation keys.")
 flags.DEFINE_multi_string("augmentation_keys_exclude", [],
@@ -58,7 +58,7 @@ flags.DEFINE_multi_string("filter_exclude", [],
 flags.DEFINE_float("adv", None, "Adversarial strengh")
 flags.DEFINE_integer("zs", None, "Adversarial strengh")
 flags.DEFINE_integer("zt", None, "Adversarial strengh")
-flags.DEFINE_bool("shuffle", True, "Shuffle?")
+flags.DEFINE_bool("shuffle", False, "Shuffle?")
 flags.DEFINE_bool("use_validation", True, "Use a train/validation split")
 
 flags.DEFINE_string("load_encoder", None, "Path to encoder to load")
@@ -92,7 +92,7 @@ def main(argv):
     if FLAGS.emb_model_path == "music2latent":
         emb_model = M2LWrapper(device=device)
     else:
-        emb_model = torch.jit.load(FLAGS.emb_model_path).eval()  #.to(device)
+        emb_model = torch.jit.load(FLAGS.emb_model_path)  #.to(device)
     dummy = torch.randn(1, 1, 8192)  #.to(device)
     z = emb_model.encode(dummy)
     ae_emb_size = z.shape[1]
@@ -135,7 +135,7 @@ def main(argv):
         blender = EDM(device=device, emb_model=emb_model)
     else:
         raise ValueError("Model not recognized")
-
+        
     ######### LOAD AN EXTERNAL ENCODER #######
     if FLAGS.load_encoder is not None:
         print("Loading encoder from ", FLAGS.load_encoder)

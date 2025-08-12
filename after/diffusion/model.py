@@ -161,20 +161,6 @@ class Base(nn.Module):
                 torch.save(
                     d, model_dir + "/checkpoint" + str(self.step) + "_EMA.pt")
 
-            state_dict = self.state_dict()
-            state_dict = {
-                k: v
-                for k, v in state_dict.items() if "emb_model" not in k
-            }
-            d = {
-                "model_state": {
-                    k: v
-                    for k, v in state_dict.items() if "emb_model" not in k
-                },
-                "opt_state": self.opt.state_dict()
-            }
-
-            torch.save(d, model_dir + "/checkpoint" + str(self.step) + ".pt")
         else:
             state_dict = self.state_dict()
             state_dict = {
@@ -271,7 +257,8 @@ class Base(nn.Module):
             distill_step=None,
             distill_transfer_step=None,
             discriminator_pretrained_class=None,
-            discriminator_head_class=None):
+            discriminator_head_class=None,
+            double_distill = False):
 
         print(adversarial_weight)
 
@@ -423,20 +410,50 @@ class Base(nn.Module):
 
                         print("Initialisation of one-step refinement")
 
-                        discriminator_head = discriminator_head_class()
-                        discriminator_pretrained = discriminator_pretrained_class(
-                        )
-                        discriminator_pretrained.load_state_dict(
-                            self.net.state_dict(), strict=False)
+                        
 
-                        self.discriminator = LatentDiscriminator(
-                            discriminator_head=discriminator_head,
-                            pretrained_net=discriminator_pretrained).to(
-                                self.device)
-                        self.discriminator_opt = AdamW(
-                            self.discriminator.parameters(),
-                            lr=lr,
-                            betas=(0.9, 0.999))
+                        if double_distill:
+                            discriminator_head_timbre = discriminator_head_class()
+                            discriminator_pretrained_timbre = discriminator_pretrained_class(
+                            )
+                            discriminator_pretrained_timbre.load_state_dict(
+                                self.net.state_dict(), strict=False)
+                            
+                            discriminator_head_structure = discriminator_head_class()
+                            discriminator_pretrained_structure = discriminator_pretrained_class(
+                            )
+                            discriminator_pretrained_timbre.load_state_dict(
+                                self.net.state_dict(), strict=False)
+                            
+                            
+                            self.discriminator_timbre = LatentDiscriminator(
+                                discriminator_head=discriminator_head_timbre,
+                                pretrained_net=discriminator_pretrained_timbre).to(
+                                    self.device)
+                                
+                            self.discriminator_structure = LatentDiscriminator(
+                                discriminator_head=discriminator_head_structure,
+                                pretrained_net=discriminator_pretrained_structure).to(
+                                    self.device)
+                                
+                            self.discriminator_opt = AdamW(
+                                list(self.discriminator_timbre.parameters()) + list(self.discriminator_structure.parameters()),
+                                lr=lr,
+                                betas=(0.9, 0.999))
+                        else:
+                            discriminator_head = discriminator_head_class()
+                            discriminator_pretrained = discriminator_pretrained_class(
+                            )
+                            discriminator_pretrained.load_state_dict(
+                                self.net.state_dict(), strict=False)
+                            self.discriminator = LatentDiscriminator(
+                                discriminator_head=discriminator_head,
+                                pretrained_net=discriminator_pretrained).to(
+                                    self.device)
+                            self.discriminator_opt = AdamW(
+                                self.discriminator.parameters(),
+                                lr=lr,
+                                betas=(0.9, 0.999))
                         distill_init = True
 
                         with open(os.path.join(model_dir, "config.gin"),
@@ -469,35 +486,92 @@ class Base(nn.Module):
                     x0_renoise_x1 = torch.randn_like(x1)
                     x1_renoise = (1 -
                                   t_renoise) * x0_renoise_x1 + t_renoise * x1
+                    
+                    if double_distill:
+                        losses_timbre = self.discriminator_timbre.loss(
+                            reals=x1_renoise,
+                            fakes=x_onestep_renoised,
+                            time=t_renoise,
+                            cond_reals=cond,
+                            time_cond_reals=torch.zeros_like(time_cond),
+                            cond_fakes=cond_swap,
+                            time_cond_fakes=torch.zeros_like(time_cond_swap))
+                        
+                        losses_structure = self.discriminator_structure.loss(
+                            reals=x1_renoise,
+                            fakes=x_onestep_renoised,
+                            time=t_renoise,
+                            cond_reals=torch.zeros_like(cond),
+                            time_cond_reals=time_cond,
+                            cond_fakes=torch.zeros_like(cond_swap),
+                            time_cond_fakes=time_cond_swap)
+                        
+                        # loss_dis_structure = losses_structure["loss_dis"]
+                        # loss_dis_timbre = losses_timbre["loss_dis"]
+                        loss_dis = losses_structure["loss_dis"].mean() + losses_timbre["loss_dis"].mean()
+                        
+                        loss_adv = losses_structure["loss_adv"].mean() + losses_timbre["loss_adv"].mean()
+                        
+                    else:
+                        losses = self.discriminator.loss(
+                            reals=x1_renoise,
+                            fakes=x_onestep_renoised,
+                            time=t_renoise,
+                            cond_reals=cond,
+                            time_cond_reals=time_cond,
+                            cond_fakes=cond_swap,
+                            time_cond_fakes=time_cond_swap)
 
-                    losses = self.discriminator.loss(
-                        reals=x1_renoise,
-                        fakes=x_onestep_renoised,
-                        time=t_renoise,
-                        cond_reals=cond,
-                        time_cond_reals=time_cond,
-                        cond_fakes=cond_swap,
-                        time_cond_fakes=time_cond_swap)
+                        loss_dis = losses["loss_dis"].mean()
+                        loss_adv = losses["loss_adv"].mean()
 
-                    loss_dis = losses["loss_dis"].mean()
-                    loss_adv = losses["loss_adv"].mean()
-
-                    if not self.step % 2:
+                    if not self.step % 3:
+                        if double_distill:
+                            losses_timbre_contrastive = self.discriminator_timbre.loss(
+                                reals=x1_renoise,
+                                fakes=x1_renoise,
+                                time=t_renoise,
+                                cond_reals=cond,
+                                time_cond_reals=torch.zeros_like(time_cond),
+                                cond_fakes=cond[torch.randperm(cond.shape[0])],
+                                time_cond_fakes=torch.zeros_like(time_cond_swap))
+                            
+                            losses_structure_contrastive = self.discriminator_structure.loss(
+                                reals=x1_renoise,
+                                fakes=x1_renoise,
+                                time=t_renoise,
+                                cond_reals=torch.zeros_like(cond),
+                                time_cond_reals=time_cond,
+                                cond_fakes=torch.zeros_like(cond_swap),
+                                time_cond_fakes=time_cond[torch.randperm(time_cond.shape[0])])
+                            loss_contrastive = losses_structure_contrastive["loss_dis"].mean() + losses_timbre_contrastive["loss_dis"].mean()
+                        else:
+                            loss_contrastive = torch.tensor(0.).to(x1_renoise)
+                        
+                        
+                        loss = loss_dis + loss_contrastive
                         self.discriminator_opt.zero_grad()
-                        loss_dis.backward()
+                        loss.backward()
                         # torch.nn.utils.clip_grad_norm_(self.net.parameters(), 10.0)
                         self.discriminator_opt.step()
 
                     else:
                         self.opt.zero_grad()
                         loss_adv.backward()
-                        # torch.nn.utils.clip_grad_norm_(self.net.parameters(), 10.0)
+                        torch.nn.utils.clip_grad_norm_(self.net.parameters(), 10.0)
                         self.opt.step()
+                        loss_contrastive=None
 
                     lossdict = {
                         "Distill/loss_dis": loss_dis.item(),
                         "Distill/loss_adv": loss_adv.item(),
                     }
+                    
+                    if double_distill:
+                        if loss_contrastive is not None:
+                            lossdict["Distill/contrastive"] = loss_contrastive.item()
+                        lossdict["Distill/timbre_dis"] = losses_timbre["loss_adv"].mean().item()
+                        lossdict["Distill/structure_dis"] = losses_structure["loss_adv"].mean().item()
 
                     if self.step > distill_transfer_step:
                         lossdict.update({

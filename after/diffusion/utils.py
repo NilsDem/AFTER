@@ -53,10 +53,7 @@ def collate_fn(batch,
                random_crop=True):
 
     x = torch.from_numpy(np.stack([b["z"] for b in batch], axis=0))
-
-    # x = [torch.tensor(b["z"], dtype=torch.float32) for b in batch]
     batch_size = x.shape[0]
-    batch_size = len(x)
 
     if n_signal == x.shape[-1]:
         i0 = np.zeros(x.shape[0], dtype=int)
@@ -92,28 +89,6 @@ def collate_fn(batch,
                     x_timbre.append(current_x)
 
                 x_timbre = torch.from_numpy(np.stack(x_timbre, axis=0))
-
-        else:
-            if timbre_limit is None:
-                if n_signal == x.shape[-1]:
-                    i1 = np.zeros(x.shape[0], dtype=int)
-                else:
-                    i1 = np.random.randint(0, x.shape[-1] - n_signal,
-                                           x.shape[0])
-            else:
-                nmax = int(n_signal * timbre_limit)
-                i1 = np.random.randint(-nmax, nmax, x.shape[0])
-                i1 = [
-                    np.clip(i0c + i1c, 0, x.shape[-1] - n_signal)
-                    for i0c, i1c in zip(i0, i1)
-                ]
-            x_timbre = crop([x], n_signal, i1)[0]
-
-    except Exception as e:
-        print(e)
-        print("error with data augmentations")
-        i1 = np.random.randint(0, x.shape[-1] - n_signal, x.shape[0])
-        x_timbre = crop([x], n_signal, i1)[0]
 
             else:
                 if timbre_limit is None:
