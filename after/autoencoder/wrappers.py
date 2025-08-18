@@ -183,8 +183,9 @@ class EncodecWrapper:
 from stable_audio_tools.models.autoencoders import AudioAutoencoder
 from stable_audio_tools.models import create_model_from_config
 from stable_audio_tools.models.utils import load_ckpt_state_dict
-import json
+import json, math
 import torch
+from einops import rearrange
 
 
 def copy_state_dict(model, state_dict):
@@ -206,44 +207,178 @@ def copy_state_dict(model, state_dict):
     model.load_state_dict(model_state_dict, strict=False)
 
 
-class SAOWrapper():
-    """Wrapper for the EncoderDecoder model to use it with the AudioExample class."""
+class SAOWrapper:
+    """SAO wrapper with chunked overlap-add encode/decode (batched)."""
 
-    def __init__(self, device="cpu"):
+    def __init__(
+        self,
+        device="cpu",
+        ckpt_path="/data/nils/repos/codecs_benchmark/autoencoder_runs/sao/vae_model.ckpt",
+        model_config="/data/nils/repos/codecs_benchmark/autoencoder_runs/sao/vae_model_config.json"
+    ):
 
-        ckpt_path = "/data/nils/repos/codecs_benchmark/autoencoder_runs/sao/vae_model.ckpt"
-        model_config = "/data/nils/repos/codecs_benchmark/autoencoder_runs/sao/vae_model_config.json"
         with open(model_config) as f:
             model_config = json.load(f)
-
         model = create_model_from_config(model_config)
-
         copy_state_dict(model, load_ckpt_state_dict(ckpt_path))
 
-        self.model = model
-        self.to(device)
+        self.model = model.to(device).eval()
+        self.device = device
+
+        # convenience
+        self.sr = model.sample_rate
+        self.compress_ratio = model.downsampling_ratio
+        self.latent_dim = model.latent_dim
+        self.in_channels = model.in_channels
+        self.out_channels = model.out_channels
 
     def to(self, device):
         self.model.to(device)
+        self.device = device
         return self
 
     def cpu(self):
-        self.model.cpu()
-        return self
+        return self.to("cpu")
 
     def eval(self):
         self.model.eval()
         return self
 
-    def encode(self, x):
-        x = x.repeat(1, 2, 1)
-        z = self.model.encode(x)
-        return z
+    def encode(self,
+               audio,
+               chunked=True,
+               chunk_size=32,
+               overlap=4,
+               max_batch_size=1):
+        """
+        Encode batched audio with optional chunking.
+        audio: (B, C, T), already preprocessed to correct channels and sample rate
+        Returns latents: (B, latent_dim, latent_length)
+        """
+        if audio.shape[1] == 1:
+            audio = audio.repeat(1, 2, 1)
+        bs, n_ch, sample_length = audio.shape
+        compress_ratio = self.compress_ratio
 
-    def decode(self, z):
-        x = self.model.decode(z)
-        x = x.mean(dim=1, keepdim=True)
-        return x
+        if (audio.shape[-1] // compress_ratio) < 2 * chunk_size:
+            chunked = False
 
-    def __call__(self, x):
-        return self.decode(self.encode(x))
+        assert n_ch == self.in_channels
+        assert sample_length % compress_ratio == 0, "Audio length must be multiple of compression ratio."
+
+        latent_length = sample_length // compress_ratio
+        hopsize_l = chunk_size - overlap
+        win = torch.bartlett_window(overlap * 2, device=audio.device)
+
+        if not chunked:
+            return self.model.encode(audio)
+
+        # --- chunked path ---
+        chunk_size_s = chunk_size * compress_ratio
+        overlap_s = overlap * compress_ratio
+        hopsize_s = hopsize_l * compress_ratio
+
+        n_chunk = int(math.ceil(
+            (sample_length - chunk_size_s) / hopsize_s)) + 1
+        pad_len = chunk_size_s + hopsize_s * (n_chunk - 1) - sample_length
+        audio = F.pad(audio, (0, pad_len))
+
+        chunks = []
+        for i in range(n_chunk):
+            head = i * hopsize_s
+            chunk = audio[..., head:head + chunk_size_s]
+            chunks.append(chunk)
+        chunks = torch.stack(chunks, dim=1)  # (B, n_chunk, C, chunk_size_s)
+        chunks = rearrange(chunks, "b n c l -> (b n) c l")
+
+        # batched encoding
+        zs = []
+        for i in range(0, chunks.shape[0], max_batch_size):
+            z_ = self.model.encode(chunks[i:i + max_batch_size])
+            zs.append(z_)
+        zs = torch.cat(zs, dim=0)
+        zs = rearrange(zs, "(b n) c l -> b n c l", b=bs)
+
+        # overlap-add crossfade in latent domain
+        latents = torch.zeros(
+            (bs, self.latent_dim, audio.shape[-1] // compress_ratio),
+            device=audio.device)
+        for i in range(n_chunk):
+            z_ = zs[:, i]
+            if i != 0:
+                z_[:, :, :overlap] *= win[:overlap]
+            if i != n_chunk - 1:
+                z_[:, :, -overlap:] *= win[-overlap:]
+            head = i * hopsize_l
+            latents[..., head:head + chunk_size] += z_
+
+        return latents[..., :latent_length]
+
+    def decode(self,
+               latents,
+               chunked=True,
+               chunk_size=32,
+               overlap=4,
+               max_batch_size=1):
+        """
+        Decode latents with optional chunking.
+        latents: (B, latent_dim, latent_length)
+        Returns audio: (B, C, T)
+        """
+        bs, latent_dim, latent_length = latents.shape
+        compress_ratio = self.compress_ratio
+        assert latent_dim == self.latent_dim
+
+        if latents.shape[-1] < 2 * chunk_size:
+            chunked = False
+
+        hopsize = chunk_size - overlap
+        chunk_size_s = chunk_size * compress_ratio
+        overlap_s = overlap * compress_ratio
+        hopsize_s = hopsize * compress_ratio
+        sample_length = latent_length * compress_ratio
+
+        win = torch.bartlett_window(overlap_s * 2, device=latents.device)
+
+        if not chunked:
+            return self.model.decode(latents)
+
+        # --- chunked path ---
+        n_chunk = int(math.ceil((latent_length - chunk_size) / hopsize)) + 1
+        pad_len = chunk_size + hopsize * (n_chunk - 1) - latent_length
+        latents = F.pad(latents, (0, pad_len), mode="reflect")
+
+        chunks = []
+        for i in range(n_chunk):
+            head = i * hopsize
+            chunk = latents[..., head:head + chunk_size]
+            chunks.append(chunk)
+        chunks = torch.stack(chunks, dim=1)
+        chunks = rearrange(chunks, "b n c l -> (b n) c l")
+
+        # batched decoding
+        xs = []
+        for i in range(0, chunks.shape[0], max_batch_size):
+            x_ = self.model.decode(chunks[i:i + max_batch_size])
+            xs.append(x_)
+        xs = torch.cat(xs, dim=0)
+        xs = rearrange(xs, "(b n) c l -> b n c l", b=bs)
+
+        audios = torch.zeros(
+            (bs, xs.shape[2], latents.shape[-1] * compress_ratio),
+            device=latents.device)
+        for i in range(n_chunk):
+            x_ = xs[:, i]
+            if i != 0:
+                x_[..., :overlap_s] *= win[:overlap_s]
+            if i != n_chunk - 1:
+                x_[..., -overlap_s:] *= win[-overlap_s:]
+            head = i * hopsize_s
+            audios[..., head:head + chunk_size_s] += x_
+        print("hi")
+        return audios[:, :1, :sample_length]
+
+    def __call__(self, x, **kwargs):
+        """shortcut: encode+decode"""
+        z = self.encode(x, **kwargs)
+        return self.decode(z, **kwargs)
