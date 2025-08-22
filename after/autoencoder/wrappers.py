@@ -514,7 +514,11 @@ from datasets import load_dataset
 class MERTWrapper:
     """Wrapper around Facebook's Encodec model."""
 
-    def __init__(self, device="cpu", layer_target=-1):
+    def __init__(self,
+                 device="cpu",
+                 layer_target=-1,
+                 mode="mert",
+                 target_ratio=None):
         self.device = device
 
         self.fwd_resampler = torchaudio.transforms.Resample(orig_freq=44100,
@@ -528,6 +532,8 @@ class MERTWrapper:
         self.processor = Wav2Vec2FeatureExtractor.from_pretrained(
             "m-a-p/MERT-v1-95M", trust_remote_code=True)
         self.layer_target = layer_target
+        self.target_ratio = target_ratio
+        self.mode = mode
 
         self.to(device)
 
@@ -547,10 +553,10 @@ class MERTWrapper:
 
     def encode(self, x):
         # expects x: (B,1,T)
-        x = self.fwd_resampler(x)  # repeat to stereo
+        x_resamp = self.fwd_resampler(x)  # repeat to stereo
         # extract the the audio representation
 
-        inputs = self.processor(x.squeeze(1).cpu().numpy(),
+        inputs = self.processor(x_resamp.squeeze(1).cpu().numpy(),
                                 sampling_rate=self.processor.sampling_rate,
                                 return_tensors="pt",
                                 padding=True)
@@ -564,6 +570,20 @@ class MERTWrapper:
         embed = all_layer_hidden_states[self.layer_target]
         embed = torch.permute(embed, (0, 2, 1))
 
+        if self.mode == "mert":
+            pass
+        elif self.mode == "linear":
+            target_size = x.shape[-1] // self.target_ratio
+            embed = torch.nn.functional.interpolate(embed,
+                                                    size=target_size,
+                                                    mode='linear',
+                                                    align_corners=False)
+        elif self.mode == "nearest":
+            target_size = x.shape[-1] // self.target_ratio
+            embed = torch.nn.functional.interpolate(embed,
+                                                    size=target_size,
+                                                    mode='nearest')
+        print(x.shape, embed.shape)
         return embed
 
     def decode(self, codes):
