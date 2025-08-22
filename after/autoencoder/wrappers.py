@@ -180,9 +180,6 @@ class EncodecWrapper:
         return self.decode(self.encode(x))
 
 
-from stable_audio_tools.models.autoencoders import AudioAutoencoder
-from stable_audio_tools.models import create_model_from_config
-from stable_audio_tools.models.utils import load_ckpt_state_dict
 import json, math
 import torch
 from einops import rearrange
@@ -216,6 +213,9 @@ class SAOWrapper:
         ckpt_path="/data/nils/repos/codecs_benchmark/autoencoder_runs/sao/vae_model.ckpt",
         model_config="/data/nils/repos/codecs_benchmark/autoencoder_runs/sao/vae_model_config.json"
     ):
+        from stable_audio_tools.models.autoencoders import AudioAutoencoder
+        from stable_audio_tools.models import create_model_from_config
+        from stable_audio_tools.models.utils import load_ckpt_state_dict
 
         with open(model_config) as f:
             model_config = json.load(f)
@@ -246,7 +246,7 @@ class SAOWrapper:
 
     def encode(self,
                audio,
-               chunked=True,
+               chunked=False,
                chunk_size=32,
                overlap=4,
                max_batch_size=1):
@@ -260,7 +260,7 @@ class SAOWrapper:
         bs, n_ch, sample_length = audio.shape
         compress_ratio = self.compress_ratio
 
-        if (audio.shape[-1] // compress_ratio) < 2 * chunk_size:
+        if (audio.shape[-1] // compress_ratio) < 4 * chunk_size:
             chunked = False
 
         assert n_ch == self.in_channels
@@ -316,7 +316,7 @@ class SAOWrapper:
 
     def decode(self,
                latents,
-               chunked=True,
+               chunked=False,
                chunk_size=32,
                overlap=4,
                max_batch_size=1):
@@ -329,7 +329,7 @@ class SAOWrapper:
         compress_ratio = self.compress_ratio
         assert latent_dim == self.latent_dim
 
-        if latents.shape[-1] < 2 * chunk_size:
+        if latents.shape[-1] < 4 * chunk_size:
             chunked = False
 
         hopsize = chunk_size - overlap
@@ -341,7 +341,8 @@ class SAOWrapper:
         win = torch.bartlett_window(overlap_s * 2, device=latents.device)
 
         if not chunked:
-            return self.model.decode(latents)
+            audios = self.model.decode(latents)
+            return audios[:, :1, :sample_length]
 
         # --- chunked path ---
         n_chunk = int(math.ceil((latent_length - chunk_size) / hopsize)) + 1
@@ -382,3 +383,191 @@ class SAOWrapper:
         """shortcut: encode+decode"""
         z = self.encode(x, **kwargs)
         return self.decode(z, **kwargs)
+
+
+import sys
+
+sys.path.append("/data/nils/repos/codecs_benchmark/beats/unilm/beats")
+
+import torch
+from BEATs import BEATs, BEATsConfig
+
+
+class BeatsWrapper:
+    """Wrapper around Facebook's Encodec model."""
+
+    def __init__(self, device="cpu"):
+        self.device = device
+
+        self.fwd_resampler = torchaudio.transforms.Resample(orig_freq=44100,
+                                                            new_freq=16000).to(
+                                                                self.device)
+        self.inverse_resampler = torchaudio.transforms.Resample(
+            orig_freq=16000, new_freq=44100).to(self.device)
+
+        # load the pre-trained checkpoints
+        checkpoint = torch.load(
+            '/data/nils/repos/codecs_benchmark/beats/unilm/beats/beats2.pt')
+
+        cfg = BEATsConfig(checkpoint['cfg'])
+        self.BEATs_model = BEATs(cfg)
+        self.BEATs_model.load_state_dict(checkpoint['model'])
+        self.BEATs_model.eval()
+        self.to(device)
+
+    def to(self, device):
+        self.BEATs_model.to(device)
+        self.inverse_resampler.to(device)
+        self.fwd_resampler.to(device)
+        self.device = device
+        return self
+
+    def cpu(self):
+        self.to("cpu")
+        return self
+
+    def eval(self):
+        self.BEATs_model.eval()
+        return self
+
+    def encode(self, x):
+        # expects x: (B,1,T)
+        x = self.fwd_resampler(x)  # repeat to stereo
+        # extract the the audio representation
+        padding_mask = None
+
+        representation = self.BEATs_model.extract_features(
+            x.squeeze(1), padding_mask=padding_mask)
+
+        representation = torch.permute(representation, (0, 2, 1))
+        return representation
+
+    def decode(self, codes):
+        return None
+
+    def __call__(self, x):
+        return None
+
+
+import torch
+
+from laion_clap import CLAP_Module
+
+
+class CLAPWrapper:
+    """Wrapper around Facebook's Encodec model."""
+
+    def __init__(self, device="cpu"):
+        self.device = device
+
+        self.fwd_resampler = torchaudio.transforms.Resample(orig_freq=44100,
+                                                            new_freq=48000).to(
+                                                                self.device)
+        self.inverse_resampler = torchaudio.transforms.Resample(
+            orig_freq=48000, new_freq=44100).to(self.device)
+
+        self.model = CLAP_Module(enable_fusion=False)
+        self.model.load_ckpt()
+        self.model.to(device)
+
+        self.to(device)
+
+    def to(self, device):
+        self.model.to(device)
+        self.inverse_resampler.to(device)
+        self.fwd_resampler.to(device)
+        self.device = device
+        return self
+
+    def cpu(self):
+        self.to("cpu")
+        return self
+
+    def eval(self):
+        self.model.eval()
+        return self
+
+    def encode(self, x):
+        # expects x: (B,1,T)
+        x = self.fwd_resampler(x)  # repeat to stereo
+
+        x = x.squeeze(1)
+        embed = self.model.get_audio_embedding_from_data(x=x, use_tensor=True)
+        return embed.unsqueeze(-1).repeat(1, 1, 4)
+
+    def decode(self, codes):
+        return None
+
+    def __call__(self, x):
+        return None
+
+
+# from transformers import Wav2Vec2Processor
+from transformers import Wav2Vec2FeatureExtractor
+from transformers import AutoModel
+import torch
+from torch import nn
+import torchaudio.transforms as T
+from datasets import load_dataset
+
+
+class MERTWrapper:
+    """Wrapper around Facebook's Encodec model."""
+
+    def __init__(self, device="cpu", layer_target=-1):
+        self.device = device
+
+        self.fwd_resampler = torchaudio.transforms.Resample(orig_freq=44100,
+                                                            new_freq=24000).to(
+                                                                self.device)
+
+        # loading our model weights
+        self.model = AutoModel.from_pretrained("m-a-p/MERT-v1-95M",
+                                               trust_remote_code=True)
+        # loading the corresponding preprocessor config
+        self.processor = Wav2Vec2FeatureExtractor.from_pretrained(
+            "m-a-p/MERT-v1-95M", trust_remote_code=True)
+        self.layer_target = layer_target
+
+        self.to(device)
+
+    def to(self, device):
+        self.model.to(device)
+        self.fwd_resampler.to(device)
+        self.device = device
+        return self
+
+    def cpu(self):
+        self.to("cpu")
+        return self
+
+    def eval(self):
+        self.model.eval()
+        return self
+
+    def encode(self, x):
+        # expects x: (B,1,T)
+        x = self.fwd_resampler(x)  # repeat to stereo
+        # extract the the audio representation
+
+        inputs = self.processor(x.squeeze(1).cpu().numpy(),
+                                sampling_rate=self.processor.sampling_rate,
+                                return_tensors="pt",
+                                padding=True)
+
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        outputs = self.model(**inputs, output_hidden_states=True)
+
+        all_layer_hidden_states = torch.stack(outputs.hidden_states)
+
+        embed = all_layer_hidden_states[self.layer_target]
+        embed = torch.permute(embed, (0, 2, 1))
+
+        return embed
+
+    def decode(self, codes):
+        return None
+
+    def __call__(self, x):
+        return None
