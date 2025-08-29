@@ -155,8 +155,12 @@ class Base(nn.Module):
                         k: v
                         for k, v in state_dict.items() if "emb_model" not in k
                     },
-                    "opt_state": self.opt.state_dict()
+                    "opt_state": self.opt.state_dict(),
+                    "opt_classifier_state": self.opt_classifier.state_dict(),
                 }
+                
+                if self.distill:
+                    d["opt_discriminator_state"] =  self.opt_discriminator.state_dict()
 
                 torch.save(
                     d, model_dir + "/checkpoint" + str(self.step) + "_EMA.pt")
@@ -172,8 +176,11 @@ class Base(nn.Module):
                     k: v
                     for k, v in state_dict.items if "emb_model" not in k
                 },
-                "opt_state": self.opt.state_dict()
+                "opt_state": self.opt.state_dict(),
+                "opt_classifier_state": self.opt_classifier.state_dict(),
             }
+            if self.distill:
+                d["opt_discriminator_state"]  =  self.opt_discriminator.state_dict()
 
             torch.save(d, model_dir + "/checkpoint" + str(self.step) + ".pt")
 
@@ -198,8 +205,8 @@ class Base(nn.Module):
         indices = torch.randperm(B)
 
         # Divide into 3 approximately equal parts
-        split1 = B // 3
-        split2 = 2 * B // 3
+        split1 = B // 2
+        split2 = 3 * B // 4
 
         idx_aligned = indices[:split1]
         idx_swap_time = indices[split1:split2]
@@ -218,6 +225,57 @@ class Base(nn.Module):
         cond_swap[idx_swap_cond] = cond[idx_swap_cond[cond_perm]]
 
         return time_cond_swap, cond_swap, idx_aligned, idx_swap_time, idx_swap_cond
+    
+    def init_distill(self,
+                     double_distill: bool,
+                     model_dir:str,
+                     discriminator_head_class: nn.Module,
+                     discriminator_pretrained_class: nn.Module):
+        if double_distill:
+            discriminator_head_timbre = discriminator_head_class()
+            discriminator_pretrained_timbre = discriminator_pretrained_class(
+            )
+            discriminator_pretrained_timbre.load_state_dict(
+                self.net.state_dict(), strict=False)
+            
+            discriminator_head_structure = discriminator_head_class()
+            discriminator_pretrained_structure = discriminator_pretrained_class(
+            )
+            discriminator_pretrained_timbre.load_state_dict(
+                self.net.state_dict(), strict=False)
+            
+            
+            self.discriminator_timbre = LatentDiscriminator(
+                discriminator_head=discriminator_head_timbre,
+                pretrained_net=discriminator_pretrained_timbre).to(
+                    self.device)
+                
+            self.discriminator_structure = LatentDiscriminator(
+                discriminator_head=discriminator_head_structure,
+                pretrained_net=discriminator_pretrained_structure).to(
+                    self.device)
+                
+            self.opt_discriminator = AdamW(
+                list(self.discriminator_timbre.parameters()) + list(self.discriminator_structure.parameters()),
+                lr=1e-4,
+                betas=(0.9, 0.999))
+        else:
+            discriminator_head = discriminator_head_class()
+            discriminator_pretrained = discriminator_pretrained_class(
+            )
+            discriminator_pretrained.load_state_dict(
+                self.net.state_dict(), strict=False)
+            self.discriminator = LatentDiscriminator(
+                discriminator_head=discriminator_head,
+                pretrained_net=discriminator_pretrained).to(
+                    self.device)
+            self.opt_discriminator = AdamW(
+                self.discriminator.parameters(),
+                lr=1e-4,
+                betas=(0.9, 0.999))
+            
+        with open(os.path.join(model_dir, "config.gin"),"w") as config_out:
+            config_out.write(gin.operative_config_str())
 
     @gin.configurable
     def fit(self,
@@ -268,6 +326,13 @@ class Base(nn.Module):
         self.max_steps = max_steps
 
         self.init_train(lr=lr, dataloader=validloader)
+        
+        
+        if distill_step is not None:
+            self.distill = True
+            self.init_distill(double_distill=double_distill,model_dir=model_dir, discriminator_head_class=discriminator_head_class,discriminator_pretrained_class=discriminator_pretrained_class)
+        else:
+            self.distill = False
 
         if restart_step is not None and restart_step > 0:
             state_dict = torch.load(f"{model_dir}/checkpoint" +
@@ -286,7 +351,7 @@ class Base(nn.Module):
                 for key, value in state_dict_model.items()
                 if (load_encoders[2] or "net." not in key)
             }
-
+            
             print("RELOADING")
             print(state_dict_model.keys())
             self.load_state_dict(state_dict_model, strict=False)
@@ -296,8 +361,22 @@ class Base(nn.Module):
             except Exception as e:
                 print(e)
                 print("Could not load optimizer state")
+            
+            try:
+                self.opt_classifier.load_state_dict(state_dict["opt_classifier_state"])
+            except Exception as e:
+                print(e)
+                print("Could not load optimizer state for classifier")
+                
+            if self.distill:
+                try:
+                    self.opt_discriminator.load_state_dict(state_dict["opt_discriminator_state"])
+                except Exception as e:
+                    print(e)
+                    print("Could not load optimizer state for distill discriminator")
+                
+                
             self.step = restart_step + 1
-
             print("Restarting from step ", self.step)
 
         if self.use_ema:
@@ -315,11 +394,10 @@ class Base(nn.Module):
         losses_sum = {}
         losses_sum_count = {}
 
-        distill_init = False
-
         with open(os.path.join(model_dir, "config.gin"), "w") as config_out:
             config_out.write(gin.operative_config_str())
 
+        self.save_model(model_dir)
         for e in range(n_epochs):
             for batch in dataloader:
                 if (self.step > stop_training_encoder_step
@@ -406,60 +484,6 @@ class Base(nn.Module):
                         time_cond_swap = time_cond
                         cond_swap = cond
 
-                    if distill_init is False:
-
-                        print("Initialisation of one-step refinement")
-
-                        
-
-                        if double_distill:
-                            discriminator_head_timbre = discriminator_head_class()
-                            discriminator_pretrained_timbre = discriminator_pretrained_class(
-                            )
-                            discriminator_pretrained_timbre.load_state_dict(
-                                self.net.state_dict(), strict=False)
-                            
-                            discriminator_head_structure = discriminator_head_class()
-                            discriminator_pretrained_structure = discriminator_pretrained_class(
-                            )
-                            discriminator_pretrained_timbre.load_state_dict(
-                                self.net.state_dict(), strict=False)
-                            
-                            
-                            self.discriminator_timbre = LatentDiscriminator(
-                                discriminator_head=discriminator_head_timbre,
-                                pretrained_net=discriminator_pretrained_timbre).to(
-                                    self.device)
-                                
-                            self.discriminator_structure = LatentDiscriminator(
-                                discriminator_head=discriminator_head_structure,
-                                pretrained_net=discriminator_pretrained_structure).to(
-                                    self.device)
-                                
-                            self.discriminator_opt = AdamW(
-                                list(self.discriminator_timbre.parameters()) + list(self.discriminator_structure.parameters()),
-                                lr=lr,
-                                betas=(0.9, 0.999))
-                        else:
-                            discriminator_head = discriminator_head_class()
-                            discriminator_pretrained = discriminator_pretrained_class(
-                            )
-                            discriminator_pretrained.load_state_dict(
-                                self.net.state_dict(), strict=False)
-                            self.discriminator = LatentDiscriminator(
-                                discriminator_head=discriminator_head,
-                                pretrained_net=discriminator_pretrained).to(
-                                    self.device)
-                            self.discriminator_opt = AdamW(
-                                self.discriminator.parameters(),
-                                lr=lr,
-                                betas=(0.9, 0.999))
-                        distill_init = True
-
-                        with open(os.path.join(model_dir, "config.gin"),
-                                  "w") as config_out:
-                            config_out.write(gin.operative_config_str())
-
                     # Make a onestep generation
                     x0 = torch.randn_like(x1)
                     # t = torch.rand(x0.size(0), 1, 1).to(self.device)
@@ -510,7 +534,7 @@ class Base(nn.Module):
                         # loss_dis_timbre = losses_timbre["loss_dis"]
                         loss_dis = losses_structure["loss_dis"].mean() + losses_timbre["loss_dis"].mean()
                         
-                        loss_adv = losses_structure["loss_adv"].mean() + losses_timbre["loss_adv"].mean()
+                        loss_adv = 0.5*(losses_structure["loss_adv"].mean()*2. + losses_timbre["loss_adv"].mean()*0.5)
                         
                     else:
                         losses = self.discriminator.loss(
@@ -525,7 +549,7 @@ class Base(nn.Module):
                         loss_dis = losses["loss_dis"].mean()
                         loss_adv = losses["loss_adv"].mean()
 
-                    if not self.step % 3:
+                    if not self.step % 4:
                         if double_distill:
                             losses_timbre_contrastive = self.discriminator_timbre.loss(
                                 reals=x1_renoise,
@@ -550,10 +574,10 @@ class Base(nn.Module):
                         
                         
                         loss = loss_dis + loss_contrastive
-                        self.discriminator_opt.zero_grad()
+                        self.opt_discriminator.zero_grad()
                         loss.backward()
                         # torch.nn.utils.clip_grad_norm_(self.net.parameters(), 10.0)
-                        self.discriminator_opt.step()
+                        self.opt_discriminator.step()
 
                     else:
                         self.opt.zero_grad()
@@ -574,17 +598,19 @@ class Base(nn.Module):
                         lossdict["Distill/structure_dis"] = losses_structure["loss_adv"].mean().item()
 
                     if self.step > distill_transfer_step:
-                        lossdict.update({
-                            "Distill/loss_dis_aligned":
-                            losses["loss_dis"][idx_aligned].mean().item(),
-                            "Distill/loss_dis_swap_time":
-                            losses["loss_dis"][idx_swap_time].mean().item(),
-                            "Distill/loss_dis_swap_cond":
-                            losses["loss_dis"][idx_swap_cond].mean().item(),
-                        })
+                        if double_distill:
+                            pass
+                        else:
+                            lossdict.update({
+                                "Distill/loss_dis_aligned":
+                                losses["loss_dis"][idx_aligned].mean().item(),
+                                "Distill/loss_dis_swap_time":
+                                losses["loss_dis"][idx_swap_time].mean().item(),
+                                "Distill/loss_dis_swap_cond":
+                                losses["loss_dis"][idx_swap_cond].mean().item(),
+                            })
 
-                elif self.step > timbre_warmup and not (
-                        self.step % update_classifier_every
+                elif self.step > timbre_warmup and not (self.step % update_classifier_every
                         == 0) and self.classifier is not None:
 
                     cond_pred = self.classifier(time_cond.detach())
@@ -772,7 +798,7 @@ class Base(nn.Module):
 
                         # for nb_steps in [5, 40]:
 
-                        nb_steps = [20] + ([1] if distill_init else [])
+                        nb_steps = [20] + ([1] if self.distill else [])
 
                         for nb_step in nb_steps:
                             x1_rec = self.sample(x0,

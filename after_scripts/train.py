@@ -25,7 +25,7 @@ flags.DEFINE_multi_string("config", [], "List of config files.")
 flags.DEFINE_string("model", "rectified", "Model type.")
 
 # Training
-flags.DEFINE_integer("bsize", 64, "Batch size.")
+flags.DEFINE_integer("bsize", 32, "Batch size.")
 flags.DEFINE_integer("n_signal", 32,
                      "Training length in number of latent steps")
 
@@ -42,7 +42,7 @@ flags.DEFINE_string("emb_model_path", "music2latent",
                     "Path to the embedding model.")
 
 # Puts the dataset in cache prior to training for slow hard drives
-flags.DEFINE_bool("use_cache", False, "Whether to cache the dataset.")
+flags.DEFINE_bool("use_cache", True, "Whether to cache the dataset.")
 flags.DEFINE_integer("max_samples", None, "Maximum number of samples.")
 flags.DEFINE_integer("num_workers", 2, "Number of workers.")
 flags.DEFINE_multi_string("augmentation_keys", ["all"],

@@ -97,6 +97,8 @@ class ConvDiscriminator(nn.Module):
         cond_layers=None,
     ):
         super().__init__()
+        
+      
         self.loss_type = loss_type
         self.soft_clip_scale = soft_clip_scale
         self.cond_layers = cond_layers or num_layers  # default: apply to all
@@ -134,7 +136,6 @@ class ConvDiscriminator(nn.Module):
         self.layers = nn.ModuleList(layers)
 
     def forward(self, x, cond=None, time_cond=None):
-
         for block in self.layers:
             x, time_cond = block(x, time_cond, cond)
 
@@ -183,6 +184,8 @@ class LatentDiscriminator(nn.Module):
                                     time=time,
                                     cond=cond_reals,
                                     time_cond=time_cond_reals)
+        
+        
         fakes = self.pretrained_net(x=fakes,
                                     time=time,
                                     cond=cond_fakes,
