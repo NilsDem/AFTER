@@ -33,7 +33,7 @@ class SimpleDataset(torch.utils.data.Dataset):
         self.max_samples = max_samples
         self.recache_every = recache_every
         self.recache_counter = 0
-
+        print(path)
         self.env = lmdb.open(path,
                              lock=False,
                              readonly=readonly,
@@ -205,6 +205,7 @@ class CombinedDataset(torch.utils.data.Dataset):
             info_dict = dataset_dict
 
         elif path_dict is not None:
+
             self.datasets = {
                 k:
                 SimpleDataset(v["path"],

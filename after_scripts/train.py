@@ -136,7 +136,7 @@ def main(argv):
         blender = EDM(device=device, emb_model=emb_model)
     else:
         raise ValueError("Model not recognized")
-        
+
     ######### LOAD AN EXTERNAL ENCODER #######
     if FLAGS.load_encoder is not None:
         print("Loading encoder from ", FLAGS.load_encoder)
@@ -159,7 +159,7 @@ def main(argv):
     n_signal_waveform = n_signal * ae_ratio
     structure_type = gin.query_parameter("%STRUCTURE_TYPE")
 
-    data_keys = ["z"
+    data_keys = ["z", "clap_m2l"
                  ] + (["waveform"] if blender.time_transform is not None else
                       []) + (["midi"] if structure_type == "midi" else [])
 

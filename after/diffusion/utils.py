@@ -50,7 +50,8 @@ def collate_fn(batch,
                ae_ratio,
                timbre_limit=None,
                timbre_augmentation_keys=[],
-               random_crop=True):
+               random_crop=True,
+               timbre_type="z"):
 
     max_size = max([b["z"].shape[-1] for b in batch])
     for i, b in enumerate([b["z"] for b in batch]):
@@ -69,58 +70,61 @@ def collate_fn(batch,
         i0 = np.random.randint(0, x.shape[-1] - n_signal, x.shape[0])
     x_target = crop([x], n_signal, i0)[0]
 
-    if not random_crop:
-        x_timbre = x_target
+    if timbre_type == "clap":
+        x_timbre = np.stack([b["clap_m2l"] for b in batch], axis=0)
+        x_timbre = torch.from_numpy(x_timbre).float()
     else:
-        try:
-            if len(timbre_augmentation_keys) > 0:
-                all_timbre, x_timbre = [], []
-                for key in timbre_augmentation_keys:
-                    all_timbre.append([b[key] for b in batch])
+        if not random_crop:
+            x_timbre = x_target
+        else:
+            try:
+                if len(timbre_augmentation_keys) > 0:
+                    all_timbre, x_timbre = [], []
+                    for key in timbre_augmentation_keys:
+                        all_timbre.append([b[key] for b in batch])
 
-                indexes = np.random.randint(0, len(all_timbre), batch_size)
-                for i in range(batch_size):
-                    current_x = all_timbre[indexes[i]][i]
-                    if current_x.shape[-1] < n_signal:
-                        current_x = x[i]
-                        print(
-                            "Warning: timbre signal too short, using original signal"
-                        )
-                        current_x = np.pad(current_x,
-                                           (0, n_signal - current_x.shape[-1]),
-                                           mode="constant")
-                    if n_signal == current_x.shape[-1]:
-                        i1 = 0
-                    else:
-                        i1 = np.random.randint(0,
-                                               current_x.shape[-1] - n_signal,
-                                               1)[0]
-                    current_x = current_x[..., i1:i1 + n_signal]
-                    x_timbre.append(current_x)
+                    indexes = np.random.randint(0, len(all_timbre), batch_size)
+                    for i in range(batch_size):
+                        current_x = all_timbre[indexes[i]][i]
+                        if current_x.shape[-1] < n_signal:
+                            current_x = x[i]
+                            print(
+                                "Warning: timbre signal too short, using original signal"
+                            )
+                            current_x = np.pad(
+                                current_x, (0, n_signal - current_x.shape[-1]),
+                                mode="constant")
+                        if n_signal == current_x.shape[-1]:
+                            i1 = 0
+                        else:
+                            i1 = np.random.randint(
+                                0, current_x.shape[-1] - n_signal, 1)[0]
+                        current_x = current_x[..., i1:i1 + n_signal]
+                        x_timbre.append(current_x)
 
-                x_timbre = torch.from_numpy(np.stack(x_timbre, axis=0))
+                    x_timbre = torch.from_numpy(np.stack(x_timbre, axis=0))
 
-            else:
-                if timbre_limit is None:
-                    if n_signal == x.shape[-1]:
-                        i1 = np.zeros(x.shape[0], dtype=int)
-                    else:
-                        i1 = np.random.randint(0, x.shape[-1] - n_signal,
-                                               x.shape[0])
                 else:
-                    nmax = int(n_signal * timbre_limit)
-                    i1 = np.random.randint(-nmax, nmax, x.shape[0])
-                    i1 = [
-                        np.clip(i0c + i1c, 0, x.shape[-1] - n_signal)
-                        for i0c, i1c in zip(i0, i1)
-                    ]
-                x_timbre = crop([x], n_signal, i1)[0]
+                    if timbre_limit is None:
+                        if n_signal == x.shape[-1]:
+                            i1 = np.zeros(x.shape[0], dtype=int)
+                        else:
+                            i1 = np.random.randint(0, x.shape[-1] - n_signal,
+                                                   x.shape[0])
+                    else:
+                        nmax = int(n_signal * timbre_limit)
+                        i1 = np.random.randint(-nmax, nmax, x.shape[0])
+                        i1 = [
+                            np.clip(i0c + i1c, 0, x.shape[-1] - n_signal)
+                            for i0c, i1c in zip(i0, i1)
+                        ]
+                    x_timbre = crop([x], n_signal, i1)[0]
 
-        except Exception as e:
-            print(e)
-            print("error with data augmentations")
-            i1 = np.random.randint(0, x.shape[-1] - n_signal, x.shape[0])
-            x_timbre = crop([x], n_signal, i1)[0]
+            except Exception as e:
+                print(e)
+                print("error with data augmentations")
+                i1 = np.random.randint(0, x.shape[-1] - n_signal, x.shape[0])
+                x_timbre = crop([x], n_signal, i1)[0]
     if structure_type == "audio":
         time_cond_target = x_target
     elif structure_type == "midi":
