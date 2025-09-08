@@ -232,6 +232,24 @@ def main(dummy):
 
     if FLAGS.emb_model_path == "music2latent":
         emb_model = M2LWrapper(device=device)  #.eval()
+    elif FLAGS.emb_model_path == "SPEC_4096":
+        import sys
+        import gin
+        sys.path.append("/data/nils/repos/codecs_benchmark")
+        from networks import AutoEncoder2Dv2
+
+        ckpt = "/data/nils/repos/codecs_benchmark/autoencoder_runs/SPEC_4096/checkpoint460000.pt"
+        config = "/data/nils/repos/codecs_benchmark/autoencoder_runs/SPEC_4096/config.gin"
+        gin.parse_config_files_and_bindings(
+            [config],
+            [],
+        )
+
+        emb_model = AutoEncoder2Dv2()
+        d = torch.load(ckpt, map_location="cpu")
+        emb_model.load_state_dict(d["model_state"], strict=False)
+        emb_model.eval().to(device)
+
     else:
         emb_model = None if FLAGS.emb_model_path is None else torch.jit.load(
             FLAGS.emb_model_path).to(device).eval()

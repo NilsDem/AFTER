@@ -58,6 +58,8 @@ flags.DEFINE_multi_string("filter_exclude", [],
 flags.DEFINE_float("adv", None, "Adversarial strengh")
 flags.DEFINE_integer("zs", None, "Adversarial strengh")
 flags.DEFINE_integer("zt", None, "Adversarial strengh")
+flags.DEFINE_integer("attn", None, "Attention span")
+
 flags.DEFINE_bool("shuffle", False, "Shuffle?")
 flags.DEFINE_bool("use_validation", True, "Use a train/validation split")
 
@@ -123,6 +125,10 @@ def main(argv):
             print("changing zt to", FLAGS.zt)
             gin.bind_parameter("%ZT_CHANNELS", FLAGS.zt)
 
+        if FLAGS.attn is not None:
+            print("changing attention to", FLAGS.attn)
+            gin.bind_parameter("%LOCAL_ATTENTION_SIZE", FLAGS.attn)
+
         if FLAGS.shuffle:
             gin.bind_parameter("%SHUFFLE", [2])
         # else:
@@ -159,9 +165,10 @@ def main(argv):
     n_signal_waveform = n_signal * ae_ratio
     structure_type = gin.query_parameter("%STRUCTURE_TYPE")
 
-    data_keys = ["z", "clap_m2l"
-                 ] + (["waveform"] if blender.time_transform is not None else
-                      []) + (["midi"] if structure_type == "midi" else [])
+    data_keys = [
+        "z",
+    ] + (["waveform"] if blender.time_transform is not None else
+         []) + (["midi"] if structure_type == "midi" else [])
 
     ## DATASET
     augmentation_keys = FLAGS.augmentation_keys

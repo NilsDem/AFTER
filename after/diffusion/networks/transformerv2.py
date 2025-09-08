@@ -128,7 +128,7 @@ class MHAttention(nn.Module):
         attention_chunk_size: int = 4,
         local_attention_size: Optional[int] = None,
         max_diffusion_steps=16,
-        max_batch_size=4,
+        max_batch_size=16,
     ):
 
         super().__init__()
@@ -377,7 +377,7 @@ class DenoiserTransBlock(nn.Module):
                  pos_emb_type: str = "learnable",
                  local_attention_size: Optional[int] = None,
                  attention_chunk_size: int = 4,
-                 use_out_proj = True):
+                 use_out_proj=True):
         super().__init__()
         self.n_channels = n_channels
         self.embed_dim = embed_dim
@@ -429,8 +429,8 @@ class DenoiserTransBlock(nn.Module):
 
         self.rearrange2 = Rearrange("b t c -> b c t", )
         if use_out_proj:
-            self.out_proj = nn.Sequential(nn.Linear(self.embed_dim, n_channels),
-                                        self.rearrange2)
+            self.out_proj = nn.Sequential(
+                nn.Linear(self.embed_dim, n_channels), self.rearrange2)
         else:
             self.out_proj = self.rearrange2
 
@@ -478,7 +478,7 @@ class DenoiserV2(nn.Module):
                  pos_emb_type="learnable",
                  local_attention_size: Optional[int] = None,
                  attention_chunk_size: int = 4,
-                 use_out_proj = True):
+                 use_out_proj=True):
 
         super().__init__()
         self.noise_embed_dims = noise_embed_dims
