@@ -300,6 +300,7 @@ def process_db(input_path, output_path, device,
     cur_index = 0
     chunk_entries = []
     augment_pool = None
+    interrupted = False
 
     if emb_model is not None and FLAGS.num_augments > 0:
         _init_augment_pool(structure_aug, timbre_aug)
@@ -402,9 +403,16 @@ def process_db(input_path, output_path, device,
         cur_index = flush_chunk_batch(chunk_entries, env, cur_index, device,
                                       emb_model, z_length, desc_model,
                                       augment_pool)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nKeyboardInterrupt received, shutting down workers...")
+        raise
     finally:
         if augment_pool is not None:
-            augment_pool.close()
+            if interrupted:
+                augment_pool.terminate()
+            else:
+                augment_pool.close()
             augment_pool.join()
         env.close()
 
