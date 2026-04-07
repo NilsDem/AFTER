@@ -43,11 +43,11 @@ flags.DEFINE_string("label_mode",
                     help="Mode for labeling data")
 
 flags.DEFINE_integer("num_steps",
-                     default=10000,
+                     default=20000,
                      help="Number of steps to build the map")
 
 flags.DEFINE_integer("num_examples",
-                     default=10000,
+                     default=None,
                      help="Number of steps to build the map")
 
 flags.DEFINE_string("ae_mode",

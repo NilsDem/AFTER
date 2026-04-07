@@ -27,7 +27,7 @@ class SimpleDataset(torch.utils.data.Dataset):
             "include": [],
             "exclude": []
         },
-        try_load_indices=True,
+        try_load_indices=False,
     ) -> None:
         super().__init__()
         self.num_sequential = num_sequential
@@ -143,11 +143,11 @@ class SimpleDataset(torch.utils.data.Dataset):
             ]
 
         for i in tqdm(range(len(self.indexes))):
-            self.cache.append(self.__getitem__(i))
+            self.cache.append(self.__getitem__(i, build_cache=True))
 
         self.cached = True
 
-    def __getitem__(self, index):
+    def __getitem__(self, index, build_cache=False):
         if self.cached == True:
             self.recache_counter += 1
             if self.recache_every is not None and self.recache_counter == self.recache_every:
@@ -169,7 +169,7 @@ class SimpleDataset(torch.utils.data.Dataset):
             else:
                 dat = ae.get(key)
                 
-                if isinstance(dat, pretty_midi.PrettyMIDI):
+                if build_cache  and isinstance(dat, pretty_midi.PrettyMIDI):
                     # print("Comuting piano roll for key: ", key)
                     piano_roll = dat.get_piano_roll(fs = 44100/4096*4)
                     out["piano_roll_"+key] = piano_roll

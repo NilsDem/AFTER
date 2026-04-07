@@ -121,10 +121,7 @@ class MHAttention(nn.Module):
         local_attention_size: Optional[int] = None,
         max_diffusion_steps: int = 16,
         max_batch_size: int = 4,
-        use_sink: bool = False,
-        sink_size: int = 1,
-        # NEW: to enable mask precompute
-        max_seq_len: int = 32,  # your model seq_len (tokens per call)
+        max_seq_len: int = 128, 
     ):
         super().__init__()
         self.is_causal = bool(is_causal)
@@ -135,35 +132,15 @@ class MHAttention(nn.Module):
         self.min_chunk_size = int(attention_chunk_size)
         self.local_attention_size = local_attention_size
 
-        self.use_sink = bool(use_sink)
-        self.sink_size = int(sink_size)
-
-        if self.use_sink:
-            self.sink_K = nn.Parameter(
-                torch.randn(1, self.n_heads, self.sink_size, embed_dim // n_heads)
-            )
-            self.sink_V = nn.Parameter(
-                torch.randn(1, self.n_heads, self.sink_size, embed_dim // n_heads)
-            )
-        else:
-            # keep parameters to preserve state_dict compatibility if needed
-            self.sink_K = nn.Parameter(torch.randn(1, 1, 1, 1))
-            self.sink_V = nn.Parameter(torch.randn(1, 1, 1, 1))
-
-        # local attention overrides cache size in your original code
         if local_attention_size is not None and max_cache_size > 0:
             self.max_cache_size = int(local_attention_size)
             
-        
-
         # Cache buffers
         if self.max_cache_size > 0:
             print("Creating cache")
             self.register_buffer("last_k", torch.zeros(max_batch_size,self.n_heads,  1, embed_dim // n_heads))
             self.register_buffer("last_v", torch.zeros(max_batch_size,self.n_heads,  1, embed_dim // n_heads))
             
-        
-
             k_cache = torch.zeros(
                 (max_batch_size, max_diffusion_steps, self.n_heads, self.max_cache_size, embed_dim // n_heads),
                 dtype=torch.float32,
@@ -171,9 +148,7 @@ class MHAttention(nn.Module):
             v_cache = torch.zeros_like(k_cache)
             self.register_buffer("k_cache", k_cache)
             self.register_buffer("v_cache", v_cache)
-        else:
-            print("NO CACHE"*100)
-            print(max_cache_size)
+
 
         self.rearrange_heads1 = Rearrange("bs n (h d) -> bs h n d", h=self.n_heads)
         self.rearrange_heads2 = Rearrange("bs h n d -> bs n (h d)", h=self.n_heads)
@@ -184,7 +159,7 @@ class MHAttention(nn.Module):
         # Then slice in forward.
         # -----------------------------
         self.max_seq_len = int(max_seq_len)
-        max_total_len = self.max_seq_len + self.max_cache_size + (self.sink_size if self.use_sink else 0)
+        max_total_len = self.max_seq_len + self.max_cache_size
         self.max_total_len = int(max_total_len)
 
         if self.is_causal:
@@ -197,7 +172,6 @@ class MHAttention(nn.Module):
             self.register_buffer("_attn_mask_bool", torch.zeros(1, 1, dtype=torch.bool), persistent=False)
 
     def get_buffers(self, i: int):
-        # returns [B, H, Tcache, D]
         return self.k_cache[:, i], self.v_cache[:, i]
 
     def set_buffers(self, k, v, i: int):
@@ -205,27 +179,13 @@ class MHAttention(nn.Module):
         self.v_cache[: v.shape[0], i] = v
 
     def roll_cache(self, roll_size: int, cache_index: int):
-        """
-        Keep semantics compatible with your earlier usage.
-        NOTE: this still uses cat in your original; the big win would be a true in-place ring.
-        For now, we keep your behavior as-is. (Next step: in-place shift.)
-        """
-        # if self.max_cache_size <= 0:
-        #     return
-
         if self.last_k is None or self.last_v is None:
             return
         k_cache, v_cache = self.get_buffers(cache_index)
 
         if roll_size < self.min_chunk_size:
-            # keep the print (optional)
             print("warming - roll size is smaller than min chunk size")
-
-        # If last_k/last_v not initialized yet, just return
-        # if self.last_k is None or self.last_v is None:
-        #     return
-
-        # Concatenate and crop (same semantics as before)
+            
         k_cache = torch.cat([k_cache[: self.last_k.shape[0]], self.last_k[:, :, :roll_size]], dim=2)
         v_cache = torch.cat([v_cache[: self.last_v.shape[0]], self.last_v[:, :, :roll_size]], dim=2)
 
@@ -240,11 +200,8 @@ class MHAttention(nn.Module):
         Slice precomputed bool mask and convert to -inf/0 float mask.
         Shape expected by SDPA: [Tq, Tk] (broadcastable).
         """
-        # We want the last Tq rows (queries correspond to the newest tokens)
         m = self._attn_mask_bool[:Tk, :Tk]  # [Tk, Tk] for safety (max)
         m = m[-Tq:, :Tk]                    # [Tq, Tk]
-        # convert: True -> -inf, False -> 0
-        # use a fresh tensor for correct dtype (still much cheaper than rebuilding logic)
         attn = torch.zeros((Tq, Tk), device=device, dtype=dtype)
         attn = attn.masked_fill(m.to(device=device), float("-inf"))
         return attn
@@ -271,13 +228,7 @@ class MHAttention(nn.Module):
         if self.is_causal:
             Tq = q.shape[2]
             Tk = full_k.shape[2]
-            # Safety clamp: if runtime length exceeds precomputed max, fall back (rare)
-            if Tk > self.max_total_len:
-                # Fallback: no local window / just causal
-                # (You can also raise here if you prefer strictness.)
-                attn_mask = None
-            else:
-                attn_mask = self._get_attn_mask(Tq, Tk, device=q.device, dtype=q.dtype)
+            attn_mask = self._get_attn_mask(Tq, Tk, device=q.device, dtype=q.dtype)
 
         out = nn.functional.scaled_dot_product_attention(
             q,
@@ -305,8 +256,6 @@ class SelfAttention(nn.Module):
         max_cache_size: int = 0,
         max_diffusion_steps: int = 16,
         max_batch_size: int = 16,
-        use_sink: bool = False,
-        sink_size: int = 1,
         max_seq_len: int = 32,
     ):
         super().__init__()
@@ -323,8 +272,6 @@ class SelfAttention(nn.Module):
             local_attention_size=local_attention_size,
             max_diffusion_steps=max_diffusion_steps,
             max_batch_size=max_batch_size,
-            use_sink=use_sink,
-            sink_size=sink_size,
             max_seq_len=max_seq_len,
         )
 
@@ -365,8 +312,6 @@ class DecoderBlock(nn.Module):
         max_cache_size: int = 0,
         max_diffusion_steps: int = 16,
         max_batch_size: int = 16,
-        use_sink: bool = False,
-        sink_size: int = 1,
         max_seq_len: int = 32,
     ):
         super().__init__()
@@ -384,8 +329,6 @@ class DecoderBlock(nn.Module):
             max_cache_size=max_cache_size,
             max_diffusion_steps=max_diffusion_steps,
             max_batch_size=max_batch_size,
-            use_sink=use_sink,
-            sink_size=sink_size,
             max_seq_len=max_seq_len,
         )
 
@@ -443,16 +386,12 @@ class DenoiserTransBlock(nn.Module):
         dropout: float = 0.1,
         n_layers: int = 4,
         is_causal: bool = True,
-        pos_emb_type: str = "learnable",
         local_attention_size: Optional[int] = None,
         attention_chunk_size: int = 4,
         use_out_proj: bool = True,
-        # cache / sink knobs
         max_cache_size: int = 0,
         max_diffusion_steps: int = 16,
         max_batch_size: int = 16,
-        use_sink: bool = False,
-        sink_size: int = 1,
     ):
         super().__init__()
         self.n_channels = n_channels
@@ -478,18 +417,8 @@ class DenoiserTransBlock(nn.Module):
         else:
             self.patchify_and_embed_tcond = nn.Identity()
 
-        self.rotary_emb = None
-        if pos_emb_type == "learnable":
-            self.pos_embed = nn.Embedding(self.seq_len, self.embed_dim)
-            pre = torch.arange(0, self.seq_len).long()
-            self.register_buffer("precomputed_pos_enc", pre, persistent=False)
-        elif pos_emb_type == "rotary":
-            self.rotary_emb = RotaryEmbedding(32)
-            self.pos_embed = None
-            self.register_buffer("precomputed_pos_enc", torch.zeros(1, dtype=torch.long), persistent=False)
-        else:
-            self.pos_embed = None
-            self.register_buffer("precomputed_pos_enc", torch.zeros(1, dtype=torch.long), persistent=False)
+
+        self.rotary_emb = RotaryEmbedding(32)
 
         self.decoder_blocks = nn.ModuleList(
             [
@@ -500,14 +429,12 @@ class DenoiserTransBlock(nn.Module):
                     tcond_dim=tcond_dim,
                     is_causal=is_causal,
                     dropout_level=self.dropout,
-                    rotary_emb=None if pos_emb_type != "rotary" else self.rotary_emb,
+                    rotary_emb=self.rotary_emb,
                     attention_chunk_size=attention_chunk_size,
                     local_attention_size=local_attention_size,
                     max_cache_size=max_cache_size,
                     max_diffusion_steps=max_diffusion_steps,
                     max_batch_size=max_batch_size,
-                    use_sink=use_sink,
-                    sink_size=sink_size,
                     max_seq_len=self.seq_len,
                 )
                 for _ in range(self.n_layers)
@@ -533,11 +460,6 @@ class DenoiserTransBlock(nn.Module):
     ):
         x = self.patchify_and_embed(x)  # [B, T, C]
 
-        if self.pos_embed is not None:
-            # Embedding lookup each forward is usually ok; if you want, you can cache full pos_enc.
-            pos = self.pos_embed(self.precomputed_pos_enc[: x.size(1)]).expand(x.size(0), x.size(1), -1)
-            x = x + pos
-
         if time_cond is not None and self.tcond_dim > 0:
             time_cond = self.patchify_and_embed_tcond(time_cond)
 
@@ -560,16 +482,12 @@ class DenoiserV2(nn.Module):
         mlp_multiplier: int = 2,
         dropout: float = 0.1,
         causal: bool = False,
-        pos_emb_type: str = "learnable",
         local_attention_size: Optional[int] = None,
         attention_chunk_size: int = 4,
         use_out_proj: bool = True,
-        # cache / sink knobs
         max_cache_size: int = 0,
         max_diffusion_steps: int = 16,
         max_batch_size: int = 16,
-        use_sink: bool = False,
-        sink_size: int = 1,
     ):
         super().__init__()
         self.noise_embed_dims = int(noise_embed_dims)
@@ -599,15 +517,12 @@ class DenoiserV2(nn.Module):
             cond_dim=0 if cond_dim == 0 else self.embed_dim,
             tcond_dim=tcond_dim,
             is_causal=causal,
-            pos_emb_type=pos_emb_type,
             attention_chunk_size=attention_chunk_size,
             local_attention_size=local_attention_size,
             use_out_proj=use_out_proj,
             max_cache_size=max_cache_size,
             max_diffusion_steps=max_diffusion_steps,
             max_batch_size=max_batch_size,
-            use_sink=use_sink,
-            sink_size=sink_size,
         )
 
     def roll_cache(self, size: int, cache_index: int):
@@ -654,8 +569,6 @@ if __name__ == "__main__":
         max_cache_size=64,
         max_diffusion_steps=16,
         max_batch_size=16,
-        use_sink=False,
-        sink_size=1,
     )
 
     B = 4

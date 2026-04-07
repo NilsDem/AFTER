@@ -64,7 +64,7 @@ class AudioExample(object):
 
     def get(self, key: str):
 
-        if key == "midi" or "augmented_midis" in key:
+        if "midi" in key:
             try:
                 midi = self.ae.buffers[key].data
                 midi = pickle.loads(midi)

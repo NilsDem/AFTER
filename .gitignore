@@ -1,3 +1,5 @@
+.claude/
+tests/
 encoder_checkpoints/*
 *DS_Store*
 pretrained/*
