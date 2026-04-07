@@ -4,7 +4,7 @@ from absl import app
 
 AVAILABLE_SCRIPTS = [
     'train', 'prepare_dataset', 'update_dataset', 'train_autoencoder',
-    'export_autoencoder', 'export', 'export_midi'
+    'export_autoencoder', 'export', 'export_midi', "export_clock"
 ]
 
 
@@ -53,5 +53,9 @@ def main():
         from after_scripts import export_midi
         sys.argv[0] = export_midi.__name__
         app.run(export_midi.main)
+    elif command == 'export_clock':
+        from after_scripts import export_clock
+        sys.argv[0] = export_clock.__name__
+        app.run(export_clock.main)
     else:
         raise Exception(f'Command {command} not found')

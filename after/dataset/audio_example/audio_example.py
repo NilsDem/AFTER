@@ -3,7 +3,7 @@ import json
 import pickle
 
 import numpy as np
-
+import pretty_midi
 try:
     import jax.numpy as jnp
 except:
@@ -64,15 +64,18 @@ class AudioExample(object):
 
     def get(self, key: str):
 
-        if key == "midi":
-            midi = self.ae.buffers["midi"].data
-            midi = pickle.loads(midi)
+        if key == "midi" or "augmented_midis" in key:
+            try:
+                midi = self.ae.buffers[key].data
+                midi = pickle.loads(midi)
+            except:
+                print("failure for loading midi - returning empty midi")
+                midi = None
             return midi
 
         buf = self.ae.buffers[key]
         if buf is None:
             raise KeyError(f"key '{key}' not available")
-
         array = np.frombuffer(
             buf.data,
             dtype=PRECISION_TO_DTYPE[buf.precision],

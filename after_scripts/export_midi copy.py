@@ -42,20 +42,8 @@ flags.DEFINE_string("label_mode",
                     help="Mode for labeling data")
 
 flags.DEFINE_integer("num_steps",
-                     default=50000,
+                     default=3000,
                      help="Number of steps to build the map")
-
-flags.DEFINE_integer("num_examples",
-                     default=10000,
-                     help="Number of steps to build the map")
-
-flags.DEFINE_string("ae_mode",
-                    default="linear",
-                    help="Number of steps to build the map")
-
-flags.DEFINE_bool("reload_embeddings",
-                  default=False,
-                  help="Reload precomputed embeddings if available")
 
 
 class DummyIdentity(nn.Module):
@@ -65,12 +53,6 @@ class DummyIdentity(nn.Module):
         super().__init__()
         self.encoder = nn.Identity()
         self.decoder = nn.Identity()
-
-    def forward(self, x: torch.Tensor):
-        return x
-
-    def forward_stream(self, x: torch.Tensor):
-        return x
 
 
 def main(argv):
@@ -102,7 +84,6 @@ def main(argv):
             cache_size = gin.query_parameter("%LOCAL_ATTENTION_SIZE")
             gin.bind_parameter("transformerv2.MHAttention.max_cache_size",
                                cache_size)
-            raise
         except:
             gin.bind_parameter("transformer.Denoiser.max_cache_size",
                                gin.query_parameter("%N_SIGNAL"))
@@ -127,39 +108,28 @@ def main(argv):
     ### GENERATE EMBEDDING PLOT ###
     if FLAGS.latent_project:
 
-        if True:
+        try:
             path_dict = gin.query_parameter("utils.get_datasets.path_dict")
             dataset = CombinedDataset(path_dict=path_dict,
                                       keys=["z", "metadata"])
 
-            tmp = os.path.join(FLAGS.model_path, "latent_embeddings.pt")
-
-            if FLAGS.reload_embeddings and os.path.exists(tmp):
-                embeddings, labels = torch.load(tmp)
-            else:
-                embeddings, labels = prepare_training(
-                    encoder=blender.encoder,
-                    post_encoder=blender.post_encoder,
-                    dataset=dataset,
-                    num_examples=FLAGS.num_examples,
-                    mode=FLAGS.label_mode)
-
-                torch.save((embeddings, labels), tmp)
-
-            print(set(labels))
+            embeddings, labels = prepare_training(
+                encoder=blender.encoder,
+                post_encoder=blender.post_encoder,
+                dataset=dataset,
+                num_examples=2000,
+                mode=FLAGS.label_mode)
 
             embeddings = embeddings / (FLAGS.latent_range)
             torch.set_grad_enabled(True)
             if zt_channels > 2:
                 project_model = train_autoencoder(embeddings,
                                                   num_steps=FLAGS.num_steps,
-                                                  batch_size=128,
-                                                  lr=1e-4,
-                                                  device="cpu",
-                                                  val_split=0.05,
-                                                  mode=FLAGS.ae_mode)
+                                                  batch_size=8,
+                                                  lr=1e-3,
+                                                  device="cpu")
 
-                compressed_embeddings = project_model.encode(
+                compressed_embeddings = project_model.encoder(
                     torch.tensor(embeddings,
                                  dtype=torch.float32)).detach().numpy()
             else:
@@ -174,11 +144,11 @@ def main(argv):
                                             gamma=1.,
                                             brightness_scale=10.)
             torch.set_grad_enabled(False)
-        # except Exception as e:
-        #     print("Could not load dataset for embedding plot.")
-        #     print("Error : ", e)
-        #     print("Us --nolatent_project to disable latent projection.")
-        #     exit()
+        except Exception as e:
+            print("Could not load dataset for embedding plot.")
+            print("Error : ", e)
+            print("Us --nolatent_project to disable latent projection.")
+            exit()
     else:
         project_model = DummyIdentity()
 
@@ -195,7 +165,7 @@ def main(argv):
                 self.time_cond_ratio = gin.query_parameter(
                     "utils.collate_fn.compress_midi")
             else:
-                self.encoder_time = DummyIdentity()
+                self.encoder_time = nn.Identity()
                 self.time_cond_ratio = 1
             self.post_encoder = blender.post_encoder
 
@@ -262,7 +232,7 @@ def main(argv):
             self.register_method(
                 "generate",
                 in_channels=self.n_poly * 2 + zt_channels,
-                in_ratio=1,  #self.ae_ratio // self.time_cond_ratio,
+                in_ratio=self.ae_ratio // self.time_cond_ratio,
                 out_channels=1,
                 out_ratio=1,
                 input_labels=input_labels +
@@ -274,7 +244,7 @@ def main(argv):
             self.register_method(
                 "diffuse",
                 in_channels=self.n_poly * 2 + zt_channels,
-                in_ratio=1,
+                in_ratio=self.ae_ratio // self.time_cond_ratio,
                 out_channels=self.ae_latents,
                 out_ratio=self.ae_ratio,
                 input_labels=input_labels +
@@ -376,31 +346,31 @@ def main(argv):
             #                   cache_index=cache_index)
             #     return dx
 
-            # if guidance_structure == guidance_timbre:
-            full_time = time.repeat(2, 1, 1)
-            full_x = x.repeat(2, 1, 1)
+            # elif guidance_structure == guidance_timbre:
+            #     full_time = time.repeat(2, 1, 1)
+            #     full_x = x.repeat(2, 1, 1)
 
-            full_cond = torch.cat([
-                cond,
-                self.drop_value * torch.ones_like(cond),
-            ])
+            #     full_cond = torch.cat([
+            #         cond,
+            #         self.drop_value * torch.ones_like(cond),
+            #     ])
 
-            full_time_cond = torch.cat([
-                time_cond,
-                self.drop_value * torch.ones_like(time_cond),
-            ])
+            #     full_time_cond = torch.cat([
+            #         time_cond,
+            #         self.drop_value * torch.ones_like(time_cond),
+            #     ])
 
-            dx = self.net(full_x,
-                          time=full_time,
-                          cond=full_cond,
-                          time_cond=full_time_cond,
-                          cache_index=cache_index)
+            #     dx = self.net(full_x,
+            #                   time=full_time,
+            #                   cond=full_cond,
+            #                   time_cond=full_time_cond,
+            #                   cache_index=cache_index)
 
-            dx_full, dx_none = torch.chunk(dx, 2, dim=0)
+            #     dx_full, dx_none = torch.chunk(dx, 3, dim=0)
 
-            dx = dx_none + guidance_structure * (dx_full - dx_none)
+            #     dx = dx_none + guidance_structure * (dx_full - dx_none)
 
-            return dx
+            #     return dx
 
             # else:
             full_time = time.repeat(3, 1, 1)
@@ -435,53 +405,6 @@ def main(argv):
                                              (dx_full - dx_cond) - dx_none)
 
             return dx
-
-        def make_pianoroll_from_buffer(self,
-                                       notes,
-                                       T_roll: int,
-                                       n_pitches: int = 128):
-            """
-            notes: [B, 2*n_poly, T_buffer]
-            even channels: pitch
-            odd channels: velocity
-            T_roll: number of piano roll frames
-            Returns: [B, n_pitches, T_roll] with velocity values in [0, 1]
-            """
-            B, C, T_buf = notes.shape
-            n_poly = C // 2
-            frame_len = T_buf // T_roll
-
-            # Split pitch / velocity
-            pitches = notes[:, 0::2, :]
-            velocities = notes[:, 1::2, :] / 127.0
-
-            # Trim to fit full frames
-            pitches = pitches[:, :, :frame_len * T_roll]
-            velocities = velocities[:, :, :frame_len * T_roll]
-
-            # Reshape into frames
-            pitches = pitches.view(B, n_poly, T_roll, frame_len)
-            velocities = velocities.view(B, n_poly, T_roll, frame_len)
-
-            # Initialize piano roll
-            piano_roll = torch.zeros(B, n_pitches, T_roll)
-
-            # For each batch, frame, and poly voice, scatter velocity where active
-            for b in range(B):
-                for t in range(T_roll):
-                    # Active mask for this frame (polyphony × frame_len)
-                    active_mask = velocities[b, :, t, :] > 0
-                    if not active_mask.any():
-                        continue
-                    # Flatten over polyphony/time and get pitch/velocity pairs
-                    v_active = velocities[b, :, t, :][active_mask]
-                    p_active = pitches[b, :, t, :][active_mask].long().clamp(
-                        0, n_pitches - 1)
-                    # Aggregate (max velocity if multiple voices on same pitch)
-                    piano_roll[b, p_active,
-                               t] = torch.maximum(piano_roll[b, p_active, t],
-                                                  v_active)
-            return piano_roll
 
         def sample(self, x_last: torch.Tensor, cond: torch.Tensor,
                    time_cond: torch.Tensor):
@@ -529,13 +452,18 @@ def main(argv):
             # Get the notes
             notes = x[:, :2 * self.n_poly]
 
-            time_cond = self.make_pianoroll_from_buffer(
-                notes,
-                T_roll=self.time_cond_ratio * x.shape[-1] // self.ae_ratio)
+            time_cond = torch.zeros((1, 128, x.shape[-1]))
+
+            for i in range(self.n_poly):
+                for j in range(x.shape[-1]):
+                    print("hey")
+                    if notes[0, 2 * i + 1, j] > 0:
+                        time_cond[:, notes[:, 2 * i].long(),
+                                  j] = notes[:, 2 * i + 1, j] / 127
 
             # Generate
             x = torch.randn(n, self.ae_latents,
-                            time_cond.shape[-1] // self.time_cond_ratio)
+                            x.shape[-1] // self.time_cond_ratio)
 
             time_cond = self.encoder_time.forward_stream(time_cond[:1])
 
@@ -560,20 +488,21 @@ def main(argv):
         def map2latent(self, x: torch.Tensor) -> torch.Tensor:
             tdim = x.shape[-1]
             mapvec = x.mean(-1)
-            latents = self.project_model.decode(mapvec)
+            latents = self.project_model.decoder(mapvec)
             return latents.unsqueeze(-1).repeat((1, 1, tdim))
 
         @torch.jit.export
         def latent2map(self, x: torch.Tensor) -> torch.Tensor:
             tdim = x.shape[-1]
             latents = x.mean(-1)
-            map = self.project_model.encode(latents)
+            map = self.project_model.encoder(latents)
             return map.unsqueeze(-1).repeat((1, 1, tdim))
 
     ####
     streamer = Streamer()
 
-    dummmy = torch.randn(1, FLAGS.n_poly * 2 + zt_channels, 8192)
+    dummmy = torch.randn(1, FLAGS.n_poly * 2 + zt_channels,
+                         2 * streamer.time_cond_ratio)
 
     out = streamer.diffuse(dummmy)
 

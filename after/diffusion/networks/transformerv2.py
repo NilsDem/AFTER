@@ -1,16 +1,21 @@
 import torch
 from einops.layers.torch import Rearrange
 from torch import nn
-#from einops import rearrange
+from typing import Optional
 import gin
-import numpy as np
-
 from .rotary_embedding import RotaryEmbedding
 
-from typing import Dict, Tuple, Optional, List
 
-
+# -----------------------------
+# Fast, scriptable positional embedding
+# -----------------------------
 class PositionalEmbedding(nn.Module):
+    """
+    Fourier features for scalar time inputs.
+    Optimizations:
+      - precompute freqs buffer once
+      - avoid torch.arange + ger each forward
+    """
 
     def __init__(
         self,
@@ -21,91 +26,80 @@ class PositionalEmbedding(nn.Module):
         rearrange: bool = False,
     ):
         super().__init__()
-        self.num_channels = num_channels
-        self.max_positions = max_positions
-        self.endpoint = endpoint
-        self.factor = factor
-        self.rearrange = (Rearrange("b (f c) -> b (c f)", f=2)
-                          if rearrange else nn.Identity())
+        assert num_channels % 2 == 0, "num_channels must be even"
+        self.num_channels = int(num_channels)
+        self.max_positions = int(max_positions)
+        self.endpoint = bool(endpoint)
+        self.factor = float(factor)
 
-    def forward(self, x: torch.Tensor):
-        x = x.view(-1)
-        x = x * self.factor
-        freqs = torch.arange(
-            start=0,
-            end=self.num_channels // 2,
-            device=x.device,
-        ).float()
-        freqs = freqs / (self.num_channels // 2 - (1 if self.endpoint else 0))
-        freqs = (1 / self.max_positions)**freqs
-        x = x.ger(freqs.to(x.dtype))
-        x = torch.cat([x.cos(), x.sin()], dim=1)
-        return self.rearrange(x)
+        self.rearrange = (
+            Rearrange("b (f c) -> b (c f)", f=2) if rearrange else nn.Identity()
+        )
 
+        # Precompute frequency exponents once (buffer)
+        half = self.num_channels // 2
+        denom = float(half - (1 if self.endpoint else 0))
+        freqs = torch.arange(0, half, dtype=torch.float32) / denom
+        freqs = (1.0 / float(self.max_positions)) ** freqs  # shape [half]
+        self.register_buffer("freqs", freqs, persistent=False)
 
-def chunk_wise_causal_mask(seq_len: int, chunk_size: int):
-    # Initialize a full attention mask (everything allowed)
-    mask = torch.zeros(seq_len, seq_len)
-
-    for i in range(0, seq_len, chunk_size):
-        end = min(i + chunk_size, seq_len)
-
-        # Allow full attention within the chunk
-        mask[i:end, i:end] = 1  # Each chunk can fully attend to itself
-
-        # Allow attention to all previous tokens
-        mask[i:end, :i] = 1  # Attend to past chunks
-
-    return 1 - mask  # Convert to mask format (1 = masked, 0 = allowed)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: scalar or [B] or [B, ...] -> flatten to [B]
+        x = x.reshape(-1).to(dtype=self.freqs.dtype) * self.factor  # [B]
+        # Outer product via broadcasting: [B, 1] * [1, half] -> [B, half]
+        ang = x[:, None] * self.freqs[None, :]
+        out = torch.cat([ang.cos(), ang.sin()], dim=1)  # [B, num_channels]
+        return self.rearrange(out)
 
 
-def combined_sliding_chunkwise_mask(seq_len: int, chunk_size: int,
-                                    window_size: int) -> torch.Tensor:
+# -----------------------------
+# Vectorized mask precompute (no Python loops in forward)
+# -----------------------------
+@torch.jit.ignore
+def _build_chunkwise_mask_maxlen(
+    max_len: int, chunk_size: int, window_size: int
+) -> torch.Tensor:
     """
-    Combined chunk-wise + sliding window causal mask.
-
-    - Full attention within each chunk.
-    - Attend to all previous chunks.
-    - Optionally: attend to sliding window before chunk.
-
-    Args:
-        seq_len: total sequence length
-        chunk_size: size of each chunk
-        window_size: size of sliding window (set to -1 for no window)
-
-    Returns:
-        mask: Tensor (seq_len, seq_len), with 1 = masked, 0 = allowed
+    Builds a mask of shape [max_len, max_len] with True = masked.
+    Semantics match your original:
+      - within chunk: full attention (bidirectional) inside each chunk
+      - past chunks:
+          window_size < 0  => attend to all past
+          window_size >= 0 => attend to [q - window + 1, chunk_start - 1]
     """
-    mask = torch.ones(seq_len, seq_len)  # Start fully masked
+    L = int(max_len)
+    cs = int(chunk_size)
+    ws = int(window_size)
 
-    for i in range(0, seq_len, chunk_size):
-        end = min(i + chunk_size, seq_len)
+    q = torch.arange(L)[:, None]  # [L,1]
+    k = torch.arange(L)[None, :]  # [1,L]
 
-        # Allow full attention within chunk
-        mask[i:end, i:end] = 0
-        # Optionally limit past attention with a sliding window
-        if window_size >= 0:
-            for j in range(i, end):
+    cq = q // cs
+    ck = k // cs
+    same_chunk = cq.eq(ck)
 
-                sliding_start = max(0, j - window_size + 1)
+    if ws < 0:
+        past_allowed = ck.lt(cq)  # all past chunks
+    else:
+        chunk_start = (cq * cs)  # [L,1]
+        sliding_start = (q - (ws - 1)).clamp(min=0)  # [L,1]
+        # keys must be before current chunk start, and within sliding window
+        past_allowed = (k < chunk_start) & (k >= sliding_start)
 
-                mask[j, sliding_start:
-                     i] = 0  # Overwrite earlier full-past with limited window
-        else:
-            mask[i:end, :i] = 0
-    return mask
+    allowed = same_chunk | past_allowed
+    masked = ~allowed  # True = masked
+    return masked
 
 
 class CacheModule(nn.Module):
-
     def __init__(self, max_cache_size: int = 0):
         super().__init__()
-        self.max_cache_size = max_cache_size
-        self.register_buffer('k_cache', torch.zeros(1))
-        self.register_buffer('v_cache', torch.zeros(1))
+        self.max_cache_size = int(max_cache_size)
+        self.register_buffer("k_cache", torch.zeros(1), persistent=False)
+        self.register_buffer("v_cache", torch.zeros(1), persistent=False)
 
     @torch.jit.export
-    def get_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_cache(self):
         return self.k_cache, self.v_cache
 
     @torch.jit.export
@@ -113,152 +107,226 @@ class CacheModule(nn.Module):
         self.k_cache = k
         self.v_cache = v
 
-
 @gin.configurable
 class MHAttention(nn.Module):
-
     def __init__(
         self,
         is_causal: bool = False,
         dropout_level: float = 0.0,
         n_heads: int = 4,
         max_cache_size: int = 0,
-        rotary_emb: nn.Module = None,
+        rotary_emb: Optional[nn.Module] = None,
         embed_dim: int = 256,
         attention_chunk_size: int = 4,
         local_attention_size: Optional[int] = None,
-        max_diffusion_steps=16,
-        max_batch_size=16,
+        max_diffusion_steps: int = 16,
+        max_batch_size: int = 4,
+        use_sink: bool = False,
+        sink_size: int = 1,
+        # NEW: to enable mask precompute
+        max_seq_len: int = 32,  # your model seq_len (tokens per call)
     ):
-
         super().__init__()
-        self.is_causal = is_causal
-        self.dropout_level = dropout_level
-        self.n_heads = n_heads
+        self.is_causal = bool(is_causal)
+        self.dropout_level = float(dropout_level)
+        self.n_heads = int(n_heads)
         self.rotary_emb = rotary_emb
-        self.max_cache_size = max_cache_size
-        self.min_chunk_size = attention_chunk_size
+        self.max_cache_size = int(max_cache_size)
+        self.min_chunk_size = int(attention_chunk_size)
         self.local_attention_size = local_attention_size
 
-        if max_cache_size > 0:
-            self.register_buffer('last_k', None)
-            self.register_buffer('last_v', None)
+        self.use_sink = bool(use_sink)
+        self.sink_size = int(sink_size)
+
+        if self.use_sink:
+            self.sink_K = nn.Parameter(
+                torch.randn(1, self.n_heads, self.sink_size, embed_dim // n_heads)
+            )
+            self.sink_V = nn.Parameter(
+                torch.randn(1, self.n_heads, self.sink_size, embed_dim // n_heads)
+            )
+        else:
+            # keep parameters to preserve state_dict compatibility if needed
+            self.sink_K = nn.Parameter(torch.randn(1, 1, 1, 1))
+            self.sink_V = nn.Parameter(torch.randn(1, 1, 1, 1))
+
+        # local attention overrides cache size in your original code
+        if local_attention_size is not None and max_cache_size > 0:
+            self.max_cache_size = int(local_attention_size)
+            
+        
+
+        # Cache buffers
+        if self.max_cache_size > 0:
+            print("Creating cache")
+            self.register_buffer("last_k", torch.zeros(max_batch_size,self.n_heads,  1, embed_dim // n_heads))
+            self.register_buffer("last_v", torch.zeros(max_batch_size,self.n_heads,  1, embed_dim // n_heads))
+            
+        
 
             k_cache = torch.zeros(
-                (max_batch_size, max_diffusion_steps, n_heads, max_cache_size,
-                 embed_dim // n_heads))
+                (max_batch_size, max_diffusion_steps, self.n_heads, self.max_cache_size, embed_dim // n_heads),
+                dtype=torch.float32,
+            )
+            v_cache = torch.zeros_like(k_cache)
+            self.register_buffer("k_cache", k_cache)
+            self.register_buffer("v_cache", v_cache)
+        else:
+            print("NO CACHE"*100)
+            print(max_cache_size)
 
-            v_cache = torch.zeros(
-                (max_batch_size, max_diffusion_steps, n_heads, max_cache_size,
-                 embed_dim // n_heads))
-            self.register_buffer('k_cache', k_cache)
-            self.register_buffer('v_cache', v_cache)
+        self.rearrange_heads1 = Rearrange("bs n (h d) -> bs h n d", h=self.n_heads)
+        self.rearrange_heads2 = Rearrange("bs h n d -> bs n (h d)", h=self.n_heads)
 
-        self.rearrange_heads1 = Rearrange("bs n (h d) -> bs h n d",
-                                          h=self.n_heads)
+        # -----------------------------
+        # Precompute mask once (CPU), register as buffer.
+        # We precompute for max_total_len = cache + seq + sink.
+        # Then slice in forward.
+        # -----------------------------
+        self.max_seq_len = int(max_seq_len)
+        max_total_len = self.max_seq_len + self.max_cache_size + (self.sink_size if self.use_sink else 0)
+        self.max_total_len = int(max_total_len)
 
-        self.rearrange_heads2 = Rearrange("bs h n d -> bs n (h d)",
-                                          h=self.n_heads)
+        if self.is_causal:
+            ws = -1 if self.local_attention_size is None else int(self.local_attention_size)
+            # build boolean mask once; will be moved to device automatically as buffer
+            masked_bool = _build_chunkwise_mask_maxlen(self.max_total_len, self.min_chunk_size, ws)
+            # store as bool; convert to -inf in forward with correct dtype/device
+            self.register_buffer("_attn_mask_bool", masked_bool, persistent=False)
+        else:
+            self.register_buffer("_attn_mask_bool", torch.zeros(1, 1, dtype=torch.bool), persistent=False)
 
     def get_buffers(self, i: int):
-        k_cache, v_cache = self.k_cache[:, i], self.v_cache[:, i]
-        return k_cache, v_cache
+        # returns [B, H, Tcache, D]
+        return self.k_cache[:, i], self.v_cache[:, i]
 
     def set_buffers(self, k, v, i: int):
-        self.k_cache[:k.shape[0], i] = k
-        self.v_cache[:k.shape[0], i] = v
+        self.k_cache[: k.shape[0], i] = k
+        self.v_cache[: v.shape[0], i] = v
 
     def roll_cache(self, roll_size: int, cache_index: int):
+        """
+        Keep semantics compatible with your earlier usage.
+        NOTE: this still uses cat in your original; the big win would be a true in-place ring.
+        For now, we keep your behavior as-is. (Next step: in-place shift.)
+        """
+        # if self.max_cache_size <= 0:
+        #     return
+
+        if self.last_k is None or self.last_v is None:
+            return
         k_cache, v_cache = self.get_buffers(cache_index)
 
         if roll_size < self.min_chunk_size:
+            # keep the print (optional)
             print("warming - roll size is smaller than min chunk size")
 
-        k_cache = torch.cat(
-            [k_cache[:self.last_k.shape[0]], self.last_k[:, :, :roll_size]],
-            dim=2)
-        v_cache = torch.cat(
-            [v_cache[:self.last_k.shape[0]], self.last_v[:, :, :roll_size]],
-            dim=2)
+        # If last_k/last_v not initialized yet, just return
+        # if self.last_k is None or self.last_v is None:
+        #     return
+
+        # Concatenate and crop (same semantics as before)
+        k_cache = torch.cat([k_cache[: self.last_k.shape[0]], self.last_k[:, :, :roll_size]], dim=2)
+        v_cache = torch.cat([v_cache[: self.last_v.shape[0]], self.last_v[:, :, :roll_size]], dim=2)
 
         if k_cache.shape[2] > self.max_cache_size:
-            k_cache = k_cache[:, :, -self.max_cache_size:]
-            v_cache = v_cache[:, :, -self.max_cache_size:]
+            k_cache = k_cache[:, :, -self.max_cache_size :]
+            v_cache = v_cache[:, :, -self.max_cache_size :]
 
         self.set_buffers(k_cache, v_cache, cache_index)
 
+    def _get_attn_mask(self, Tq: int, Tk: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """
+        Slice precomputed bool mask and convert to -inf/0 float mask.
+        Shape expected by SDPA: [Tq, Tk] (broadcastable).
+        """
+        # We want the last Tq rows (queries correspond to the newest tokens)
+        m = self._attn_mask_bool[:Tk, :Tk]  # [Tk, Tk] for safety (max)
+        m = m[-Tq:, :Tk]                    # [Tq, Tk]
+        # convert: True -> -inf, False -> 0
+        # use a fresh tensor for correct dtype (still much cheaper than rebuilding logic)
+        attn = torch.zeros((Tq, Tk), device=device, dtype=dtype)
+        attn = attn.masked_fill(m.to(device=device), float("-inf"))
+        return attn
+
     def forward(self, q, k, v, cache_index: int):
-        q, k, v = [self.rearrange_heads1(x) for x in [q, k, v]]
+        # [B, N, C] -> [B, H, N, D]
+        q, k, v = [self.rearrange_heads1(x) for x in (q, k, v)]
 
         if self.max_cache_size > 0:
             k_cache, v_cache = self.get_buffers(cache_index)
-            full_k = torch.cat([k_cache[:k.shape[0]], k], dim=2)
-            full_v = torch.cat([v_cache[:k.shape[0]], v], dim=2)
-            # full_k = full_k[:, :, -(self.max_cache_size + :]
-            # full_v = full_v[:, :, -self.max_cache_size:]
-
+            full_k = torch.cat([k_cache[: k.shape[0]], k], dim=2)
+            full_v = torch.cat([v_cache[: v.shape[0]], v], dim=2)
             self.last_k = k
             self.last_v = v
         else:
             full_k = k
             full_v = v
 
-        if self.is_causal:
-            if self.local_attention_size is not None:
-                attn_mask = combined_sliding_chunkwise_mask(
-                    full_k.shape[2], self.min_chunk_size,
-                    self.local_attention_size)
-            else:
-                attn_mask = chunk_wise_causal_mask(full_k.shape[2],
-                                                   self.min_chunk_size)
-            attn_mask = attn_mask[-q.shape[2]:]
-            attn_mask = attn_mask.masked_fill(attn_mask == 1,
-                                              float('-inf')).to(k)
-
-            # print(attn_mask[-1])
-
-        else:
-            attn_mask = None
-
         if self.rotary_emb is not None:
-            q, full_k = self.rotary_emb.rotate_queries_with_cached_keys(
-                q, full_k)
+            q, full_k = self.rotary_emb.rotate_queries_with_cached_keys(q, full_k)
+
+        # ----------- attention mask -----------
+        attn_mask : Optional[torch.Tensor] = None
+        if self.is_causal:
+            Tq = q.shape[2]
+            Tk = full_k.shape[2]
+            # Safety clamp: if runtime length exceeds precomputed max, fall back (rare)
+            if Tk > self.max_total_len:
+                # Fallback: no local window / just causal
+                # (You can also raise here if you prefer strictness.)
+                attn_mask = None
+            else:
+                attn_mask = self._get_attn_mask(Tq, Tk, device=q.device, dtype=q.dtype)
 
         out = nn.functional.scaled_dot_product_attention(
             q,
             full_k,
             full_v,
             attn_mask=attn_mask,
-            is_causal=False,
-            dropout_p=self.dropout_level if self.training else 0.)
+            is_causal=False,  # we handle causal via mask
+            dropout_p=self.dropout_level if self.training else 0.0,
+        )
 
         out = self.rearrange_heads2(out)
         return out
 
 
 class SelfAttention(nn.Module):
-
-    def __init__(self,
-                 embed_dim: int,
-                 is_causal: bool = True,
-                 dropout_level: float = 0.0,
-                 n_heads: int = 8,
-                 rotary_emb=None,
-                 local_attention_size: Optional[int] = None,
-                 attention_chunk_size: int = 4):
-
+    def __init__(
+        self,
+        embed_dim: int,
+        is_causal: bool = True,
+        dropout_level: float = 0.0,
+        n_heads: int = 8,
+        rotary_emb=None,
+        local_attention_size: Optional[int] = None,
+        attention_chunk_size: int = 4,
+        max_cache_size: int = 0,
+        max_diffusion_steps: int = 16,
+        max_batch_size: int = 16,
+        use_sink: bool = False,
+        sink_size: int = 1,
+        max_seq_len: int = 32,
+    ):
         super().__init__()
         self.qkv_linear = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
 
-        self.mha = MHAttention(is_causal,
-                               dropout_level,
-                               n_heads,
-                               rotary_emb=rotary_emb,
-                               embed_dim=embed_dim,
-                               attention_chunk_size=attention_chunk_size,
-                               local_attention_size=local_attention_size)
-
-        self.rotary_emb = rotary_emb
+        self.mha = MHAttention(
+            is_causal=is_causal,
+            dropout_level=dropout_level,
+            n_heads=n_heads,
+            max_cache_size=max_cache_size,
+            rotary_emb=rotary_emb,
+            embed_dim=embed_dim,
+            attention_chunk_size=attention_chunk_size,
+            local_attention_size=local_attention_size,
+            max_diffusion_steps=max_diffusion_steps,
+            max_batch_size=max_batch_size,
+            use_sink=use_sink,
+            sink_size=sink_size,
+            max_seq_len=max_seq_len,
+        )
 
     def roll_cache(self, roll_size: int, cache_index: int):
         self.mha.roll_cache(roll_size, cache_index=cache_index)
@@ -269,7 +337,6 @@ class SelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-
     def __init__(self, embed_dim, mlp_multiplier, dropout_level):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -283,46 +350,46 @@ class MLP(nn.Module):
         return self.mlp(x)
 
 
-class DoubleIdentity(nn.Module):
-
-    def __init__(self) -> None:
-        super().__init__()
-
-    def roll_cache(self, size: int, cache_index: int):
-        pass
-
-    def forward(self, input: torch.Tensor, inputb: torch.Tensor,
-                cache_index: int) -> torch.Tensor:
-        return input
-
-
 class DecoderBlock(nn.Module):
-
-    def __init__(self,
-                 embed_dim: int,
-                 cond_dim: int,
-                 tcond_dim: int,
-                 is_causal: bool,
-                 mlp_multiplier: int,
-                 dropout_level: float,
-                 mlp_class,
-                 rotary_emb=None,
-                 local_attention_size: Optional[int] = None,
-                 attention_chunk_size: int = 4):
+    def __init__(
+        self,
+        embed_dim: int,
+        cond_dim: int,
+        tcond_dim: int,
+        is_causal: bool,
+        mlp_multiplier: int,
+        dropout_level: float,
+        rotary_emb=None,
+        local_attention_size: Optional[int] = None,
+        attention_chunk_size: int = 4,
+        max_cache_size: int = 0,
+        max_diffusion_steps: int = 16,
+        max_batch_size: int = 16,
+        use_sink: bool = False,
+        sink_size: int = 1,
+        max_seq_len: int = 32,
+    ):
         super().__init__()
         self.cond_dim = cond_dim
         self.tcond_dim = tcond_dim
 
         self.self_attention = SelfAttention(
-            embed_dim,
-            is_causal,
-            dropout_level,
-            n_heads=embed_dim // 64,
+            embed_dim=embed_dim,
+            is_causal=is_causal,
+            dropout_level=dropout_level,
+            n_heads=max(1, embed_dim // 64),
             rotary_emb=rotary_emb,
             attention_chunk_size=attention_chunk_size,
-            local_attention_size=local_attention_size)
+            local_attention_size=local_attention_size,
+            max_cache_size=max_cache_size,
+            max_diffusion_steps=max_diffusion_steps,
+            max_batch_size=max_batch_size,
+            use_sink=use_sink,
+            sink_size=sink_size,
+            max_seq_len=max_seq_len,
+        )
 
-        self.mlp = mlp_class(embed_dim, mlp_multiplier, dropout_level)
+        self.mlp = MLP(embed_dim, mlp_multiplier, dropout_level)
         self.norm1 = nn.LayerNorm(embed_dim)
         self.norm3 = nn.LayerNorm(embed_dim)
 
@@ -333,15 +400,19 @@ class DecoderBlock(nn.Module):
         if self.tcond_dim > 0:
             self.tcond_linear = nn.Linear(tcond_dim, 2 * embed_dim)
             self.norm0 = nn.LayerNorm(embed_dim, elementwise_affine=False)
+        else:
+            self.tcond_linear = self.norm0 = nn.Identity()
 
     def roll_cache(self, size: int, cache_index: int = 0):
         self.self_attention.roll_cache(size, cache_index)
 
-    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor],
-                tcond: Optional[torch.Tensor],
-                cache_index: int) -> torch.Tensor:
-
-        # AdaLN tcond
+    def forward(
+        self,
+        x: torch.Tensor,
+        cond: Optional[torch.Tensor],
+        tcond: Optional[torch.Tensor],
+        cache_index: int,
+    ) -> torch.Tensor:
         if self.tcond_dim > 0:
             x = self.norm0(x)
             assert tcond is not None
@@ -350,40 +421,47 @@ class DecoderBlock(nn.Module):
 
         x = self.self_attention(self.norm1(x), cache_index=cache_index) + x
 
-        # AdaLN cond
         if self.cond_dim > 0:
             x = self.norm2(x)
             assert cond is not None
             alpha, beta = self.linear(cond).chunk(2, dim=-1)
             x = x * (1 + alpha.unsqueeze(1)) + beta.unsqueeze(1)
 
-        # Final layer
         x = self.mlp(self.norm3(x)) + x
         return x
 
 
 class DenoiserTransBlock(nn.Module):
-
-    def __init__(self,
-                 n_channels: int = 64,
-                 seq_len: int = 32,
-                 mlp_multiplier: int = 4,
-                 embed_dim: int = 256,
-                 cond_dim: int = 128,
-                 tcond_dim: int = 0,
-                 dropout: float = 0.1,
-                 n_layers: int = 4,
-                 is_causal: bool = True,
-                 pos_emb_type: str = "learnable",
-                 local_attention_size: Optional[int] = None,
-                 attention_chunk_size: int = 4,
-                 use_out_proj=True):
+    def __init__(
+        self,
+        n_channels: int = 64,
+        seq_len: int = 32,
+        mlp_multiplier: int = 4,
+        embed_dim: int = 256,
+        cond_dim: int = 128,
+        tcond_dim: int = 0,
+        dropout: float = 0.1,
+        n_layers: int = 4,
+        is_causal: bool = True,
+        pos_emb_type: str = "learnable",
+        local_attention_size: Optional[int] = None,
+        attention_chunk_size: int = 4,
+        use_out_proj: bool = True,
+        # cache / sink knobs
+        max_cache_size: int = 0,
+        max_diffusion_steps: int = 16,
+        max_batch_size: int = 16,
+        use_sink: bool = False,
+        sink_size: int = 1,
+    ):
         super().__init__()
         self.n_channels = n_channels
         self.embed_dim = embed_dim
         self.dropout = dropout
         self.n_layers = n_layers
         self.mlp_multiplier = mlp_multiplier
+        self.tcond_dim = tcond_dim
+        self.seq_len = int(seq_len)
 
         self.patchify_and_embed = nn.Sequential(
             Rearrange("b c t -> b t c"),
@@ -397,40 +475,48 @@ class DenoiserTransBlock(nn.Module):
                 nn.Linear(tcond_dim, tcond_dim),
                 nn.GELU(),
             )
-            self.pos_embed_ca = nn.Identity()
         else:
             self.patchify_and_embed_tcond = nn.Identity()
 
+        self.rotary_emb = None
         if pos_emb_type == "learnable":
-            self.pos_embed = nn.Embedding(seq_len, self.embed_dim)
+            self.pos_embed = nn.Embedding(self.seq_len, self.embed_dim)
+            pre = torch.arange(0, self.seq_len).long()
+            self.register_buffer("precomputed_pos_enc", pre, persistent=False)
         elif pos_emb_type == "rotary":
             self.rotary_emb = RotaryEmbedding(32)
             self.pos_embed = None
-        elif pos_emb_type == "none":
+            self.register_buffer("precomputed_pos_enc", torch.zeros(1, dtype=torch.long), persistent=False)
+        else:
             self.pos_embed = None
+            self.register_buffer("precomputed_pos_enc", torch.zeros(1, dtype=torch.long), persistent=False)
 
-        precomputed_pos_enc = torch.arange(0, seq_len).long()
-        self.register_buffer("precomputed_pos_enc", precomputed_pos_enc)
+        self.decoder_blocks = nn.ModuleList(
+            [
+                DecoderBlock(
+                    embed_dim=self.embed_dim,
+                    mlp_multiplier=self.mlp_multiplier,
+                    cond_dim=0 if cond_dim == 0 else self.embed_dim,
+                    tcond_dim=tcond_dim,
+                    is_causal=is_causal,
+                    dropout_level=self.dropout,
+                    rotary_emb=None if pos_emb_type != "rotary" else self.rotary_emb,
+                    attention_chunk_size=attention_chunk_size,
+                    local_attention_size=local_attention_size,
+                    max_cache_size=max_cache_size,
+                    max_diffusion_steps=max_diffusion_steps,
+                    max_batch_size=max_batch_size,
+                    use_sink=use_sink,
+                    sink_size=sink_size,
+                    max_seq_len=self.seq_len,
+                )
+                for _ in range(self.n_layers)
+            ]
+        )
 
-        self.decoder_blocks = nn.ModuleList([
-            DecoderBlock(embed_dim=self.embed_dim,
-                         mlp_multiplier=self.mlp_multiplier,
-                         cond_dim=cond_dim,
-                         tcond_dim=tcond_dim,
-                         is_causal=is_causal,
-                         dropout_level=self.dropout,
-                         mlp_class=MLP,
-                         rotary_emb=None
-                         if pos_emb_type != "rotary" else self.rotary_emb,
-                         attention_chunk_size=attention_chunk_size,
-                         local_attention_size=local_attention_size)
-            for _ in range(self.n_layers)
-        ])
-
-        self.rearrange2 = Rearrange("b t c -> b c t", )
+        self.rearrange2 = Rearrange("b t c -> b c t")
         if use_out_proj:
-            self.out_proj = nn.Sequential(
-                nn.Linear(self.embed_dim, n_channels), self.rearrange2)
+            self.out_proj = nn.Sequential(nn.Linear(self.embed_dim, n_channels), self.rearrange2)
         else:
             self.out_proj = self.rearrange2
 
@@ -438,56 +524,61 @@ class DenoiserTransBlock(nn.Module):
         for block in self.decoder_blocks:
             block.roll_cache(size, cache_index)
 
-    def forward(self, x: torch.Tensor, features: Optional[torch.Tensor],
-                time_cond: Optional[torch.Tensor], cache_index: int):
-
-        x = self.patchify_and_embed(x)
+    def forward(
+        self,
+        x: torch.Tensor,
+        features: Optional[torch.Tensor],
+        time_cond: Optional[torch.Tensor],
+        cache_index: int,
+    ):
+        x = self.patchify_and_embed(x)  # [B, T, C]
 
         if self.pos_embed is not None:
-            pos_enc = self.pos_embed(
-                self.precomputed_pos_enc[:x.size(1)]).expand(
-                    x.size(0), x.size(1), -1)
-            x = x + pos_enc
+            # Embedding lookup each forward is usually ok; if you want, you can cache full pos_enc.
+            pos = self.pos_embed(self.precomputed_pos_enc[: x.size(1)]).expand(x.size(0), x.size(1), -1)
+            x = x + pos
 
-        time_cond = self.patchify_and_embed_tcond(
-            time_cond) if time_cond is not None else None
+        if time_cond is not None and self.tcond_dim > 0:
+            time_cond = self.patchify_and_embed_tcond(time_cond)
 
         for block in self.decoder_blocks:
-            x = block(x,
-                      cond=features,
-                      tcond=time_cond,
-                      cache_index=cache_index)
+            x = block(x, cond=features, tcond=time_cond, cache_index=cache_index)
 
         return self.out_proj(x)
 
-
 @gin.configurable
 class DenoiserV2(nn.Module):
-
-    def __init__(self,
-                 n_channels: int,
-                 seq_len: int = 32,
-                 embed_dim: int = 256,
-                 cond_dim: int = 64,
-                 tcond_dim: int = 0,
-                 noise_embed_dims: int = 128,
-                 n_layers: int = 6,
-                 mlp_multiplier: int = 2,
-                 dropout: float = 0.1,
-                 causal: bool = False,
-                 pos_emb_type="learnable",
-                 local_attention_size: Optional[int] = None,
-                 attention_chunk_size: int = 4,
-                 use_out_proj=True):
-
+    def __init__(
+        self,
+        n_channels: int,
+        seq_len: int = 32,
+        embed_dim: int = 256,
+        cond_dim: int = 64,
+        tcond_dim: int = 0,
+        noise_embed_dims: int = 128,
+        n_layers: int = 6,
+        mlp_multiplier: int = 2,
+        dropout: float = 0.1,
+        causal: bool = False,
+        pos_emb_type: str = "learnable",
+        local_attention_size: Optional[int] = None,
+        attention_chunk_size: int = 4,
+        use_out_proj: bool = True,
+        # cache / sink knobs
+        max_cache_size: int = 0,
+        max_diffusion_steps: int = 16,
+        max_batch_size: int = 16,
+        use_sink: bool = False,
+        sink_size: int = 1,
+    ):
         super().__init__()
-        self.noise_embed_dims = noise_embed_dims
-        self.embed_dim = embed_dim
-        self.n_channels = n_channels
+        self.noise_embed_dims = int(noise_embed_dims)
+        self.embed_dim = int(embed_dim)
+        self.n_channels = int(n_channels)
 
-        self.fourier_feats = PositionalEmbedding(num_channels=noise_embed_dims,
-                                                 max_positions=10_000,
-                                                 factor=100.0)
+        self.fourier_feats = PositionalEmbedding(
+            num_channels=noise_embed_dims, max_positions=10_000, factor=100.0
+        )
 
         if cond_dim > 0:
             self.embedding = nn.Sequential(
@@ -511,26 +602,28 @@ class DenoiserV2(nn.Module):
             pos_emb_type=pos_emb_type,
             attention_chunk_size=attention_chunk_size,
             local_attention_size=local_attention_size,
-            use_out_proj=use_out_proj)
-
-    @property
-    def name(self):
-        return "transformer"
+            use_out_proj=use_out_proj,
+            max_cache_size=max_cache_size,
+            max_diffusion_steps=max_diffusion_steps,
+            max_batch_size=max_batch_size,
+            use_sink=use_sink,
+            sink_size=sink_size,
+        )
 
     def roll_cache(self, size: int, cache_index: int):
         self.denoiser_trans_block.roll_cache(size, cache_index)
 
-    def forward(self,
-                x,
-                time: torch.Tensor,
-                cond: Optional[torch.Tensor] = None,
-                time_cond: Optional[torch.Tensor] = None,
-                cache_index: int = 0) -> torch.Tensor:
-
-        # Fix for retro-compatibility of export code
-        if len(time.shape) > 1:
+    def forward(
+        self,
+        x: torch.Tensor,
+        time: torch.Tensor,
+        cond: Optional[torch.Tensor] = None,
+        time_cond: Optional[torch.Tensor] = None,
+        cache_index: int = 0,
+    ) -> torch.Tensor:
+        # retro-compat: sometimes time comes as [B,1,T], keep scalar per batch
+        if time.dim() > 1:
             time = time[..., 0]
-
         time = time.reshape(-1)
 
         noise_level = self.fourier_feats(time)
@@ -542,23 +635,39 @@ class DenoiserV2(nn.Module):
 
         features = self.embedding(embedding_in)
 
-        x = self.denoiser_trans_block(x,
-                                      features=features,
-                                      time_cond=time_cond,
-                                      cache_index=cache_index)
+        x = self.denoiser_trans_block(
+            x, features=features, time_cond=time_cond, cache_index=cache_index
+        )
         return x
 
 
 if __name__ == "__main__":
-    denoiser = DenoiserV2(n_channels=16,
-                          tcond_dim=24,
-                          cond_dim=32,
-                          temporal_noise=False)
+    # quick check
+    denoiser = DenoiserV2(
+        n_channels=16,
+        seq_len=32,
+        tcond_dim=24,
+        cond_dim=32,
+        causal=True,
+        local_attention_size=64,   # set None for full-past
+        attention_chunk_size=4,
+        max_cache_size=64,
+        max_diffusion_steps=16,
+        max_batch_size=16,
+        use_sink=False,
+        sink_size=1,
+    )
 
-    tcond = torch.randn((16, 24, 32))
-    x = torch.randn((16, 16, 32))
-    cond = torch.randn((16, 32))
+    B = 4
+    tcond = torch.randn((B, 24, 32))
+    x = torch.randn((B, 16, 32))
+    cond = torch.randn((B, 32))
+    time = torch.randn(B, 1)
 
-    time = torch.randn(16, 1)
+    y = denoiser(x, time, cond, tcond, cache_index=0)
+    print("out:", y.shape)
 
-    print(denoiser(x, time, cond, tcond).shape)
+    # TorchScript check
+    ts = torch.jit.script(denoiser.eval())
+    y2 = ts(x, time, cond, tcond, 0)
+    print("ts out:", y2.shape)

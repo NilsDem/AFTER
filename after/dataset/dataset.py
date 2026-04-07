@@ -6,6 +6,7 @@ from tqdm import tqdm
 import numpy as np
 import os
 import json
+import pretty_midi
 
 
 class SimpleDataset(torch.utils.data.Dataset):
@@ -33,7 +34,6 @@ class SimpleDataset(torch.utils.data.Dataset):
         self.max_samples = max_samples
         self.recache_every = recache_every
         self.recache_counter = 0
-        print(path)
         self.env = lmdb.open(path,
                              lock=False,
                              readonly=readonly,
@@ -111,8 +111,9 @@ class SimpleDataset(torch.utils.data.Dataset):
         if keys == "all":
             self.buffer_keys = self.get_keys()
         else:
-            self.buffer_keys = keys
+            self.buffer_keys = keys + ["metadata"]
 
+        print(self.buffer_keys)
         if init_cache:
             self.build_cache()
 
@@ -163,18 +164,16 @@ class SimpleDataset(torch.utils.data.Dataset):
         out = {}
         for key in self.buffer_keys:
             if key == "metadata":
+
                 out[key] = ae.get_metadata()
             else:
-                try:
-                    out[key] = ae.get(key)
-                except:
-                    print("key: ", key, " not found")
-
-        if "midi" in out.keys():
-            midi = out["midi"]
-
-            out["midi"] = midi
-
+                dat = ae.get(key)
+                
+                if isinstance(dat, pretty_midi.PrettyMIDI):
+                    # print("Comuting piano roll for key: ", key)
+                    piano_roll = dat.get_piano_roll(fs = 44100/4096*4)
+                    out["piano_roll_"+key] = piano_roll
+                out[key] = dat
         return out
 
 
@@ -220,16 +219,17 @@ class CombinedDataset(torch.utils.data.Dataset):
         else:
             print("provide either path or dataset dict")
 
-        if freqs == "estimate":
-            for k in info_dict.keys():
-                info_dict[k]["freq"] = len(self.datasets[k])**0.3
-        elif type(freqs) == list and len(freqs) == len(info_dict.keys()):
+        if type(freqs) == list and len(freqs) == len(info_dict.keys()):
             for i, k in enumerate(info_dict.keys()):
                 info_dict[k]["freq"] = freqs[i]
         else:
-            print("using default unit frequency")
+            print("Using estimated frequencies")
             for k in info_dict.keys():
-                info_dict[k]["freq"] = 1
+                info_dict[k]["freq"] = len(self.datasets[k])**0.3
+        # else:
+        #     print("using default unit frequency")
+        #     for k in info_dict.keys():
+        #         info_dict[k]["freq"] = 1
 
         for k, v in self.datasets.items():
             print(k, " : ", len(v), "examples ")
@@ -294,5 +294,6 @@ class CombinedDataset(torch.utils.data.Dataset):
 
         dataset_id = self.dataset_ids[idx]
         data = self.datasets[dataset_id][self.all_indexes[idx]]
+        data["metadata"]["label"] = dataset_id
         data["label"] = dataset_id
         return data

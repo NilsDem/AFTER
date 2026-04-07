@@ -449,9 +449,9 @@ class BeatsWrapper:
         return None
 
 
-import torch
+# import torch
 
-from laion_clap import CLAP_Module
+# from laion_clap import CLAP_Module
 
 
 class CLAPWrapper:

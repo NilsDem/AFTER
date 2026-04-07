@@ -8,68 +8,45 @@ from cached_conv import convs
 IN_SIZE = None
 N_SIGNAL = None
 
-ZS_CHANNELS = 12
-ZT_CHANNELS = 64
+ZS_CHANNELS = 128
+ZT_CHANNELS = 6
 SR = 44100
-STRUCTURE_TYPE = "audio"
-PHASE_1_STEP = 100000
-MAX_STEPS = 500000
-ADV_WEIGHT = 0.06
+STRUCTURE_TYPE = "midi"
+PHASE_1_STEP = 200000
+MAX_STEPS = 2000000
+ADV_WEIGHT = 0.
 SHUFFLE = None
 
-LOCAL_ATTENTION_SIZE = 32
+LOCAL_ATTENTION_SIZE = 16
 ATTENTION_CHUNK_SIZE = 1
 
 # Data
-diffusion.utils.collate_fn_new:
+diffusion.utils.collate_fn:
     n_signal = %N_SIGNAL
     structure_type = %STRUCTURE_TYPE
 
 ### ARCHITECTURE ### 
 encoder/diffusion.networks.ecapa_encoder.ECAPATDNN:
-    channels = [512, 512, 512, 1024, 2048]
-    dilations = [1, 1, 1, 1, 1 ]
+    attention_channels = 128
+    channels = [512, 512, 512, 1024]
+    dilations = [1, 1, 1, 1]
     global_context = True
-    groups = [1, 1, 1, 1, 1]
+    groups = [1, 1, 1, 1]
     in_size = %IN_SIZE
-    kernel_sizes = [3, 3, 3, 3, 3]
+    kernel_sizes = [3, 3, 3, 3]
     out_dim = %ZT_CHANNELS
     pooling = True
     res2net_scale = 8
-    se_channels = 256
-    attention_channels = 256
-    spherical_normalisation = True
+    se_channels = 128
+    spherical_normalisation = False
     use_tanh = False
     regularisation = "ac"
 
 
-encoder_time/diffusion.networks.Encoder1D:
-    in_size = %IN_SIZE
-    channels = [128, 256, 256, 512, %ZS_CHANNELS]
-    ratios = [1, 1, 1, 1]
-    use_tanh = False
-    average_out = False
-    upscale_out = False
-    spherical_normalization = False
-    vae_regularisation = False
-    ac_regularisation = True
-    norm_type = "batch_norm"
-
-encoder_time/convs.get_padding.mode = 'causal'
-
-classifier/diffusion.networks.Encoder1D:
-    in_size = %ZS_CHANNELS
-    channels = [64, 64, 64, 64, %ZT_CHANNELS]
-    ratios = [2, 2, 2, 1, 1]
-    use_tanh = False
-    average_out = True
-    upscale_out = False
-    norm_type = "batch_norm"
-
 diffusion.networks.transformerv2.DenoiserV2:
     n_channels = %IN_SIZE
     seq_len = %N_SIGNAL   
-    embed_dim = 256
+    embed_dim = 384
     cond_dim = %ZT_CHANNELS
     noise_embed_dims = 64
     n_layers = 6
@@ -86,8 +63,8 @@ diffusion.model.Base:
     sr = %SR
     net= @diffusion.networks.transformerv2.DenoiserV2()
     encoder = @encoder/diffusion.networks.ecapa_encoder.ECAPATDNN()
-    encoder_time = @encoder_time/diffusion.networks.Encoder1D()    
-    classifier = @classifier/diffusion.networks.Encoder1D()
+    # encoder_time = @encoder_time/diffusion.networks.Encoder1D()    
+    # classifier = @classifier/diffusion.networks.Encoder1D()
     time_transform = None
     drop_value = -4.
     drop_rate = 0.15
@@ -95,14 +72,13 @@ diffusion.model.Base:
  
 diffusion.model.Base.fit: 
     max_steps = %MAX_STEPS
-    train_encoder = False
+    train_encoder = True
     train_encoder_time = True
-    load_encoders= [False, True, True]
 
     ## Adversarial
     timbre_warmup = %PHASE_1_STEP
     adversarial_warmup = 10000
-    stop_training_encoder_step = 1
+    stop_training_encoder_step = %MAX_STEPS
     stop_training_encoder_time_step = %MAX_STEPS
     update_classifier_every = 3
     adversarial_loss = "cosine"
@@ -111,8 +87,8 @@ diffusion.model.Base.fit:
     drop_targets = [0,1]
 
     # Noise augmentation to smooth the latent space
-    zsem_noise_aug = 0.02
-    time_cond_noise_aug = 0.01
+    zsem_noise_aug = 0.05
+    time_cond_noise_aug = 0.02
 
     ## Encoder regularisation
     regularisation_weight = 1

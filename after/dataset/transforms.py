@@ -41,7 +41,7 @@ class BasicPitchPytorch(BaseTransform):
         self.device = device
 
     @torch.no_grad()
-    def __call__(self, waveform, **kwargs):
+    def __call__(self, waveform, params_bp={}):
         if type(waveform) != torch.Tensor:
             waveform = torch.from_numpy(waveform).to(self.device)
 
@@ -54,15 +54,19 @@ class BasicPitchPytorch(BaseTransform):
         if len(waveform.shape) > 1 and waveform.shape[0] > 1:
             results = []
             for wave in waveform:
+                print("predicting")
                 _, midi_data, _ = predict(model=self.pt_model,
                                           audio=wave.squeeze().cpu(),
-                                          device=self.device)
+                                          device=self.device,
+                                          **params_bp)
                 results.append(midi_data)
             return results
         else:
+            print("predicting")
             _, midi_data, _ = predict(model=self.pt_model,
                                       audio=waveform.squeeze().cpu(),
-                                      device=self.device)
+                                      device=self.device,
+                                      **params_bp)
             return midi_data
 
 
@@ -104,7 +108,7 @@ class BaseTransform():
 from audiomentations import TimeStretch as time_stretch
 
 
-class TimeStretch(BaseTransform):
+class TS(BaseTransform):
 
     def __init__(self, sr, ts_min=0.5, ts_max=2., random_silence=True):
         super().__init__(sr, "time_stretch")
@@ -127,7 +131,7 @@ class TimeStretch(BaseTransform):
             audio = self.silence_transform(audio, sample_rate=self.sr)
             audio = self.silence_transform(audio, sample_rate=self.sr)
             audio = self.silence_transform(audio, sample_rate=self.sr)
-            audio = self.silence_transform(audio, sample_rate=self.sr)
+            # audio = self.silence_transform(audio, sample_rate=self.sr)
         return audio
 
 
@@ -228,15 +232,384 @@ class PSTS(BaseTransform):
             audio = self.silence_aug(audio, sample_rate=self.sr)
             audio = self.silence_aug(audio, sample_rate=self.sr)
             audio = self.silence_aug(audio, sample_rate=self.sr)
-            audio = self.silence_aug(audio, sample_rate=self.sr)
-            audio = self.silence_aug(audio, sample_rate=self.sr)
+            # audio = self.silence_aug(audio, sample_rate=self.sr)
+        else:
+            audio = audio.astype(np.float32)
 
         # Ensure output length matches input length
-        if len(audio) < time_dim:
-            audio = np.pad(audio, (0, time_dim - len(audio)), mode='constant')
-        elif len(audio) > time_dim:
+        if audio.shape[-1] < time_dim:
+            if len(audio.shape) > 1:
+                audio = np.pad(audio,
+                               ((0, 0), (0, time_dim - audio.shape[-1])),
+                               mode='constant')
+            else:
+                audio = np.pad(audio, (0, time_dim - audio.shape[-1]),
+                               mode='constant')
+
+        elif audio.shape[-1] > time_dim:
             audio = audio[..., :time_dim]
         return audio
+
+
+def generate_piecewise_stretch_curve(
+    n_samples: int,
+    min_stretch: float = 0.8,
+    max_stretch: float = 1.2,
+    n_switches: int = 4,
+    seed: int = None,
+):
+    """
+    Generate a piecewise-linear time-stretch curve.
+
+    Args:
+        n_samples (int): total number of samples in the audio
+        min_stretch (float): minimum local stretch factor
+        max_stretch (float): maximum local stretch factor
+        n_switches (int): number of random change points (segments = n_switches + 1)
+        seed (int, optional): random seed for reproducibility
+
+    Returns:
+        np.ndarray: time_stretch curve of shape (n_samples,)
+    """
+    rng = np.random.default_rng(seed)
+
+    # Random switch points (excluding first and last)
+    switch_points = np.sort(
+        rng.choice(np.arange(1, n_samples - 1), n_switches, replace=False))
+    keypoints = np.concatenate([[0], switch_points, [n_samples - 1]])
+
+    # Random stretch values at each keypoint
+    stretch_values = rng.uniform(min_stretch, max_stretch, size=len(keypoints))
+
+    # Linear interpolation between keypoints
+    curve = np.interp(np.arange(n_samples), keypoints, stretch_values)
+
+    return curve
+
+
+def warp_beats_with_stretch(beats, time_stretchs, sr):
+    """
+    Warp beat times according to a time-varying stretch curve.
+
+    Args:
+        beats (np.ndarray): beat times (in seconds)
+        time_stretchs (np.ndarray): per-sample stretch factors
+        sr (int): sample rate
+
+    Returns:
+        np.ndarray: warped beat times (in seconds)
+    """
+    # Time axis
+    n = len(time_stretchs)
+    t_orig = np.arange(n) / sr
+
+    # Compute new warped time mapping
+    warped_time = np.cumsum(1.0 / time_stretchs) / sr  # integrate reciprocal
+
+    # Interpolate warped time at each beat
+    warped_beats = np.interp(beats, t_orig, warped_time)
+
+    return warped_beats
+
+
+class LinearTimeStretch(BaseTransform):
+
+    def __init__(self, sr, ts_min=0.8, ts_max=1.25, n_switches=3):
+        super().__init__(sr, "linear_time_stretch")
+        self.ts_min = ts_min
+        self.ts_max = ts_max
+        self.n_switches = n_switches
+
+    def __call__(self, audio: np.array, beats):
+
+        time_stretchs = generate_piecewise_stretch_curve(
+            min_stretch=self.ts_min,
+            max_stretch=self.ts_max,
+            n_switches=self.n_switches,
+            n_samples=audio.shape[-1])
+        audio_transformed = pedalboard.time_stretch(
+            audio,
+            samplerate=self.sr,
+            stretch_factor=time_stretchs,
+            use_time_domain_smoothing=True).squeeze()
+
+        warped_beats = warp_beats_with_stretch(beats,
+                                               time_stretchs,
+                                               sr=self.sr)
+
+        if audio_transformed.shape[-1] < audio.shape[-1]:
+            audio_transformed = np.pad(
+                audio_transformed,
+                (0, audio.shape[-1] - audio_transformed.shape[-1]),
+                mode='constant')
+        else:
+            audio_transformed = audio_transformed[..., :audio.shape[-1]]
+            warped_beats = warped_beats[warped_beats <= audio.shape[-1] /
+                                        self.sr]
+
+        warped_beats = list(warped_beats)
+
+        return audio_transformed, warped_beats
+
+
+import pretty_midi
+
+
+def shift_and_stretch_midi(
+    pm,
+    pitch_shift=0,
+    time_stretch=1.0,
+):
+    """
+    Pitch-shift and/or time-stretch only the NOTE events of a MIDI file.
+
+    Parameters
+    ----------
+    midi_path : str
+        Path to the input MIDI file.
+    pitch_shift : int
+        Semitone shift (positive = up, negative = down).
+    time_stretch : float
+        Stretch factor (>1 = slower/longer, <1 = faster/shorter).
+
+    Returns
+    -------
+    pm : pretty_midi.PrettyMIDI
+        Modified PrettyMIDI object (with shifted/stretched notes only).
+    """
+
+    for inst in pm.instruments:
+        for note in inst.notes:
+            note.pitch = int(note.pitch + pitch_shift)
+            note.start /= time_stretch
+            note.end /= time_stretch
+
+    return pm
+
+
+def add_silence_midi(
+    pm,
+    silence_time,
+):
+    """
+    Pitch-shift and/or time-stretch only the NOTE events of a MIDI file.
+
+    Parameters
+    ----------
+    midi_path : str
+        Path to the input MIDI file.
+    pitch_shift : int
+        Semitone shift (positive = up, negative = down).
+    time_stretch : float
+        Stretch factor (>1 = slower/longer, <1 = faster/shorter).
+
+    Returns
+    -------
+    pm : pretty_midi.PrettyMIDI
+        Modified PrettyMIDI object (with shifted/stretched notes only).
+    """
+
+    for inst in pm.instruments:
+        for note in inst.notes:
+            note.start += silence_time
+            note.end += silence_time
+
+    return pm
+
+
+def total_silence_augmentation(audio, midi):
+    audio = 0. * audio
+    midi = pretty_midi.PrettyMIDI()
+    return audio, midi
+
+
+def silence_augmentation(audio, midi, sr=44100, fade_ms=20):
+    """
+    Silence augmentation:
+      1. Find largest gap between consecutive notes in the first 33% of the MIDI duration.
+      2. Silence everything before the note after that gap.
+      3. Apply a short crossfade before that note.
+      4. Trim and shift MIDI accordingly.
+
+    Returns:
+        aug_audio (np.ndarray), aug_midi (pretty_midi.PrettyMIDI)
+    """
+
+    # --- Normalize shapes ---
+    if audio.ndim > 1:
+        audio = audio.squeeze()
+
+    # --- Extract note timings ---
+    notes = [n for inst in midi.instruments for n in inst.notes]
+    if not notes:
+        return audio.copy(), midi  # no notes → nothing to trim
+
+    # Sort by start time
+    notes.sort(key=lambda n: n.start)
+    note_starts = np.array([n.start for n in notes])
+
+    total_duration = midi.get_end_time()
+    first_third = total_duration / 3.0
+
+    # Consider notes only within first 1/3
+    mask = note_starts < first_third
+    if mask.sum() < 2:
+        # Not enough notes early on to compute gaps
+        return audio.copy(), midi
+
+    sub_starts = note_starts[mask]
+    gaps = np.diff(sub_starts)
+
+    # Find the biggest gap and the note after it
+    gap_idx = np.argmax(gaps)
+    start_note_time = sub_starts[gap_idx + 1]
+
+    # --- Convert time to sample index ---
+    start_idx = int(start_note_time * sr)
+
+    # --- Crossfade setup ---
+    fade_samples = int((fade_ms / 1000.0) * sr)
+    fade_start = max(0, start_idx - fade_samples)
+
+    # --- Create a faded copy ---
+    aug_audio = audio.copy()
+    if fade_start > 0:
+        fade_curve = np.linspace(0, 1, fade_samples)
+        aug_audio[:fade_start] = 0
+        aug_audio[fade_start:start_idx] *= fade_curve
+    else:
+        aug_audio[:start_idx] = 0
+
+    # --- Silence before fade_start completely ---
+    aug_audio[:fade_start] = 0
+
+    # --- Update MIDI ---
+    aug_midi = pretty_midi.PrettyMIDI()
+    for inst in midi.instruments:
+        new_inst = pretty_midi.Instrument(program=inst.program,
+                                          is_drum=inst.is_drum,
+                                          name=inst.name)
+        for n in inst.notes:
+            if n.start <= start_note_time - 0.010:
+                continue  # remove notes that end before first onset
+            new_inst.notes.append(n)  # keep timing unchanged
+        aug_midi.instruments.append(new_inst)
+
+    return aug_audio, aug_midi
+
+
+class ConstantPitchShift(BaseTransform):
+
+    def __init__(self,
+                 sr,
+                 ts_min=0.7,
+                 ts_max=1.25,
+                 ps_min=-4,
+                 ps_max=4,
+                 add_silence=False):
+        super().__init__(sr, "linear_time_stretch")
+        self.ts_min = ts_min
+        self.ts_max = ts_max
+        self.ps_min = ps_min
+        self.ps_max = ps_max
+        self.add_silence = add_silence
+
+        self.pitch_aug = PitchShift(min_semitones=ps_min,
+                                    max_semitones=ps_max,
+                                    p=1.0)
+        self.time_aug = TimeStretch(min_rate=ts_min,
+                                    max_rate=ts_max,
+                                    leave_length_unchanged=False,
+                                    p=1.0)
+
+    def __call__(self, audio: np.array, midi):
+
+
+        audio_transformed = self.pitch_aug(audio, sample_rate=self.sr)
+        audio_transformed = self.time_aug(audio_transformed,
+                                          sample_rate=self.sr)
+
+        pitch_shifts = self.pitch_aug.parameters["num_semitones"]
+        time_stretchs = self.time_aug.parameters["rate"]
+
+
+        if midi is not None:
+            warped_midi = shift_and_stretch_midi(midi, pitch_shifts, time_stretchs)
+        else:
+            warped_midi = None
+
+        if self.add_silence and np.random.rand() < 0.05:
+            audio_transformed, warped_midi = total_silence_augmentation(
+                audio_transformed, warped_midi)
+
+            # silence_time = np.random.uniform(0.0,
+            #                                  0.15 * audio.shape[-1] / self.sr)
+            # audio_transformed = np.pad(audio_transformed,
+            #                            (int(silence_time * self.sr), 0),
+            #                            mode='constant')
+            # warped_midi = add_silence_midi(warped_midi, silence_time)
+
+        if audio_transformed.shape[-1] < audio.shape[-1]:
+            audio_transformed = np.pad(
+                audio_transformed,
+                (0, audio.shape[-1] - audio_transformed.shape[-1]),
+                mode='constant')
+        elif audio_transformed.shape[-1] > audio.shape[-1]:
+            audio_transformed = audio_transformed[..., :audio.shape[-1]]
+
+        return audio_transformed, warped_midi
+
+
+class ConstantPitchShiftPedalboard(BaseTransform):
+
+    def __init__(self,
+                 sr,
+                 ts_min=0.7,
+                 ts_max=1.25,
+                 ps_min=-4,
+                 ps_max=4,
+                 add_silence=False):
+        super().__init__(sr, "linear_time_stretch")
+        self.ts_min = ts_min
+        self.ts_max = ts_max
+        self.ps_min = ps_min
+        self.ps_max = ps_max
+        self.add_silence = add_silence
+
+    def __call__(self, audio: np.array, midi):
+
+        pitch_shifts = np.random.randint(self.ps_min, self.ps_max, 1)[0]
+        time_stretchs = np.random.uniform(self.ts_min, self.ts_max)
+
+        print("transforming")
+        audio_transformed = pedalboard.time_stretch(
+            audio,
+            samplerate=self.sr,
+            stretch_factor=time_stretchs,
+            pitch_shift_in_semitones=pitch_shifts,
+            use_time_domain_smoothing=True).squeeze()
+
+        print("end transofmring")
+
+        warped_midi = shift_and_stretch_midi(midi, pitch_shifts, time_stretchs)
+
+        if self.add_silence:
+            silence_time = np.random.uniform(0.0,
+                                             0.15 * audio.shape[-1] / self.sr)
+            audio_transformed = np.pad(audio_transformed,
+                                       (int(silence_time * self.sr), 0),
+                                       mode='constant')
+            warped_midi = add_silence_midi(warped_midi, silence_time)
+
+        if audio_transformed.shape[-1] < audio.shape[-1]:
+            audio_transformed = np.pad(
+                audio_transformed,
+                (0, audio.shape[-1] - audio_transformed.shape[-1]),
+                mode='constant')
+        elif audio_transformed.shape[-1] > audio.shape[-1]:
+            audio_transformed = audio_transformed[..., :audio.shape[-1]]
+
+        return audio_transformed, warped_midi
 
 
 class PSTSOLD(BaseTransform):
@@ -306,6 +679,7 @@ class PSTSOLD(BaseTransform):
             stretch_factor=time_stretchs,
             pitch_shift_in_semitones=pitch_shifts,
             use_time_domain_smoothing=True)
+
         return audio_transformed
 
     def __call__(self, audio):
@@ -456,13 +830,23 @@ from after.dataset.beat_this.inference import Audio2Beats
 
 class BeatTrack(BaseTransform):
 
-    def __init__(self, sr, device="cpu") -> None:
+    def __init__(self,
+                 sr,
+                 device="cpu",
+                 fps: float = 50.0,
+                 dbn: bool = True,
+                 bpm=None) -> None:
         super().__init__(sr, "beat_this")
 
         self.audio2beats = Audio2Beats(checkpoint_path="final0",
-                                       dbn=False,
+                                       dbn=dbn,
+                                       fps=fps,
                                        float16=False,
-                                       device=device)
+                                       device=device,
+                                       bpm=bpm)
+        self.device = device
+        self.uses_bpm = bpm
+        self.dbn = dbn
 
     def get_beat_signal(self, b, len_wave, len_z, sr=24000, zero_value=0):
         if len(b) < 2:
@@ -512,19 +896,52 @@ class BeatTrack(BaseTransform):
             out = np.concatenate((out, np.zeros(abs(len(times) - len(out)))))
         return out
 
-    def __call__(self, waveform: np.array, z_length: int):
+    def __call__(
+        self,
+        waveform: np.array,
+        z_length: int = None,
+        return_beats: bool = False,
+        bpm: float = None,
+        set_first_beat_zero: bool = False,
+    ):
+
+        if bpm is None:
+            if self.uses_bpm:
+                self.audio2beats.reset_processor(bpm=None)
+                self.uses_bpm = False
+        else:
+            print("Using BPM")
+            self.audio2beats.reset_processor(bpm=bpm)
+            self.uses_bpm = True
+
         beats, downbeats = self.audio2beats(waveform, self.sr)
-        beat_clock = self.get_beat_signal(beats,
-                                          waveform.shape[-1],
-                                          z_length,
-                                          sr=self.sr,
-                                          zero_value=0.)
-        downbeat_clock = self.get_beat_signal(downbeats,
+
+        if len(beats) == 0:
+            beats = np.array([0.])
+            downbeats = np.array([0.])
+
+        if set_first_beat_zero:
+            beats = beats - beats[0]
+            downbeats = downbeats - downbeats[0]
+
+        if return_beats:
+            return {"beats": beats, "downbeats": downbeats}
+        else:
+            assert z_length is not None, "z_length must be provided if return_beats is False"
+            beat_clock = self.get_beat_signal(beats,
                                               waveform.shape[-1],
                                               z_length,
                                               sr=self.sr,
                                               zero_value=0.)
-        return {"beat_clock": beat_clock, "downbeat_clock": downbeat_clock}
+            downbeat_clock = self.get_beat_signal(downbeats,
+                                                  waveform.shape[-1],
+                                                  z_length,
+                                                  sr=self.sr,
+                                                  zero_value=0.)
+            return {
+                "beat_clock": list(beat_clock),
+                "downbeat_clock": list(downbeat_clock)
+            }
 
 
 def compute_librosa(y: np.ndarray,

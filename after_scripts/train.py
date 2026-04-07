@@ -1,5 +1,6 @@
 import gin
-
+import cached_conv as cc
+# gin.config.enable_dynamic_registration()
 #gin.add_config_file_search_path('./after/diffusion/configs')
 import torch
 import os
@@ -7,13 +8,14 @@ import numpy as np
 
 import after
 from after.dataset import SimpleDataset, CombinedDataset
-from after.diffusion.utils import collate_fn, get_datasets
+from after.diffusion.utils import collate_fn, get_datasets, collate_fn_new
 from after.diffusion.model import Base
 import after.diffusion.model
 from after.autoencoder import M2LWrapper
 from tqdm import tqdm
 from after.diffusion.model import RectifiedFlow, Base
 from absl import flags, app
+from tqdm import tqdm
 
 FLAGS = flags.FLAGS
 
@@ -26,15 +28,12 @@ flags.DEFINE_string("model", "rectified", "Model type.")
 
 # Training
 flags.DEFINE_integer("bsize", 32, "Batch size.")
-flags.DEFINE_integer("n_signal", 32,
+flags.DEFINE_integer("n_signal", 64,
                      "Training length in number of latent steps")
 
 # DATASET
 flags.DEFINE_multi_string(
-    "db_path", [
-        "/fast-1/nils/instruments/real_m2l/",
-        "/fast-1/nils/instruments/synthetic_m2l/"
-    ], "Database path. Use multiple for combined datasets.")
+    "db_path", [], "Database path. Use multiple for combined datasets.")
 flags.DEFINE_multi_float("freqs", [1., 1.],
                          "Sampling frequencies for multiple datasets.")
 flags.DEFINE_string("out_path", "./after_runs", "Output path.")
@@ -45,8 +44,13 @@ flags.DEFINE_string("emb_model_path", "music2latent",
 flags.DEFINE_bool("use_cache", True, "Whether to cache the dataset.")
 flags.DEFINE_integer("max_samples", None, "Maximum number of samples.")
 flags.DEFINE_integer("num_workers", 2, "Number of workers.")
-flags.DEFINE_multi_string("augmentation_keys", ["all"],
-                          "List of augmentation keys.")
+flags.DEFINE_multi_string("augmentation_keys", [
+    # "augment_shift_stretch_nosilence_0",
+    # "augment_shift_stretch_nosilence_1",
+    # "augment_shift_stretch_nosilence_2",
+    # "augment_shift_stretch_nosilence_3",
+], "List of augmentation keys.")
+flags.DEFINE_multi_string("target_keys", None, "List of augmentation keys.")
 flags.DEFINE_multi_string("augmentation_keys_exclude", [],
                           "List of augmentation keys.")
 flags.DEFINE_multi_string("augmentation_keys_include", [],
@@ -66,6 +70,9 @@ flags.DEFINE_bool("use_validation", True, "Use a train/validation split")
 flags.DEFINE_string("load_encoder", None, "Path to encoder to load")
 flags.DEFINE_integer("load_encoder_step", None, "Step to load encoder")
 flags.DEFINE_bool("random_crop", True, "Use random croping for timbre")
+flags.DEFINE_bool("use_augment_target", False,
+                  "Use augmented keys for diffusion/structure target as well")
+flags.DEFINE_integer("sample_rate", None, "Sample rate")
 
 
 def add_gin_extension(config_name: str) -> str:
@@ -95,8 +102,13 @@ def main(argv):
         emb_model = M2LWrapper(device=device)
     else:
         emb_model = torch.jit.load(FLAGS.emb_model_path)  #.to(device)
-    dummy = torch.randn(1, 1, 8192)  #.to(device)
-    z = emb_model.encode(dummy)
+    try:
+        audio_channels = emb_model.model.audio_channels 
+    except:
+        audio_channels = 1
+    dummy = torch.randn(1, audio_channels, 8192)  #.to(device)
+    with torch.no_grad():
+        z = emb_model.encode(dummy)
     ae_emb_size = z.shape[1]
     ae_ratio = dummy.shape[-1] // z.shape[-1]
 
@@ -104,8 +116,10 @@ def main(argv):
           " - emb size : ", ae_emb_size)
 
     with gin.unlock_config():
-        gin.bind_parameter("diffusion.utils.collate_fn.ae_ratio", ae_ratio)
-        gin.bind_parameter("diffusion.utils.collate_fn.random_crop",
+        gin.bind_parameter("diffusion.utils.collate_fn_new.use_augment_target",
+                           FLAGS.use_augment_target)
+        gin.bind_parameter("diffusion.utils.collate_fn_new.ae_ratio", ae_ratio)
+        gin.bind_parameter("diffusion.utils.collate_fn_new.random_crop",
                            FLAGS.random_crop)
         gin.bind_parameter("%IN_SIZE", ae_emb_size)
 
@@ -116,6 +130,9 @@ def main(argv):
         if FLAGS.adv is not None:
             print("changing adversarial to", FLAGS.adv)
             gin.bind_parameter("%ADV_WEIGHT", FLAGS.adv)
+        if FLAGS.sample_rate is not None:
+            print("changing sample rate to", FLAGS.sample_rate)
+            gin.bind_parameter("%SR", FLAGS.sample_rate)
 
         if FLAGS.zs is not None:
             print("changing zs to", FLAGS.zs)
@@ -170,6 +187,17 @@ def main(argv):
     ] + (["waveform"] if blender.time_transform is not None else
          []) + (["midi"] if structure_type == "midi" else [])
 
+    if structure_type == "descriptors":
+        descriptors = gin.query_parameter(
+            "diffusion.utils.collate_fn_new.descriptors")
+        descr_keys = []
+
+        for key in FLAGS.augmentation_keys:
+            descr_keys.extend([key + "_" + descr for descr in descriptors])
+        descr_keys.extend(descriptors)
+
+        data_keys += descr_keys
+    print(data_keys)
     ## DATASET
     augmentation_keys = FLAGS.augmentation_keys
 
@@ -187,15 +215,35 @@ def main(argv):
                      ) if FLAGS.augmentation_keys_include else True)
         ]
 
+    data_keys = data_keys + augmentation_keys
+
+    augmentation_keys = [
+        k for k in augmentation_keys if ("augment" in k or "aug" in k)
+        and "augmented_midis" not in k #and "target" not in k
+    ]
+
+    if FLAGS.target_keys == ["all"]:
+        target_keys = [k for k in allkeys if "target" in k]
+    else:
+        target_keys = FLAGS.target_keys
+
+    with gin.unlock_config():
+        gin.bind_parameter("diffusion.utils.collate_fn_new.target_keys",
+                           target_keys)
+
+    data_keys = data_keys + (target_keys if target_keys else []) + ["metadata"]
+
+    print("augmentation keys : ", augmentation_keys)
+    print("data keys : ", data_keys)
+
     if augmentation_keys is not None:
         print("Augmentation keys", augmentation_keys)
 
         with gin.unlock_config():
             gin.bind_parameter(
-                "diffusion.utils.collate_fn.timbre_augmentation_keys",
+                "diffusion.utils.collate_fn_new.timbre_augmentation_keys",
                 augmentation_keys)
 
-        data_keys = data_keys + augmentation_keys
     else:
         print("No augmentation keys")
 
@@ -211,6 +259,7 @@ def main(argv):
                            FLAGS.max_samples)
         gin.bind_parameter("diffusion.utils.get_datasets.filter", filter)
 
+    
     dataset, valset, train_sampler, val_sampler = get_datasets()
 
     # else
@@ -233,7 +282,7 @@ def main(argv):
         shuffle=True if train_sampler is None else False,
         num_workers=FLAGS.num_workers,
         drop_last=True,
-        collate_fn=collate_fn,
+        collate_fn=collate_fn_new,
         sampler=train_sampler if train_sampler is not None else None)
 
     if FLAGS.use_validation:
@@ -243,18 +292,24 @@ def main(argv):
             shuffle=False,
             num_workers=FLAGS.num_workers,
             drop_last=True,
-            collate_fn=collate_fn,
+            collate_fn=collate_fn_new,
             sampler=val_sampler if val_sampler is not None else None)
     else:
         valid_loader = None
 
     print("Data shape : ", dataset[0]["z"].shape)
     print("Croped shape : ", next(iter(train_loader))["x"].shape)
+    print("Time cond shape : ", next(iter(train_loader))["x_time_cond"].shape)
 
     try:
-        dummy = collate_fn([])
+        dummy = collate_fn_new([])
     except:
         pass
+
+    # while True:
+    #     for b in tqdm(train_loader):
+    #         print("hi")
+    #         _ = b
 
     ######### SAVE CONFIG #########
     model_dir = os.path.join(FLAGS.out_path, FLAGS.name)

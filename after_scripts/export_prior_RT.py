@@ -28,7 +28,6 @@ flags.DEFINE_string("emb_model_path",
                     default="./pretrained/test.ts",
                     help="Path to audio codec")
 flags.DEFINE_integer("chunk_size", default=1, help="Chunk size")
-flags.DEFINE_integer("n_poly", default=8, help="Number of polyphonic voices")
 flags.DEFINE_bool("latent_project",
                   default=True,
                   help="Train a 2D latent map for max4Live Device")
@@ -42,11 +41,11 @@ flags.DEFINE_string("label_mode",
                     help="Mode for labeling data")
 
 flags.DEFINE_integer("num_steps",
-                     default=50000,
+                     default=1000,
                      help="Number of steps to build the map")
 
 flags.DEFINE_integer("num_examples",
-                     default=10000,
+                     default=4000,
                      help="Number of steps to build the map")
 
 flags.DEFINE_string("ae_mode",
@@ -65,12 +64,6 @@ class DummyIdentity(nn.Module):
         super().__init__()
         self.encoder = nn.Identity()
         self.decoder = nn.Identity()
-
-    def forward(self, x: torch.Tensor):
-        return x
-
-    def forward_stream(self, x: torch.Tensor):
-        return x
 
 
 def main(argv):
@@ -102,16 +95,16 @@ def main(argv):
             cache_size = gin.query_parameter("%LOCAL_ATTENTION_SIZE")
             gin.bind_parameter("transformerv2.MHAttention.max_cache_size",
                                cache_size)
-            raise
         except:
             gin.bind_parameter("transformer.Denoiser.max_cache_size",
                                gin.query_parameter("%N_SIGNAL"))
 
+    print("LOCAL ATTENTION SIZE", cache_size)
     # Instantiate model
     blender = RectifiedFlow()
 
     # Load checkpoints
-    state_dict = torch.load(checkpoint_path, map_location="cpu")["model_state"]
+    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only = False)["model_state"]
     blender.load_state_dict(state_dict, strict=False)
 
     # Emb model
@@ -127,7 +120,7 @@ def main(argv):
     ### GENERATE EMBEDDING PLOT ###
     if FLAGS.latent_project:
 
-        if True:
+        try:
             path_dict = gin.query_parameter("utils.get_datasets.path_dict")
             dataset = CombinedDataset(path_dict=path_dict,
                                       keys=["z", "metadata"])
@@ -135,7 +128,7 @@ def main(argv):
             tmp = os.path.join(FLAGS.model_path, "latent_embeddings.pt")
 
             if FLAGS.reload_embeddings and os.path.exists(tmp):
-                embeddings, labels = torch.load(tmp)
+                embeddings, labels = torch.load(tmp, weights_only = False)
             else:
                 embeddings, labels = prepare_training(
                     encoder=blender.encoder,
@@ -146,9 +139,8 @@ def main(argv):
 
                 torch.save((embeddings, labels), tmp)
 
-            print(set(labels))
-
             embeddings = embeddings / (FLAGS.latent_range)
+
             torch.set_grad_enabled(True)
             if zt_channels > 2:
                 project_model = train_autoencoder(embeddings,
@@ -174,11 +166,11 @@ def main(argv):
                                             gamma=1.,
                                             brightness_scale=10.)
             torch.set_grad_enabled(False)
-        # except Exception as e:
-        #     print("Could not load dataset for embedding plot.")
-        #     print("Error : ", e)
-        #     print("Us --nolatent_project to disable latent projection.")
-        #     exit()
+        except Exception as e:
+            print("Could not load dataset for embedding plot.")
+            print("Error : ", e)
+            print("Us --nolatent_project to disable latent projection.")
+            exit()
     else:
         project_model = DummyIdentity()
 
@@ -189,20 +181,12 @@ def main(argv):
 
             self.net = blender.net
             self.encoder = blender.encoder
-            if blender.encoder_time is not None:
-                print("Using Encoder time")
-                self.encoder_time = blender.encoder_time
-                self.time_cond_ratio = gin.query_parameter(
-                    "utils.collate_fn.compress_midi")
-            else:
-                self.encoder_time = DummyIdentity()
-                self.time_cond_ratio = 1
+
             self.post_encoder = blender.post_encoder
 
             self.n_signal = n_signal
             self.n_signal_timbre = n_signal_timbre
             self.chunk_size = FLAGS.chunk_size
-            self.n_poly = FLAGS.n_poly
             self.zt_channels = zt_channels
             self.ae_latents = ae_latents
             self.emb_model_timbre = torch.jit.load(FLAGS.emb_model_path).eval()
@@ -224,61 +208,29 @@ def main(argv):
             ## ATTRIBUTES ##
             self.register_attribute("nb_steps", 1)
             self.register_attribute("guidance_timbre", 1.)
-            self.register_attribute("guidance_structure", 1.)
-
-            ## BUFFERS ##
-            self.register_buffer(
-                "previous_timbre",
-                torch.zeros(4, self.ae_latents, self.n_signal_timbre))
-
-            self.register_buffer("last_zsem", torch.zeros(4, self.zt_channels))
-
-            ## METHODS ##
-            input_labels = []
-            for i in range(self.n_poly):
-                input_labels.append("(signal) Input pitch " + str(i))
-                input_labels.append("(signal) Input velocity " + str(i))
-
-            # input_labels = [""
-            #     f"(signal) Input {l} {i}" for i in range(self.n_poly)
-            #     for l in ["pitch", "velocity"]
-            # ]
-
-            # self.register_method(
-            #     "timbre",
-            #     in_channels=1,
-            #     in_ratio=1,
-            #     out_channels=self.zt_channels,
-            #     out_ratio=self.ae_ratio,
-            #     input_labels=[
-            #         f"(signal) Input timbre",
-            #     ],
-            #     output_labels=[
-            #         f"(signal) Output timbre {i}" for i in range(zt_channels)
-            #     ],
-            #     test_buffer_size=self.chunk_size * self.ae_ratio,
-            # )
 
             self.register_method(
                 "generate",
-                in_channels=self.n_poly * 2 + zt_channels,
-                in_ratio=1,  #self.ae_ratio // self.time_cond_ratio,
+                in_channels=zt_channels,
+                in_ratio=self.ae_ratio,
                 out_channels=1,
                 out_ratio=1,
-                input_labels=input_labels +
-                [f"(signal) Input timbre {i}" for i in range(zt_channels)],
+                input_labels=[
+                    f"(signal) Input timbre {i}" for i in range(zt_channels)
+                ],
                 output_labels=[f"(signal) Audio output"],
                 test_buffer_size=self.chunk_size * self.ae_ratio,
             )
 
             self.register_method(
                 "diffuse",
-                in_channels=self.n_poly * 2 + zt_channels,
-                in_ratio=1,
+                in_channels=zt_channels,
+                in_ratio=self.ae_ratio,
                 out_channels=self.ae_latents,
                 out_ratio=self.ae_ratio,
-                input_labels=input_labels +
-                [f"(signal) Input timbre {i}" for i in range(zt_channels)],
+                input_labels=[
+                    f"(signal) Input timbre {i}" for i in range(zt_channels)
+                ],
                 output_labels=[
                     f"(signal) Latent output {i}"
                     for i in range(self.ae_latents)
@@ -314,7 +266,7 @@ def main(argv):
                 output_labels=[
                     f"(signal) 2D Latent 1", f"(signal) 2D Latent 2"
                 ],
-                test_buffer_size=2048,
+                test_buffer_size=256,
             )
 
             self.register_method(
@@ -331,7 +283,7 @@ def main(argv):
                 input_labels=[
                     f"(signal) 2D Latent 1", f"(signal) 2D Latent 2"
                 ],
-                test_buffer_size=2048,
+                test_buffer_size=256,
             )
 
         @torch.jit.export
@@ -344,15 +296,6 @@ def main(argv):
             return 0
 
         @torch.jit.export
-        def get_guidance_structure(self) -> float:
-            return self.guidance_structure[0]
-
-        @torch.jit.export
-        def set_guidance_structure(self, guidance_structure: float) -> int:
-            self.guidance_structure = (guidance_structure, )
-            return 0
-
-        @torch.jit.export
         def get_nb_steps(self) -> int:
             return self.nb_steps[0]
 
@@ -362,184 +305,42 @@ def main(argv):
             return 0
 
         def model_forward(self, x: torch.Tensor, time: torch.Tensor,
-                          cond: torch.Tensor, time_cond: torch.Tensor,
+                          cond: torch.Tensor,
                           cache_index: int) -> torch.Tensor:
 
-            guidance_timbre = self.guidance_timbre[0]
-            guidance_structure = self.guidance_structure[0]
-
-            # if guidance_structure == guidance_timbre == 1.:
-            #     dx = self.net(x,
-            #                   time=time,
-            #                   cond=cond,
-            #                   time_cond=time_cond,
-            #                   cache_index=cache_index)
-            #     return dx
-
-            # if guidance_structure == guidance_timbre:
-            full_time = time.repeat(2, 1, 1)
-            full_x = x.repeat(2, 1, 1)
-
-            full_cond = torch.cat([
-                cond,
-                self.drop_value * torch.ones_like(cond),
-            ])
-
-            full_time_cond = torch.cat([
-                time_cond,
-                self.drop_value * torch.ones_like(time_cond),
-            ])
-
-            dx = self.net(full_x,
-                          time=full_time,
-                          cond=full_cond,
-                          time_cond=full_time_cond,
+            dx = self.net(x,
+                          time=time,
+                          cond=cond,
                           cache_index=cache_index)
-
-            dx_full, dx_none = torch.chunk(dx, 2, dim=0)
-
-            dx = dx_none + guidance_structure * (dx_full - dx_none)
-
             return dx
 
-            # else:
-            full_time = time.repeat(3, 1, 1)
-            full_x = x.repeat(3, 1, 1)
-
-            full_cond = torch.cat([
-                cond,
-                cond,
-                self.drop_value * torch.ones_like(cond),
-            ])
-
-            full_time_cond = torch.cat([
-                time_cond,
-                self.drop_value * torch.ones_like(time_cond),
-                self.drop_value * torch.ones_like(time_cond),
-            ])
-
-            dx = self.net(full_x,
-                          time=full_time,
-                          cond=full_cond,
-                          time_cond=full_time_cond,
-                          cache_index=cache_index)
-
-            dx_full, dx_cond, dx_none = torch.chunk(dx, 3, dim=0)
-
-            total_guidance = 0.5 * (guidance_structure + guidance_timbre)
-
-            guidance_cond_factor = guidance_structure / (max(
-                guidance_timbre, 0.1))
-
-            dx = dx_none + total_guidance * (dx_cond + guidance_cond_factor *
-                                             (dx_full - dx_cond) - dx_none)
-
-            return dx
-
-        def make_pianoroll_from_buffer(self,
-                                       notes,
-                                       T_roll: int,
-                                       n_pitches: int = 128):
-            """
-            notes: [B, 2*n_poly, T_buffer]
-            even channels: pitch
-            odd channels: velocity
-            T_roll: number of piano roll frames
-            Returns: [B, n_pitches, T_roll] with velocity values in [0, 1]
-            """
-            B, C, T_buf = notes.shape
-            n_poly = C // 2
-            frame_len = T_buf // T_roll
-
-            # Split pitch / velocity
-            pitches = notes[:, 0::2, :]
-            velocities = notes[:, 1::2, :] / 127.0
-
-            # Trim to fit full frames
-            pitches = pitches[:, :, :frame_len * T_roll]
-            velocities = velocities[:, :, :frame_len * T_roll]
-
-            # Reshape into frames
-            pitches = pitches.view(B, n_poly, T_roll, frame_len)
-            velocities = velocities.view(B, n_poly, T_roll, frame_len)
-
-            # Initialize piano roll
-            piano_roll = torch.zeros(B, n_pitches, T_roll)
-
-            # For each batch, frame, and poly voice, scatter velocity where active
-            for b in range(B):
-                for t in range(T_roll):
-                    # Active mask for this frame (polyphony × frame_len)
-                    active_mask = velocities[b, :, t, :] > 0
-                    if not active_mask.any():
-                        continue
-                    # Flatten over polyphony/time and get pitch/velocity pairs
-                    v_active = velocities[b, :, t, :][active_mask]
-                    p_active = pitches[b, :, t, :][active_mask].long().clamp(
-                        0, n_pitches - 1)
-                    # Aggregate (max velocity if multiple voices on same pitch)
-                    piano_roll[b, p_active,
-                               t] = torch.maximum(piano_roll[b, p_active, t],
-                                                  v_active)
-            return piano_roll
-
-        def sample(self, x_last: torch.Tensor, cond: torch.Tensor,
-                   time_cond: torch.Tensor):
-
-            x = x_last
-            t = torch.linspace(0, 1, self.nb_steps[0] + 1)
+        def sample(self, x_last: torch.Tensor, cond: torch.Tensor):
+            t = torch.linspace(0, 1, self.nb_steps[0] + 1).to(x_last)
             dt = 1 / self.nb_steps[0]
+            
 
             for i, t_value in enumerate(t[:-1]):
-                x = x + self.model_forward(x=x,
-                                           time=t_value.repeat(
-                                               x.shape[0], 1, x.shape[-1]),
+                x_last = x_last + self.model_forward(x=x_last,
+                                           time=t_value,
                                            cond=cond,
-                                           time_cond=time_cond,
                                            cache_index=i) * dt
 
-                self.net.roll_cache(x.shape[-1], i)
-            return x
-
-        # @torch.jit.export
-        # def timbre(self, x) -> torch.Tensor:
-        #     x = self.emb_model_timbre.encode(x)
-
-        #     self.previous_timbre[:x.shape[0]] = torch.cat(
-        #         (self.previous_timbre[:x.shape[0]], x), -1)[..., x.shape[-1]:]
-
-        #     zsem = self.encoder.forward_stream(
-        #         self.previous_timbre[:x.shape[0]])
-
-        #     if self.post_encoder is not None:
-        #         zsem = self.post_encoder.forward_stream(zsem)
-
-        #     zsem = zsem.unsqueeze(-1).repeat((1, 1, x.shape[-1]))
-        #     zsem = zsem / self.latent_range
-        #     return zsem
+                self.net.roll_cache(x_last.shape[-1], i)
+            return x_last
 
         @torch.jit.export
         def diffuse(self, x: torch.Tensor) -> torch.Tensor:
 
             n = x.shape[0]
-            zsem = x[:, -self.zt_channels:].mean(-1)
+            zsem = x.mean(-1)
+            
 
             zsem = zsem * self.latent_range
 
-            # Get the notes
-            notes = x[:, :2 * self.n_poly]
-
-            time_cond = self.make_pianoroll_from_buffer(
-                notes,
-                T_roll=self.time_cond_ratio * x.shape[-1] // self.ae_ratio)
-
             # Generate
-            x = torch.randn(n, self.ae_latents,
-                            time_cond.shape[-1] // self.time_cond_ratio)
+            x = torch.randn(n, self.ae_latents, x.shape[-1], device=x.device)
 
-            time_cond = self.encoder_time.forward_stream(time_cond[:1])
-
-            x = self.sample(x[:1], time_cond=time_cond, cond=zsem[:1])
+            x = self.sample(x[:1], cond=zsem[:1])
 
             if n > 1:
                 x = x.repeat(n, 1, 1)
@@ -567,33 +368,66 @@ def main(argv):
         def latent2map(self, x: torch.Tensor) -> torch.Tensor:
             tdim = x.shape[-1]
             latents = x.mean(-1)
-            map = self.project_model.encode(latents)
-            return map.unsqueeze(-1).repeat((1, 1, tdim))
+            map_latents = self.project_model.encode(latents)
+            return map_latents.unsqueeze(-1).repeat((1, 1, tdim))
 
     ####
     streamer = Streamer()
+    class TRTGenerateWrapper(nn.Module):
+        def __init__(self, streamer: Streamer):
+            super().__init__()
+            self.streamer = streamer.eval()
 
-    dummmy = torch.randn(1, FLAGS.n_poly * 2 + zt_channels, 8192)
+        def forward(self, x: torch.Tensor):
+            return self.streamer.generate(x)
+        
+    
+    device = "cuda"
+    streamer = streamer.to(device).eval()
+    trt_model = TRTGenerateWrapper(streamer).to(device).eval()
+    example_input = torch.randn(1, 6, 1, device="cuda")
+    
+    import torch_tensorrt
 
-    out = streamer.diffuse(dummmy)
+    trt_gm = torch_tensorrt.compile(
+        trt_model,
+        ir="dynamo",
+        inputs=[
+            torch_tensorrt.Input(
+                min_shape=(1, 6, 1),
+                opt_shape=(1, 6, 1),
+                max_shape=(4, 6, 1),
+                dtype=torch.float32,
+            )
+        ],
+        enabled_precisions={torch.float32}, )  # use FP16 on Jetson
+        
+    exit()
+    # )
+    
+    
 
-    out_name = os.path.join(folder,
-                            "after.midi." + folder.split("/")[-1] + ".ts")
+    # dummmy = torch.randn(1, zt_channels, 8192)
 
-    streamer.export_to_ts(out_name)
+    # out = streamer.diffuse(dummmy)
 
-    out_name_plot = os.path.join(
-        folder, "after.midi." + folder.split("/")[-1] + ".png")
+    # out_name = os.path.join(folder,
+    #                         "after.prior.bpm." + folder.split("/")[-1] + ".ts")
 
-    if FLAGS.latent_project:
-        fig.savefig(out_name_plot,
-                    dpi=300,
-                    bbox_inches='tight',
-                    pad_inches=0.1,
-                    facecolor=fig.get_facecolor(),
-                    transparent=False)
+    # streamer.export_to_ts(out_name)
 
-    print("Bravo - Export successful")
+    # out_name_plot = os.path.join(
+    #     folder, "after.prior.bpm." + folder.split("/")[-1] + ".png")
+
+    # if FLAGS.latent_project:
+    #     fig.savefig(out_name_plot,
+    #                 dpi=300,
+    #                 bbox_inches='tight',
+    #                 pad_inches=0.1,
+    #                 facecolor=fig.get_facecolor(),
+    #                 transparent=False)
+
+    # print("Bravo - Export successful")
 
 
 if __name__ == "__main__":

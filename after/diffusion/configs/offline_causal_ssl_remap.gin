@@ -8,22 +8,24 @@ from cached_conv import convs
 IN_SIZE = None
 N_SIGNAL = None
 
-ZS_CHANNELS = 12
-ZT_CHANNELS = 64
+ZS_CHANNELS = 8
+ZT_CHANNELS = 6
+ZT_CHANNELS_FULL = 64
 SR = 44100
 STRUCTURE_TYPE = "audio"
 PHASE_1_STEP = 100000
-MAX_STEPS = 500000
-ADV_WEIGHT = 0.06
+MAX_STEPS = 6000000
+ADV_WEIGHT = 0.5
 SHUFFLE = None
 
-LOCAL_ATTENTION_SIZE = 32
+LOCAL_ATTENTION_SIZE = 8
 ATTENTION_CHUNK_SIZE = 1
 
 # Data
 diffusion.utils.collate_fn_new:
     n_signal = %N_SIGNAL
     structure_type = %STRUCTURE_TYPE
+    use_augment_target = True
 
 ### ARCHITECTURE ### 
 encoder/diffusion.networks.ecapa_encoder.ECAPATDNN:
@@ -33,7 +35,7 @@ encoder/diffusion.networks.ecapa_encoder.ECAPATDNN:
     groups = [1, 1, 1, 1, 1]
     in_size = %IN_SIZE
     kernel_sizes = [3, 3, 3, 3, 3]
-    out_dim = %ZT_CHANNELS
+    out_dim = %ZT_CHANNELS_FULL
     pooling = True
     res2net_scale = 8
     se_channels = 256
@@ -45,7 +47,7 @@ encoder/diffusion.networks.ecapa_encoder.ECAPATDNN:
 
 encoder_time/diffusion.networks.Encoder1D:
     in_size = %IN_SIZE
-    channels = [128, 256, 256, 512, %ZS_CHANNELS]
+    channels = [128, 256, 256, 256, %ZS_CHANNELS]
     ratios = [1, 1, 1, 1]
     use_tanh = False
     average_out = False
@@ -59,12 +61,19 @@ encoder_time/convs.get_padding.mode = 'causal'
 
 classifier/diffusion.networks.Encoder1D:
     in_size = %ZS_CHANNELS
-    channels = [64, 64, 64, 64, %ZT_CHANNELS]
+    channels = [64, 64, 64, 64, %ZT_CHANNELS_FULL]
     ratios = [2, 2, 2, 1, 1]
     use_tanh = False
     average_out = True
     upscale_out = False
     norm_type = "batch_norm"
+
+diffusion.networks.LinearEncoder:
+    in_size=64
+    channels=[512, 1024, 1024, 256, %ZT_CHANNELS]
+    drop_out=0.15
+    use_tanh=False
+    regularisation="vae"
 
 diffusion.networks.transformerv2.DenoiserV2:
     n_channels = %IN_SIZE
@@ -88,6 +97,7 @@ diffusion.model.Base:
     encoder = @encoder/diffusion.networks.ecapa_encoder.ECAPATDNN()
     encoder_time = @encoder_time/diffusion.networks.Encoder1D()    
     classifier = @classifier/diffusion.networks.Encoder1D()
+    post_encoder = @diffusion.networks.LinearEncoder()
     time_transform = None
     drop_value = -4.
     drop_rate = 0.15
@@ -108,14 +118,15 @@ diffusion.model.Base.fit:
     adversarial_loss = "cosine"
     adversarial_weight = %ADV_WEIGHT 
 
-    drop_targets = [0,1]
+    drop_targets = [0]
 
     # Noise augmentation to smooth the latent space
-    zsem_noise_aug = 0.02
-    time_cond_noise_aug = 0.01
+    zsem_noise_aug = 0.
+    time_cond_noise_aug = 0.02
 
     ## Encoder regularisation
-    regularisation_weight = 1
+    regularisation_weight_cond = 0.0002
+    regularisation_weight_time_cond = 1
     regularisation_warmup = 1
 
     ## Cycle loss

@@ -12,6 +12,7 @@ torch.set_grad_enabled(False)
 
 import gin
 import cached_conv as cc
+import numpy as np
 from absl import flags, app
 
 cc.use_cached_conv(True)
@@ -22,17 +23,14 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string("model_path",
                     default="./after_runs/test",
                     help="Name of the experiment folder")
-flags.DEFINE_integer(
-    "step",
-    default=None,
-    help="Step number of checkpoint - use None to use the last checkpoint")
+flags.DEFINE_integer("step", default=None, help="Step number of checkpoint")
 flags.DEFINE_string("emb_model_path",
                     default="./pretrained/test.ts",
-                    help="Path to encoder model")
+                    help="Path to audio codec")
 flags.DEFINE_integer("chunk_size", default=1, help="Chunk size")
 flags.DEFINE_bool("latent_project",
                   default=True,
-                  help="Create latent map embedding plot")
+                  help="Train a 2D latent map for max4Live Device")
 flags.DEFINE_float(
     "latent_range",
     default=1.0,
@@ -43,11 +41,11 @@ flags.DEFINE_string("label_mode",
                     help="Mode for labeling data")
 
 flags.DEFINE_integer("num_steps",
-                     default=10000,
+                     default=3000,
                      help="Number of steps to build the map")
 
 flags.DEFINE_integer("num_examples",
-                     default=10000,
+                     default=4000,
                      help="Number of steps to build the map")
 
 flags.DEFINE_string("ae_mode",
@@ -86,21 +84,20 @@ def main(argv):
     checkpoint_path = os.path.join(folder, checkpoint_file)
     config = folder + "/config.gin"
 
+    out_name = os.path.join(folder,
+                            "after.midi." + folder.split("/")[-1] + ".ts")
     # Parse config
     gin.parse_config_file(config)
     SR = gin.query_parameter("%SR")
 
     with gin.unlock_config():
-        with gin.unlock_config():
-            if True:
-                print("success")
-                cache_denoiserv2 = gin.query_parameter("%LOCAL_ATTENTION_SIZE")
-                gin.bind_parameter("transformerv2.DenoiserV2.max_cache_size",
-                                   cache_denoiserv2)
-            # except:
-            #     cache_denoiserv1 = gin.query_parameter("%N_SIGNAL")
-            #     gin.bind_parameter("transformer.Denoiser.max_cache_size",
-            #                        cache_denoiserv1)
+        try:
+            cache_size = gin.query_parameter("%LOCAL_ATTENTION_SIZE")
+            gin.bind_parameter("transformerv2.MHAttention.max_cache_size",
+                               cache_size)
+        except:
+            gin.bind_parameter("transformer.Denoiser.max_cache_size",
+                               gin.query_parameter("%N_SIGNAL"))
 
     # Instantiate model
     blender = RectifiedFlow()
@@ -117,14 +114,12 @@ def main(argv):
     n_signal = gin.query_parameter('%N_SIGNAL')
     n_signal_timbre = gin.query_parameter('%N_SIGNAL')
     zt_channels = gin.query_parameter("%ZT_CHANNELS")
-    zs_channels = gin.query_parameter("%ZS_CHANNELS")
     ae_latents = gin.query_parameter("%IN_SIZE")
 
     ### GENERATE EMBEDDING PLOT ###
-    ### GENERATE EMBEDDING PLOT ###
     if FLAGS.latent_project:
 
-        if True:
+        try:
             path_dict = gin.query_parameter("utils.get_datasets.path_dict")
             dataset = CombinedDataset(path_dict=path_dict,
                                       keys=["z", "metadata"])
@@ -143,9 +138,8 @@ def main(argv):
 
                 torch.save((embeddings, labels), tmp)
 
-            print(set(labels))
-
             embeddings = embeddings / (FLAGS.latent_range)
+
             torch.set_grad_enabled(True)
             if zt_channels > 2:
                 project_model = train_autoencoder(embeddings,
@@ -171,11 +165,11 @@ def main(argv):
                                             gamma=1.,
                                             brightness_scale=10.)
             torch.set_grad_enabled(False)
-        # except Exception as e:
-        #     print("Could not load dataset for embedding plot.")
-        #     print("Error : ", e)
-        #     print("Us --nolatent_project to disable latent projection.")
-        #     exit()
+        except Exception as e:
+            print("Could not load dataset for embedding plot.")
+            print("Error : ", e)
+            print("Us --nolatent_project to disable latent projection.")
+            exit()
     else:
         project_model = DummyIdentity()
 
@@ -186,20 +180,22 @@ def main(argv):
 
             self.net = blender.net
             self.encoder = blender.encoder
-            self.encoder_time = blender.encoder_time
+            if blender.encoder_time is not None:
+                print("Using Encoder time")
+                self.encoder_time = blender.encoder_time
+                self.time_cond_ratio = gin.query_parameter(
+                    "utils.collate_fn.compress_midi")
+            else:
+                self.encoder_time = nn.Identity()
+                self.time_cond_ratio = 1
+            self.post_encoder = blender.post_encoder
 
             self.n_signal = n_signal
             self.n_signal_timbre = n_signal_timbre
             self.chunk_size = FLAGS.chunk_size
-            self.zs_channels = zs_channels
             self.zt_channels = zt_channels
             self.ae_latents = ae_latents
-            self.emb_model_structure = torch.jit.load(
-                FLAGS.emb_model_path).eval()
-
-            self.project_model = project_model
-
-            # self.emb_model_timbre = torch.jit.load(FLAGS.emb_model_path).eval()
+            self.emb_model_timbre = torch.jit.load(FLAGS.emb_model_path).eval()
 
             self.drop_value = blender.drop_value
 
@@ -207,11 +203,13 @@ def main(argv):
 
             # Get the ae ratio
             dummy = torch.zeros(1, 1, 4 * 4096)
-            z = self.emb_model_structure.encode(dummy)
+            z = self.emb_model_timbre.encode(dummy)
             self.ae_ratio = 4 * 4096 // z.shape[-1]
 
             self.sr = gin.query_parameter("%SR")
             self.zt_buffer = self.n_signal_timbre * self.ae_ratio
+
+            self.project_model = project_model
 
             ## ATTRIBUTES ##
             self.register_attribute("nb_steps", 1)
@@ -223,36 +221,15 @@ def main(argv):
                 "previous_timbre",
                 torch.zeros(4, self.ae_latents, self.n_signal_timbre))
 
-            ## METHODS ##
-            # self.register_method(
-            #     "forward",
-            #     in_channels=2,
-            #     in_ratio=1,
-            #     out_channels=1,
-            #     out_ratio=1,
-            #     input_labels=[
-            #         f"(signal) Input structure",
-            #         f"(signal) Input timbre",
-            #     ],
-            #     output_labels=[f"(signal) Audio output"],
-            #     test_buffer_size=self.chunk_size * self.ae_ratio,
-            # )
+            self.register_buffer("last_zsem", torch.zeros(4, self.zt_channels))
 
-            self.register_method(
-                "structure",
-                in_channels=1,
-                in_ratio=1,
-                out_channels=self.zs_channels,
-                out_ratio=self.ae_ratio,
-                input_labels=[
-                    f"(signal) Input structure",
-                ],
-                output_labels=[
-                    f"(signal) Output structure {i}"
-                    for i in range(zs_channels)
-                ],
-                test_buffer_size=self.chunk_size * self.ae_ratio,
-            )
+            ## METHODS ##
+            input_labels = ["beat", "downbeat"]
+
+            # input_labels = [""
+            #     f"(signal) Input {l} {i}" for i in range(self.n_poly)
+            #     for l in ["pitch", "velocity"]
+            # ]
 
             # self.register_method(
             #     "timbre",
@@ -270,103 +247,29 @@ def main(argv):
             # )
 
             self.register_method(
-                "diffuse",
-                in_channels=zt_channels + zs_channels,
-                in_ratio=self.ae_ratio,
-                out_channels=self.ae_latents,
-                out_ratio=self.ae_ratio,
-                input_labels=[
-                    f"(signal) Input structure {i}"
-                    for i in range(self.zs_channels)
-                ] + [
-                    f"(signal_{i}) Input timbre"
-                    for i in range(self.zt_channels)
-                ],
-                output_labels=[
-                    f"(signal) Latent output {i}"
-                    for i in range(self.ae_latents)
-                ],
-                test_buffer_size=self.chunk_size * self.ae_ratio,
-            )
-
-            self.register_method(
-                "diffuse_timbre",
-                in_channels=1 + zt_channels,
-                in_ratio=1,
-                out_channels=self.ae_latents,
-                out_ratio=self.ae_ratio,
-                input_labels=[f"(signal) Input audio structure"] + [
-                    f"(signal_{i}) Input timbre"
-                    for i in range(self.zt_channels)
-                ],
-                output_labels=[
-                    f"(signal) Latent output {i}"
-                    for i in range(self.ae_latents)
-                ],
-                test_buffer_size=self.ae_ratio,
-            )
-
-            self.register_method(
-                "diffuse_timbre_modulate",
-                in_channels=1 + zt_channels + zs_channels * 2,
-                in_ratio=1,
-                out_channels=self.ae_latents,
-                out_ratio=self.ae_ratio,
-                input_labels=[f"(signal) Input audio structure"] + [
-                    f"(signal_{i}) Input timbre"
-                    for i in range(self.zt_channels)
-                ] + [
-                    f"(signal_{i}) Modulate structure"
-                    for i in range(2 * self.zs_channels)
-                ],
-                output_labels=[
-                    f"(signal) Latent output {i}"
-                    for i in range(self.ae_latents)
-                ],
-                test_buffer_size=self.ae_ratio,
-            )
-
-            self.register_method(
                 "generate",
-                in_channels=zt_channels + zs_channels,
-                in_ratio=self.ae_ratio,
+                in_channels=len(input_labels) + zt_channels,
+                in_ratio=1,  #self.ae_ratio // self.time_cond_ratio,
                 out_channels=1,
                 out_ratio=1,
-                input_labels=[
-                    f"(signal) Input structure {i}" for i in range(zs_channels)
-                ] + [f"(signal) Input timbre {i}" for i in range(zt_channels)],
+                input_labels=input_labels +
+                [f"(signal) Input timbre {i}" for i in range(zt_channels)],
                 output_labels=[f"(signal) Audio output"],
                 test_buffer_size=self.chunk_size * self.ae_ratio,
             )
 
             self.register_method(
-                "generate_timbre",
-                in_channels=zt_channels + 1,
+                "diffuse",
+                in_channels=len(input_labels) + zt_channels,
                 in_ratio=1,
-                out_channels=1,
-                out_ratio=1,
-                input_labels=[f"(signal) audio structure"] + [
-                    f"(signal_{i}) Input timbre"
-                    for i in range(self.zt_channels)
+                out_channels=self.ae_latents,
+                out_ratio=self.ae_ratio,
+                input_labels=input_labels +
+                [f"(signal) Input timbre {i}" for i in range(zt_channels)],
+                output_labels=[
+                    f"(signal) Latent output {i}"
+                    for i in range(self.ae_latents)
                 ],
-                output_labels=[f"(signal) audio out"],
-                test_buffer_size=self.chunk_size * self.ae_ratio,
-            )
-
-            self.register_method(
-                "generate_timbre_modulate",
-                in_channels=zt_channels + 1 + 2 * zs_channels,
-                in_ratio=1,
-                out_channels=1,
-                out_ratio=1,
-                input_labels=[f"(signal) audio structure"] + [
-                    f"(signal_{i}) Input timbre"
-                    for i in range(self.zt_channels)
-                ] + [
-                    f"(signal_{i}) Modulate structure"
-                    for i in range(2 * self.zs_channels)
-                ],
-                output_labels=[f"(signal) audio out"],
                 test_buffer_size=self.chunk_size * self.ae_ratio,
             )
 
@@ -398,7 +301,7 @@ def main(argv):
                 output_labels=[
                     f"(signal) 2D Latent 1", f"(signal) 2D Latent 2"
                 ],
-                test_buffer_size=2048,
+                test_buffer_size=256,
             )
 
             self.register_method(
@@ -415,7 +318,7 @@ def main(argv):
                 input_labels=[
                     f"(signal) 2D Latent 1", f"(signal) 2D Latent 2"
                 ],
-                test_buffer_size=2048,
+                test_buffer_size=256,
             )
 
         @torch.jit.export
@@ -445,47 +348,6 @@ def main(argv):
             self.nb_steps = (nb_steps, )
             return 0
 
-        # def model_forward(self, x: torch.Tensor, time: torch.Tensor,
-        #                   cond: torch.Tensor, time_cond: torch.Tensor,
-        #                   cache_index: int) -> torch.Tensor:
-
-        #     guidance_timbre = self.guidance_timbre[0]
-        #     guidance_structure = self.guidance_structure[0]
-
-        #     full_time = time.repeat(3, 1, 1)
-        #     full_x = x.repeat(3, 1, 1)
-
-        #     full_cond = torch.cat([
-        #         cond,
-        #         self.drop_value * torch.ones_like(cond),
-        #         self.drop_value * torch.ones_like(cond),
-        #     ])
-
-        #     full_time_cond = torch.cat([
-        #         time_cond,
-        #         time_cond,
-        #         self.drop_value * torch.ones_like(time_cond),
-        #     ])
-
-        #     dx = self.net(full_x,
-        #                   time=full_time,
-        #                   cond=full_cond,
-        #                   time_cond=full_time_cond,
-        #                   cache_index=cache_index)
-
-        #     dx_full, dx_time_cond, dx_none = torch.chunk(dx, 3, dim=0)
-
-        #     total_guidance = 0.5 * (guidance_structure + guidance_timbre)
-
-        #     guidance_cond_factor = guidance_timbre / (max(
-        #         guidance_structure, 0.1))
-
-        #     dx = dx_none + total_guidance * (
-        #         dx_time_cond + guidance_cond_factor *
-        #         (dx_full - dx_time_cond) - dx_none)
-
-        #     return dx
-
         def model_forward(self, x: torch.Tensor, time: torch.Tensor,
                           cond: torch.Tensor, time_cond: torch.Tensor,
                           cache_index: int) -> torch.Tensor:
@@ -507,7 +369,7 @@ def main(argv):
 
             full_cond = torch.cat([
                 cond,
-                self.drop_value * torch.ones_like(cond),
+                cond,
             ])
 
             full_time_cond = torch.cat([
@@ -527,12 +389,47 @@ def main(argv):
 
             return dx
 
+            # else:
+            full_time = time.repeat(3, 1, 1)
+            full_x = x.repeat(3, 1, 1)
+
+            full_cond = torch.cat([
+                cond,
+                cond,
+                self.drop_value * torch.ones_like(cond),
+            ])
+
+            full_time_cond = torch.cat([
+                time_cond,
+                self.drop_value * torch.ones_like(time_cond),
+                self.drop_value * torch.ones_like(time_cond),
+            ])
+
+            dx = self.net(full_x,
+                          time=full_time,
+                          cond=full_cond,
+                          time_cond=full_time_cond,
+                          cache_index=cache_index)
+
+            dx_full, dx_cond, dx_none = torch.chunk(dx, 3, dim=0)
+
+            total_guidance = 0.5 * (guidance_structure + guidance_timbre)
+
+            guidance_cond_factor = guidance_structure / (max(
+                guidance_timbre, 0.1))
+
+            dx = dx_none + total_guidance * (dx_cond + guidance_cond_factor *
+                                             (dx_full - dx_cond) - dx_none)
+
+            return dx
+
         def sample(self, x_last: torch.Tensor, cond: torch.Tensor,
                    time_cond: torch.Tensor):
 
             x = x_last
             t = torch.linspace(0, 1, self.nb_steps[0] + 1)
             dt = 1 / self.nb_steps[0]
+
             for i, t_value in enumerate(t[:-1]):
                 x = x + self.model_forward(x=x,
                                            time=t_value.repeat(
@@ -544,101 +441,27 @@ def main(argv):
                 self.net.roll_cache(x.shape[-1], i)
             return x
 
-        # @torch.jit.export
-        # def timbre(self, x) -> torch.Tensor:
-        #     x = self.emb_model_timbre.encode(x)
-        #     self.previous_timbre[:x.shape[0]] = torch.cat(
-        #         (self.previous_timbre[:x.shape[0]], x), -1)[..., x.shape[-1]:]
-
-        #     zsem = self.encoder.forward_stream(
-        #         self.previous_timbre[:x.shape[0]])
-
-        #     zsem = zsem / self.latent_range
-
-        #     return zsem.unsqueeze(-1).repeat((1, 1, self.chunk_size))
-
-        @torch.jit.export
-        def structure(self, x) -> torch.Tensor:
-            n = x.shape[0]
-            x = self.emb_model_structure.encode(x[:1])
-            x = self.encoder_time.forward_stream(x).repeat(n, 1, 1)
-
-            return x
-
         @torch.jit.export
         def diffuse(self, x: torch.Tensor) -> torch.Tensor:
 
             n = x.shape[0]
             zsem = x[:, -self.zt_channels:].mean(-1)
-            zsem = zsem * self.latent_range
-            time_cond = x[:, :self.zs_channels]
-            x = torch.randn(n, self.ae_latents, x.shape[-1])
-            x = self.sample(x[:1], time_cond=time_cond[:1], cond=zsem[:1])
 
-            if n > 1:
-                x = x.repeat(n, 1, 1)
-
-            return x
-
-        def modulate(selx, time_cond: torch.Tensor, modulators: torch.Tensor):
-            """
-            Apply FiLM-style modulation where modulators are organized as:
-            [scale1, bias1, scale2, bias2, ...]
-            """
-            batch_size, channels, time_dim = time_cond.shape
-            n_mod_pairs = modulators.shape[1] // 2
-
-            # Split interleaved scale/bias pairs
-            scales = modulators[:, 0::2, :]  # take even indices → scale_i
-            shifts = modulators[:, 1::2, :]  # take odd indices  → bias_i
-
-            # Match shapes for broadcasting
-            # scales = scales.view(batch_size, n_mod_pairs, 1)
-            # shifts = shifts.view(batch_size, n_mod_pairs, 1)
-
-            # Apply modulation
-            time_cond = time_cond * scales + shifts
-            return time_cond
-
-        @torch.jit.export
-        def diffuse_timbre_modulate(self, x: torch.Tensor) -> torch.Tensor:
-
-            n = x.shape[0]
-            zsem = x[:, 1:1 + self.zt_channels].mean(-1)
             zsem = zsem * self.latent_range
 
-            audio = x[:, :1, :]
-            time_cond = self.structure(audio)
+            time_cond = torch.nn.functional.interpolate(
+                x[:, :-self.zt_channels],
+                scale_factor=self.time_cond_ratio / self.ae_ratio,
+                mode="nearest",
+            )
 
-            modulators = x[:, 1 + self.zt_channels:, :]
+            # Generate
+            x = torch.randn(n, self.ae_latents,
+                            time_cond.shape[-1] // self.time_cond_ratio)
 
-            modulators = torch.nn.functional.interpolate(modulators,
-                                                         scale_factor=1 /
-                                                         self.ae_ratio,
-                                                         mode="nearest")
+            time_cond = self.encoder_time.forward_stream(time_cond[:1])
 
-
-            time_cond = self.modulate(time_cond, modulators)
-
-            x = torch.randn(n, self.ae_latents, time_cond.shape[-1])
-            x = self.sample(x[:1], time_cond=time_cond[:1], cond=zsem[:1])
-
-            if n > 1:
-                x = x.repeat(n, 1, 1)
-            return x
-
-        @torch.jit.export
-        def diffuse_timbre(self, x: torch.Tensor) -> torch.Tensor:
-
-            n = x.shape[0]
-            zsem = x[:, 1:].mean(-1)
-            zsem = zsem * self.latent_range
-
-            audio = x[:, :1, :]
-            time_cond = self.structure(audio)
-
-            x = torch.randn(n, self.ae_latents, time_cond.shape[-1])
-            x = self.sample(x[:1], time_cond=time_cond[:1], cond=zsem[:1])
+            x = self.sample(x[:1], time_cond=time_cond, cond=zsem[:1])
 
             if n > 1:
                 x = x.repeat(n, 1, 1)
@@ -646,36 +469,14 @@ def main(argv):
 
         @torch.jit.export
         def decode(self, x: torch.Tensor) -> torch.Tensor:
-            n = x.shape[0]
-            audio = self.emb_model_structure.decode(x[:1])
-            return audio.repeat(n, 1, 1)
+            audio = self.emb_model_timbre.decode(x)
+            return audio
 
         @torch.jit.export
         def generate(self, x: torch.Tensor) -> torch.Tensor:
             z = self.diffuse(x)
             audio = self.decode(z)
             return audio
-
-        @torch.jit.export
-        def generate_timbre(self, x: torch.Tensor) -> torch.Tensor:
-            z = self.diffuse_timbre(x)
-            audio = self.decode(z)
-            return audio
-
-        @torch.jit.export
-        def generate_timbre_modulate(self, x: torch.Tensor) -> torch.Tensor:
-            z = self.diffuse_timbre_modulate(x)
-            audio = self.decode(z)
-            return audio
-
-        # def forward(self, x: torch.Tensor) -> torch.Tensor:
-        #     x_structure, x_timbre = x[:, :1], x[:, 1:]
-        #     structure, timbre = self.structure(x_structure), self.timbre(
-        #         x_timbre)
-        #     x = torch.cat((structure, timbre), 1)
-        #     z = self.diffuse(x)
-        #     audio = self.decode(z)
-        #     return audio
 
         @torch.jit.export
         def map2latent(self, x: torch.Tensor) -> torch.Tensor:
@@ -688,28 +489,23 @@ def main(argv):
         def latent2map(self, x: torch.Tensor) -> torch.Tensor:
             tdim = x.shape[-1]
             latents = x.mean(-1)
-            map = self.project_model.encode(latents)
-            return map.unsqueeze(-1).repeat((1, 1, tdim))
+            map_latents = self.project_model.encode(latents)
+            return map_latents.unsqueeze(-1).repeat((1, 1, tdim))
 
     ####
-
     streamer = Streamer()
 
-    dummmy = torch.randn(1, 1 + 2 * zs_channels + zt_channels, 8192)
-    out = streamer.diffuse_timbre_modulate(dummmy)
+    dummmy = torch.randn(1, 2 + zt_channels, 8192)
 
-    dummmy = torch.randn(1, zs_channels + zt_channels, FLAGS.chunk_size)
     out = streamer.diffuse(dummmy)
+
     out_name = os.path.join(folder,
-                            "after.audio." + folder.split("/")[-1] + ".ts")
+                            "after.prior.bpm." + folder.split("/")[-1] + ".ts")
 
     streamer.export_to_ts(out_name)
 
     out_name_plot = os.path.join(
-        folder, "after.audio." + folder.split("/")[-1] + ".png")
-
-    out_name_plot_legend = os.path.join(
-        folder, "after.audio." + folder.split("/")[-1] + "_legend.png")
+        folder, "after.prior.bpm." + folder.split("/")[-1] + ".png")
 
     if FLAGS.latent_project:
         fig.savefig(out_name_plot,
@@ -718,13 +514,6 @@ def main(argv):
                     pad_inches=0.1,
                     facecolor=fig.get_facecolor(),
                     transparent=False)
-
-        legend_fig.savefig(out_name_plot_legend,
-                           dpi=300,
-                           bbox_inches='tight',
-                           pad_inches=0.1,
-                           facecolor=fig.get_facecolor(),
-                           transparent=False)
 
     print("Bravo - Export successful")
 

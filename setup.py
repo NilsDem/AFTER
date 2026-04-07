@@ -19,7 +19,7 @@ setuptools.setup(
     description="AFTER: Audio Features Transfer and Exploration in Real-time",
     long_description=readme,
     long_description_content_type="text/markdown",
-    packages=setuptools.find_packages(exclude=["after_scripts", "after_scripts.*"]),
+    packages=setuptools.find_packages(),
     package_data={
         'after/diffusion/configs': ['*.gin'],
         'after/autoencoder/configs': ['*.gin'],
@@ -29,9 +29,11 @@ setuptools.setup(
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
-    entry_points={"console_scripts": [
-        "after = after_scripts.main_cli:main",
-    ]},
+    entry_points={
+        "console_scripts": [
+            "after = after_scripts.main_cli:main",
+        ]
+    },
     install_requires=requirements.split("\n"),
     python_requires='>=3.9',
     include_package_data=True,

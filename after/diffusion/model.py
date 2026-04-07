@@ -10,7 +10,6 @@ import gin
 from torch_ema import ExponentialMovingAverage
 import os
 from after.diffusion import LatentDiscriminator
-
 from einops import reduce, rearrange
 import warnings
 
@@ -112,6 +111,9 @@ class Base(nn.Module):
             print("training encoder_time")
             params += list(self.encoder_time.parameters())
 
+        if self.post_encoder is not None:
+            params += list(self.post_encoder.parameters())
+
         if self.classifier is not None:
             self.opt_classifier = AdamW(self.classifier.parameters(),
                                         lr=lr,
@@ -129,10 +131,11 @@ class Base(nn.Module):
 
         x1 = batch["x"].to(device)
         x1_cond = batch.get("x_cond", x1)
-        x1_time_cond = batch.get("x_time_cond", x1)
+        x1_time_cond = batch.get("x_time_cond", None)
 
         x1_cond = x1_cond.to(device)
-        x1_time_cond = x1_time_cond.to(device)
+        x1_time_cond = x1_time_cond.to(
+            device) if x1_time_cond is not None else None
 
         if self.time_transform is not None:
             x1_time_cond = self.time_transform(x1_time_cond)
@@ -155,8 +158,11 @@ class Base(nn.Module):
                         k: v
                         for k, v in state_dict.items() if "emb_model" not in k
                     },
-                    "opt_state": self.opt.state_dict(),
-                    "opt_classifier_state": self.opt_classifier.state_dict(),
+                    "opt_state":
+                    self.opt.state_dict(),
+                    "opt_classifier_state":
+                    self.opt_classifier.state_dict()
+                    if self.classifier is not None else None,
                 }
 
                 if self.distill:
@@ -195,7 +201,7 @@ class Base(nn.Module):
         s = torch.sigmoid(normal + shift)
         return s
 
-    def sample_pgen(self, num_samples, max_logsnr=2, min_logsnr=-6):
+    def sample_pgen(self, num_samples, max_logsnr=-2, min_logsnr=-5):
         t = 1 - torch.sigmoid(-(torch.rand(num_samples) *
                                 (max_logsnr - min_logsnr) + min_logsnr))
         return t
@@ -256,7 +262,7 @@ class Base(nn.Module):
             self.opt_discriminator = AdamW(
                 list(self.discriminator_timbre.parameters()) +
                 list(self.discriminator_structure.parameters()),
-                lr=1e-5,
+                lr=1e-6,
                 betas=(0.9, 0.999))
         else:
             discriminator_head = discriminator_head_class()
@@ -274,6 +280,8 @@ class Base(nn.Module):
             for p in self.discriminator.parameters():
                 numel += p.numel()
             print(numel / 1e6)
+
+        self.init_train(lr=1e-6, dataloader=None)
 
         with open(os.path.join(model_dir, "config.gin"), "w") as config_out:
             config_out.write(gin.operative_config_str())
@@ -301,6 +309,8 @@ class Base(nn.Module):
             cycle_swap_target="cond",
             cycle_scaling=False,
             regularisation_weight=0.0,
+            regularisation_weight_cond=None,
+            regularisation_weight_time_cond=None,
             regularisation_warmup=50000,
             drop_targets="both",
             steps_valid=5000,
@@ -321,6 +331,10 @@ class Base(nn.Module):
 
         print(adversarial_weight)
 
+        if regularisation_weight_cond is None:
+            regularisation_weight_cond = regularisation_weight
+        if regularisation_weight_time_cond is None:
+            regularisation_weight_time_cond = regularisation_weight
         self.train_encoder = train_encoder
         self.train_encoder_time = train_encoder_time
         self.use_ema = use_ema
@@ -346,8 +360,8 @@ class Base(nn.Module):
             state_dict_model = {
                 key: value
                 for key, value in state_dict["model_state"].items()
-                if (load_encoders[0] or "encoder." not in key) and (
-                    load_encoders[1] or "encoder_time" not in key)
+                if (load_encoders[0] or "encoder." not in key or "post_encoder"
+                    in key) and (load_encoders[1] or "encoder_time" not in key)
             }
 
             state_dict_model = {
@@ -418,9 +432,10 @@ class Base(nn.Module):
                 if (self.step > stop_training_encoder_time_step
                         and self.train_encoder_time == True):
                     print("detaching encoder")
-                    for param in self.encoder_time.parameters():
-                        param.requires_grad = False
-                    self.encoder_time.eval()
+                    if self.encoder_time is not None:
+                        for param in self.encoder_time.parameters():
+                            param.requires_grad = False
+                        self.encoder_time.eval()
                     self.train_encoder_time = False
 
                 x1, x1_cond, x1_time_cond = self.prep_data(batch,
@@ -448,6 +463,14 @@ class Base(nn.Module):
 
                 cond = cond + zsem_noise_aug * torch.randn_like(cond)
 
+                if self.post_encoder is not None:
+                    # print("using post_encoder")
+                    full_cond = cond.clone()
+                    cond, _, cond_reg = self.post_encoder(cond,
+                                                          return_full=True)
+                else:
+                    full_cond = cond
+
                 if self.encoder_time is not None:
                     if self.step < timbre_warmup:
                         with torch.no_grad():
@@ -463,8 +486,9 @@ class Base(nn.Module):
                     time_cond = x1_time_cond
                     time_cond_reg = torch.tensor(0.)
 
-                time_cond = time_cond + time_cond_noise_aug * torch.randn_like(
-                    time_cond)
+                if time_cond is not None:
+                    time_cond = time_cond + time_cond_noise_aug * torch.randn_like(
+                        time_cond)
 
                 if self.drop_rate > 0:
                     if self.step < timbre_warmup:
@@ -472,19 +496,30 @@ class Base(nn.Module):
                     else:
                         drop_targets = drop_targets
 
-                    cond_drop, time_cond_drop = self.cfgdrop(
-                        [cond, time_cond],
-                        bsize=x1.shape[0],
-                        drop_targets=drop_targets,
-                        drop_rate=self.drop_rate)
+                    if len(drop_targets) == 1:
+                        time_cond_drop = self.cfgdrop([time_cond],
+                                                      bsize=x1.shape[0],
+                                                      drop_targets=[0],
+                                                      drop_rate=self.drop_rate)[0]
+                        cond_drop = cond
+                    else:
+                        cond_drop, time_cond_drop = self.cfgdrop(
+                            [cond, time_cond],
+                            bsize=x1.shape[0],
+                            drop_targets=drop_targets,
+                            drop_rate=self.drop_rate)
+                else:
+                    cond_drop = cond
+                    time_cond_drop = time_cond
 
                 # Adversarial step
 
                 if distill_step is not None and self.step > distill_step:
+                    discrim_step = self.step % 3
                     cond = cond.detach()
                     time_cond = time_cond.detach()
 
-                    if self.step > distill_transfer_step:
+                    if distill_transfer_step is not None and self.step > distill_transfer_step:
                         time_cond_swap, cond_swap, idx_aligned, idx_swap_time, idx_swap_cond = self.swap_conditions(
                             time_cond, cond)
                     else:
@@ -498,23 +533,35 @@ class Base(nn.Module):
                                                              1).to(self.device)
 
                     interpolant = (1 - t) * x0 + t * x1
-                    model_output = self.net(interpolant,
-                                            time_cond=time_cond_swap,
-                                            cond=cond_swap,
-                                            time=t)
+                    if discrim_step:
+                        with torch.no_grad():
+                            model_output = self.net(interpolant,
+                                                    time_cond=time_cond_swap,
+                                                    cond=cond_swap,
+                                                    time=t)
+                    else:
+                        model_output = self.net(interpolant,
+                                                time_cond=time_cond,
+                                                cond=cond,
+                                                time=t)
 
                     x_onestep = interpolant + (1 - t) * model_output
 
                     # Renoise before passing to discriminator
                     # t_renoise = torch.rand(x0.size(0), 1, 1).to(self.device)
-                    t_renoise = self.sample_pdisc(x0.size(0)).reshape(
-                        -1, 1, 1).to(self.device)
+                    current_shift = min(1., (self.step - 2000000) / 300000)
+                    # current_shift = 1.
+                    t_renoise = self.sample_pdisc(x0.size(0),
+                                                  shift=current_shift,
+                                                  sigma=1.).reshape(
+                                                      -1, 1, 1).to(self.device)
 
                     x0_renoise = torch.randn_like(x1)
                     x_onestep_renoised = (
                         1 - t_renoise) * x0_renoise + t_renoise * x_onestep
 
-                    x0_renoise_x1 = torch.randn_like(x1)
+                    x0_renoise_x1 = x0_renoise
+                    # x0_renoise_x1 = torch.randn_like(x1)
                     x1_renoise = (1 -
                                   t_renoise) * x0_renoise_x1 + t_renoise * x1
 
@@ -559,7 +606,7 @@ class Base(nn.Module):
                         loss_dis = losses["loss_dis"].mean()
                         loss_adv = losses["loss_adv"].mean()
 
-                    if not self.step % 2:
+                    if discrim_step:
                         if double_distill:
                             losses_timbre_contrastive = self.discriminator_timbre.loss(
                                 reals=x1_renoise,
@@ -584,33 +631,43 @@ class Base(nn.Module):
                                 "loss_dis"].mean() + losses_timbre_contrastive[
                                     "loss_dis"].mean()
                         else:
-                            loss_contrastive = torch.tensor(0.).to(x1_renoise)
+                            # loss_contrastive = torch.tensor(0.).to(x1_renoise)
+                            loss_contrastive = self.discriminator.loss(
+                                reals=x1_renoise,
+                                fakes=x1_renoise,
+                                time=t_renoise,
+                                cond_reals=cond,
+                                time_cond_reals=time_cond,
+                                cond_fakes=cond[torch.randperm(cond.shape[0])],
+                                time_cond_fakes=time_cond[torch.randperm(
+                                    time_cond.shape[0])])["loss_dis"].mean()
 
                         loss = loss_dis + loss_contrastive
                         self.opt_discriminator.zero_grad()
                         loss.backward()
-                        if double_distill:
-                            torch.nn.utils.clip_grad_norm_(
-                                self.discriminator_structure.parameters(), 2.0)
-                            torch.nn.utils.clip_grad_norm_(
-                                self.discriminator_timbre.parameters(), 2.0)
+                        # if double_distill:
+                        #     torch.nn.utils.clip_grad_norm_(
+                        #         self.discriminator_structure.parameters(), 1.0)
+                        #     torch.nn.utils.clip_grad_norm_(
+                        #         self.discriminator_timbre.parameters(), 1.0)
 
-                        else:
-                            torch.nn.utils.clip_grad_norm_(
-                                self.discriminator.parameters(), 2.0)
+                        # else:
+                        #     torch.nn.utils.clip_grad_norm_(
+                        #         self.discriminator.parameters(), 1.0)
                         self.opt_discriminator.step()
 
                     else:
                         self.opt.zero_grad()
                         loss_adv.backward()
                         torch.nn.utils.clip_grad_norm_(self.net.parameters(),
-                                                       10.0)
+                                                       1.0)
                         self.opt.step()
                         loss_contrastive = None
 
                     lossdict = {
                         "Distill/loss_dis": loss_dis.item(),
                         "Distill/loss_adv": loss_adv.item(),
+                        "Distill/current_shift": current_shift,
                     }
 
                     if double_distill:
@@ -623,7 +680,7 @@ class Base(nn.Module):
                         lossdict["Distill/structure_dis"] = losses_structure[
                             "loss_adv"].mean().item()
 
-                    if self.step > distill_transfer_step:
+                    if distill_transfer_step is not None and self.step > distill_transfer_step:
                         if double_distill:
                             pass
                         else:
@@ -647,12 +704,12 @@ class Base(nn.Module):
                     if adversarial_loss == "cosine":
                         classifier_loss = (
                             1 - torch.nn.functional.cosine_similarity(
-                                cond_pred, cond.detach(), dim=1,
+                                cond_pred, full_cond.detach(), dim=1,
                                 eps=1e-8)).mean()
 
                     elif adversarial_loss == "mse":
                         classifier_loss = torch.nn.functional.mse_loss(
-                            cond_pred, cond_mean.detach(), reduction='mean')
+                            cond_pred, full_cond.detach(), reduction='mean')
 
                     self.opt_classifier.zero_grad()
                     classifier_loss.backward()
@@ -674,12 +731,16 @@ class Base(nn.Module):
                         if adversarial_loss == "cosine":
                             classifier_loss = (
                                 1 - torch.nn.functional.cosine_similarity(
-                                    cond_pred, cond.detach(), dim=1,
+                                    cond_pred,
+                                    full_cond.detach(),
+                                    dim=1,
                                     eps=1e-8)).mean()
 
                         elif adversarial_loss == "mse":
                             classifier_loss = torch.nn.functional.mse_loss(
-                                cond_pred, cond.detach(), reduction='mean')
+                                cond_pred,
+                                full_cond.detach(),
+                                reduction='mean')
 
                     else:
                         classifier_loss = torch.tensor(0.)
@@ -702,9 +763,14 @@ class Base(nn.Module):
                         adversarial_weight * (self.step - timbre_warmup) /
                         (adversarial_warmup), adversarial_weight)
 
-                    regularisation_weight_cur = min(
-                        regularisation_weight * self.step /
-                        (regularisation_warmup), regularisation_weight)
+                    regularisation_weight_cond_cur = min(
+                        regularisation_weight_cond * self.step /
+                        (regularisation_warmup), regularisation_weight_cond)
+
+                    regularisation_weight_time_cond_cur = min(
+                        regularisation_weight_time_cond * self.step /
+                        (regularisation_warmup),
+                        regularisation_weight_time_cond)
 
                     # log losses
                     cycle_weights_cur = cycle_weights if self.step > cycle_start_step else [
@@ -728,8 +794,8 @@ class Base(nn.Module):
 
                     loss = diffusion_loss - adversarial_weight_cur * classifier_loss + cycle_weights_cur[
                         0] * cond_cycle_loss + cycle_weights_cur[
-                            1] * time_cond_cycle_loss + regularisation_weight_cur * cond_reg.mean(
-                            ) + regularisation_weight_cur * time_cond_reg.mean(
+                            1] * time_cond_cycle_loss + regularisation_weight_cond_cur * cond_reg.mean(
+                            ) + regularisation_weight_time_cond_cur * time_cond_reg.mean(
                             )
 
                     self.opt.zero_grad()
@@ -767,7 +833,11 @@ class Base(nn.Module):
                             x1, x1_cond, x1_time_cond = self.prep_data(
                                 batch, device=self.device)
 
-                            cond = self.encoder(x1_cond)
+                            full_cond = self.encoder(x1_cond)
+                            if self.post_encoder is not None:
+                                cond = self.post_encoder(full_cond)
+                            else:
+                                cond = full_cond
                             time_cond = self.encoder_time(
                                 x1_time_cond
                             ) if self.encoder_time is not None else x1_time_cond
@@ -775,12 +845,12 @@ class Base(nn.Module):
                             if self.step < timbre_warmup:
                                 time_cond = self.drop_value * torch.ones_like(
                                     time_cond)
-
-                            cond_drop, time_cond_drop = self.cfgdrop(
-                                [cond, time_cond],
-                                bsize=x1.shape[0],
-                                drop_targets=drop_targets,
-                                drop_rate=self.drop_rate)
+                            if self.drop_rate > 0:
+                                cond_drop, time_cond_drop = self.cfgdrop(
+                                    [cond, time_cond],
+                                    bsize=x1.shape[0],
+                                    drop_targets=drop_targets,
+                                    drop_rate=self.drop_rate)
                             diffusion_loss, _, _ = self.diffusion_step(
                                 x1, time_cond=time_cond, cond=cond)
 
@@ -794,12 +864,14 @@ class Base(nn.Module):
                                     classifier_loss = (
                                         1 -
                                         torch.nn.functional.cosine_similarity(
-                                            cond_pred, cond, dim=1,
+                                            cond_pred,
+                                            full_cond,
+                                            dim=1,
                                             eps=1e-8)).mean()
 
                                 elif adversarial_loss == "mse":
                                     classifier_loss = torch.nn.functional.mse_loss(
-                                        cond_pred, cond, reduction='mean')
+                                        cond_pred, full_cond, reduction='mean')
 
                                 lossdict[
                                     "Classifier loss"] = classifier_loss.item(
@@ -818,12 +890,13 @@ class Base(nn.Module):
                                               global_step=self.step)
 
                         ## SAMPLING
-                        x1 = x1[:6].to(self.device)
-                        time_cond = time_cond[:6] if time_cond is not None else None
-                        cond = cond[:6] if cond is not None else None
+                        x1 = x1[:4].to(self.device)
+                        time_cond = time_cond[:4] if time_cond is not None else None
+                        cond = cond[:4] if cond is not None else None
                         x0 = self.sample_prior(x1.shape)
 
-                        audio_true = self.emb_model.decode(x1.cpu()).cpu()
+                        with torch.no_grad():
+                            audio_true = self.emb_model.decode(x1.detach().cpu()).cpu()
 
                         # for nb_steps in [5, 40]:
 
@@ -834,9 +907,9 @@ class Base(nn.Module):
                                                  nb_steps=nb_step,
                                                  time_cond=time_cond,
                                                  cond=cond)
-
-                            audio_rec = self.emb_model.decode(
-                                x1_rec.cpu()).cpu()
+                            with torch.no_grad():
+                                audio_rec = self.emb_model.decode(
+                                    x1_rec.detach().cpu()).cpu()
 
                             # SAMPLING TRANSFERS
                             shifted_cond = torch.roll(cond, shifts=-1, dims=0)
@@ -845,12 +918,20 @@ class Base(nn.Module):
                                                       time_cond=time_cond,
                                                       cond=shifted_cond)
 
-                            audio_transfer = self.emb_model.decode(
-                                x1_transfer.cpu()).cpu()
+                            with torch.no_grad():
+                                audio_transfer = self.emb_model.decode(
+                                    x1_transfer.detach().cpu()).cpu()
 
                             with warnings.catch_warnings():
                                 warnings.simplefilter("ignore")
+                                if audio_true.shape[1] == 2:
+                                    audio_true = audio_true.mean(1,
+                                                                 keepdim=True)
+                                    audio_rec = audio_rec.mean(1, keepdim=True)
+                                    audio_transfer = audio_transfer.mean(
+                                        1, keepdim=True)
                                 for i in range(x1.shape[0]):
+
                                     logger.add_audio("true/" + str(i),
                                                      audio_true[i],
                                                      global_step=self.step,
@@ -1131,7 +1212,7 @@ class RectifiedFlow(Base):
         else:
             for t in t_values:
                 t = t.reshape(1, 1, 1).repeat(x.shape[0], 1, 1)
-                x_onestep = t * x + self.model_forward(
+                x_onestep = x + self.model_forward(
                     x=x,
                     time=t,
                     cond=cond,
