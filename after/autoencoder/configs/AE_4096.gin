@@ -1,0 +1,92 @@
+from __gin__ import dynamic_registration
+
+import after
+from after import autoencoder
+from after.autoencoder.networks import SimpleNet2D
+from after.autoencoder.networks import bottlenecks
+from after.autoencoder.networks import discriminators
+from after.autoencoder import audio
+import cached_conv
+
+# Model
+SR = 44100
+AUDIO_CHANNELS = None
+LATENT_SIZE = 16
+TIME_SIZE = 131072
+
+## TRAINING
+FREEZE_ENCODER_STEPS = %MAX_STEPS
+WARMUP_STEPS = 100000
+MAX_STEPS = 500000
+REGULARISATION_WEIGHT  = 0.0005
+REGULARISATION_WARMUP = 10000
+
+## NETWORK 
+CHANNELS = [64, 64, 128, 128, 128, 128, 128, 256]
+KERNEL_SIZE = 3
+TIME_RATIOS = [1, 2, 2, 2, 1, 1, 1, 1]
+FREQ_RATIOS = [2, 2, 2, 2, 2, 2, 2, 2]
+NFFT = 1024
+HOP = 512
+
+audio.StreamableSTFT:
+    nfft = %NFFT
+    hop_size = %HOP
+    stream=False
+    skip_features=-1
+    alpha_rescale = 0.3
+    beta_rescale = 0.66
+
+SimpleNet2D.AutoEncoder2D: 
+    in_size=2
+    out_size=None
+    bottleneck_size=%LATENT_SIZE
+    channels=%CHANNELS
+    time_ratios=%TIME_RATIOS
+    freq_ratios=%FREQ_RATIOS
+    freq_size = %NFFT
+    kernel_size=%KERNEL_SIZE
+    bottleneck= @bottlenecks.VAEBottleneck() 
+    time_transform=@audio.StreamableSTFT()
+    use_vae = True
+    audio_channels = %AUDIO_CHANNELS
+
+
+autoencoder.core.SpectralDistance:
+    scales = [64, 128, 256, 512, 1024, 2048]
+    sr = %SR
+    mel_bands = [64, 64, 64, 64, 64, 64, 64]
+
+discriminators.SpectroDiscriminator:
+    n_ffts= [128 , 256, 512, 1024, 2048, 4096]
+    hop_lengths=[64, 128, 256, 512, 1024, 2048]
+    normalize_losses = True
+    capacity = 16
+    channels = [1, 2, 4, 4, 4, 8]
+    time_size = %TIME_SIZE
+    weights={
+        "feature_matching": 100.0,
+        "adversarial": 1.
+        }
+
+autoencoder.trainer.Trainer:
+    model= @SimpleNet2D.AutoEncoder2D()
+    discriminator = @discriminators.SpectroDiscriminator()
+    sr = %SR
+    max_steps = %MAX_STEPS
+    warmup_steps = %WARMUP_STEPS
+    freeze_encoder_step = %FREEZE_ENCODER_STEPS
+    waveform_losses = [(1., @autoencoder.core.SpectralDistance())]
+    multiband_distances = []
+    reg_losses = []
+    update_discriminator_every = 4
+
+autoencoder.trainer.Trainer.fit:
+    steps_display = 100
+    steps_valid = 5000
+    steps_save =25000
+    rec_loss_decay = 1.
+    weight_regularisation_loss = %REGULARISATION_WEIGHT
+    warmup_regularisation_loss = %REGULARISATION_WARMUP
+    look_ahead_steps = 1
+    

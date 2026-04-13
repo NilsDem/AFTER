@@ -14,9 +14,22 @@ def crop(arrays, length, idxs):
 def normalize(array):
     return (array - array.min()) / (array.max() - array.min() + 1e-6)
 
+
 @gin.configurable
-def get_datasets(path_dict, data_keys, freqs=None, use_cache=True, max_samples=None,
-                 filter=None, use_validation=True):
+def get_datasets(
+    db_list=None,
+    data_keys=None,
+    freqs=None,
+    use_cache=True,
+    filter=None,
+    use_validation=True,
+    ae_ratio=None,
+    compress_tc=None,
+    sr=None,
+    emb_model_path=None,
+):
+
+    path_dict = {k: {"path": k, "name": k} for k in db_list}
 
     dataset = CombinedDataset(
         path_dict=path_dict,
@@ -24,8 +37,10 @@ def get_datasets(path_dict, data_keys, freqs=None, use_cache=True, max_samples=N
         freqs="estimate" if freqs is None else freqs,
         config="train",
         init_cache=use_cache,
-        num_samples=max_samples,
         filter=filter,
+        ae_ratio=ae_ratio,
+        compress_tc=compress_tc,
+        sr=sr,
     )
     train_sampler = dataset.get_sampler()
 
@@ -38,24 +53,25 @@ def get_datasets(path_dict, data_keys, freqs=None, use_cache=True, max_samples=N
         freqs="estimate" if freqs is None else freqs,
         keys=data_keys,
         init_cache=use_cache,
-        num_samples=max_samples,
         filter=filter,
+        ae_ratio=ae_ratio,
+        compress_tc=compress_tc,
+        sr=sr,
     )
     return dataset, valset, train_sampler, valset.get_sampler()
 
 
 @gin.configurable
-def collate_fn_after(
-    batch,
-    n_signal,
-    structure_type,
-    ae_ratio,
-    timbre_limit=None,
-    timbre_keys=None,
-    structure_keys=None,
-    precomp_pr = False,
-    compress_tc=None,
-    shift_tc = 0):
+def collate_fn_after(batch,
+                     n_signal,
+                     structure_type,
+                     ae_ratio,
+                     timbre_limit=None,
+                     timbre_keys=None,
+                     structure_keys=None,
+                     precomp_pr=False,
+                     compress_tc=None,
+                     shift_tc=0):
     """
     Simplified single-loop collate_fn that safely handles all structures.
     """
@@ -83,7 +99,8 @@ def collate_fn_after(
             x_full = np.pad(x_full, ((0, 0), (0, pad)), mode="constant")
             i0 = 0
         else:
-            i0 = np.random.randint(0, x_full.shape[-1] - n_signal -1 - shift_tc)
+            i0 = np.random.randint(0,
+                                   x_full.shape[-1] - n_signal - 1 - shift_tc)
         x_target = x_full[..., i0:i0 + n_signal]
         x_list.append(x_target)
 
@@ -100,20 +117,13 @@ def collate_fn_after(
         if timbre_limit is not None:
             nmax = int(n_signal * timbre_limit)
             offset = np.random.randint(-nmax, nmax)
-            i1 = np.clip(i0 + offset, 0,
-                         x_timbre_full.shape[-1] - n_signal)
+            i1 = np.clip(i0 + offset, 0, x_timbre_full.shape[-1] - n_signal)
         else:
             i1 = (0 if x_timbre_full.shape[-1] <= n_signal else
-                  np.random.randint(0, x_timbre_full.shape[-1] - n_signal +
-                                    1))
+                  np.random.randint(0, x_timbre_full.shape[-1] - n_signal + 1))
         x_timbre = x_timbre_full[..., i1:i1 + n_signal]
 
-        if x_timbre.shape[-1] < n_signal:
-            x_timbre = np.pad(x_timbre,
-                              ((0, 0), (0, n_signal - x_timbre.shape[-1])),
-                              mode="constant")
-            
-        if x_timbre.shape!=x_target.shape:
+        if x_timbre.shape != x_target.shape:
             print("error with timbre sourcing, using target as fallback")
             x_timbre = x_target
 
@@ -130,15 +140,17 @@ def collate_fn_after(
             if key == "z":
                 midi_key = "midi"
             else:
-                midi_key =  key.replace("z", "midi")
-                
-            if precomp_pr :
+                midi_key = key.replace("z", "midi")
+
+            if precomp_pr:
                 midi_key = "piano_roll_" + midi_key
 
             midi_obj = b.get(midi_key, None)
-            
+
             if precomp_pr:
-                pr = midi_obj[..., (i0+shift_tc) * compress_tc:(i0+shift_tc) * compress_tc + n_signal * (compress_tc or 1)]
+                pr = midi_obj[..., (i0 + shift_tc) *
+                              compress_tc:(i0 + shift_tc + n_signal) *
+                              compress_tc]
             else:
                 # --- compute aligned time grid ---
                 audio_length = x_full.shape[-1] * ae_ratio / sr
@@ -147,8 +159,8 @@ def collate_fn_after(
                     hop = audio_length / length
                     times = np.linspace(hop / 2, audio_length - hop / 2,
                                         length)
-                    times_c = times[(i0+shift_tc) * compress_tc:compress_tc *
-                                    ((i0+shift_tc) + n_signal)]
+                    times_c = times[(i0 + shift_tc) * compress_tc:compress_tc *
+                                    ((i0 + shift_tc) + n_signal)]
                 else:
                     times = np.linspace(0, audio_length, x_full.shape[-1])
                     times_c = times[i0:i0 + n_signal]
@@ -156,6 +168,7 @@ def collate_fn_after(
                 # --- safe extraction ---
                 try:
                     pr = midi_obj.get_piano_roll(times=times_c)
+                    print(pr.shape)
                     if pr.size == 0:
                         print(
                             f"[WARN] Empty piano roll for key '{midi_key}'; replaced by zeros."
@@ -166,6 +179,12 @@ def collate_fn_after(
                         f"[WARN] MIDI parsing failed for key '{midi_key}' ({type(e).__name__}: {e}); using zeros."
                     )
                     pr = np.zeros((128, len(times_c)))
+
+            if pr.shape != (128, compress_tc * x_list[-1].shape[-1]):
+                print(
+                    f"[WARN] ERROR on midi : Empty piano roll for key '{midi_key}'; replaced by zeros."
+                )
+                pr = np.zeros((128, compress_tc * x_list[-1].shape[-1]))
 
             # --- normalize and assign ---
             pr = np.clip(pr / 127.0, 0, 1)
@@ -207,7 +226,7 @@ def collate_fn_after(
         #     i_b = i0 * (compress_tc or 1)
         #     time_cond = beat_clock[...,
         #                            i_b:i_b + n_signal * (compress_tc or 1)]
-            
+
         # To rewrite
         # elif structure_type == "descriptors":
         #     descriptors_data = []
@@ -249,7 +268,7 @@ def collate_fn_after(
             raise ValueError(f"Unknown structure_type: {structure_type}")
 
         time_cond_list.append(time_cond)
-        
+
     # -------------------------
     # 5. --- Stack all tensors
     # -------------------------
@@ -264,22 +283,7 @@ def collate_fn_after(
     }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-## LEGACY CODE 
+## LEGACY CODE
 
 # def get_beat_signal(beats, len_wave, len_z, sr=44100, zero_value=0.0):
 #     """
@@ -287,14 +291,14 @@ def collate_fn_after(
 #     - Between beats: ramps linearly from 0 → 1
 #     - Before first beat: constant zero
 #     - After last beat: stays at zero (no final ramp)
-    
+
 #     Args:
 #         beats (list or np.ndarray): beat times in seconds
 #         len_wave (int): number of waveform samples
 #         len_z (int): number of latent/time steps to generate
 #         sr (int): sample rate of waveform
 #         zero_value (float): value to fill outside beats (default 0.0)
-    
+
 #     Returns:
 #         np.ndarray: [len_z] beat-phase signal between 0 and 1
 #     """
@@ -317,7 +321,6 @@ def collate_fn_after(
 #     # After last beat → stays at zero
 #     signal[times >= beats[-1]] = zero_value
 #     return signal
-
 
 # import torch
 # import math
@@ -347,7 +350,6 @@ def collate_fn_after(
 
 # import math
 # import torch
-
 
 # def normalize_descriptors(
 #     x: torch.Tensor,
@@ -391,7 +393,6 @@ def collate_fn_after(
 
 #     return x_norm
 
-
 # def ema_lowpass(x, alpha):
 #     """
 #     x: (..., T)
@@ -402,7 +403,6 @@ def collate_fn_after(
 #     for t in range(1, x.shape[-1]):
 #         y[..., t] = alpha * y[..., t - 1] + (1.0 - alpha) * x[..., t]
 #     return y
-
 
 # def smooth_descriptors_ema(
 #         x,
@@ -421,4 +421,3 @@ def collate_fn_after(
 #     mean = x.mean(dim=-1, keepdim=True)
 #     y = ema_lowpass(x - mean, alpha) + mean
 #     return y
-

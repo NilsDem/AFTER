@@ -2,6 +2,7 @@ import torch.nn as nn
 import torch
 import torchaudio
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, overload
+import math
 
 
 def mod_sigmoid(x):
@@ -115,6 +116,7 @@ class STFTDistance(nn.Module):
         self.norm = norm
         self.reduction = reduction
         self.losstype = losstype
+        self.n_fft = n_fft
 
     def forward(self, x, y):
         x = self.spec(x)
@@ -130,9 +132,9 @@ class STFTDistance(nn.Module):
                                          reduction=self.reduction)
             log_distance = mean_difference(logx,
                                            logy,
-                                           norm='L1',
+                                           norm='L2',
                                            reduction=self.reduction)
-            return l_distance + log_distance
+            return l_distance + math.sqrt(self.n_fft / 2) * log_distance
 
         elif self.losstype == "diffusion":
             l_distance = mean_difference(x,
@@ -421,10 +423,6 @@ class FIRFilter(torch.nn.Module):
             self.fir.weight.requires_grad = False
             self.fir.weight.data = torch.tensor(taps.astype("float32")).view(
                 1, 1, -1)
-
-            if plot:
-                from .plotting import compare_filters
-                compare_filters(b, a, taps, fs=fs)
 
     def forward(self, input, target):
         """Calculate forward propagation.
@@ -811,79 +809,3 @@ class MultiResolutionSTFTLoss(torch.nn.Module):
             return mrstft_loss
         else:
             return mrstft_loss, sc_mag_loss, log_mag_loss, lin_mag_loss, phs_loss
-
-
-class SumAndDifferenceSTFTLoss(torch.nn.Module):
-    """Sum and difference sttereo STFT loss module.
-
-    See [Steinmetz et al., 2020](https://arxiv.org/abs/2010.10291)
-
-    Args:
-        fft_sizes (List[int]): List of FFT sizes.
-        hop_sizes (List[int]): List of hop sizes.
-        win_lengths (List[int]): List of window lengths.
-        window (str, optional): Window function type.
-        w_sum (float, optional): Weight of the sum loss component. Default: 1.0
-        w_diff (float, optional): Weight of the difference loss component. Default: 1.0
-        perceptual_weighting (bool, optional): Apply perceptual A-weighting (Sample rate must be supplied). Default: False
-        mel_stft (bool, optional): Use Multi-resoltuion mel spectrograms. Default: False
-        n_mel_bins (int, optional): Number of mel bins to use when mel_stft = True. Default: 128
-        sample_rate (float, optional): Audio sample rate. Default: None
-        output (str, optional): Format of the loss returned.
-            'loss' : Return only the raw, aggregate loss term.
-            'full' : Return the raw loss, plus intermediate loss terms.
-            Default: 'loss'
-    """
-
-    def __init__(
-        self,
-        fft_sizes: List[int],
-        hop_sizes: List[int],
-        win_lengths: List[int],
-        window: str = "hann_window",
-        w_sum: float = 1.0,
-        w_diff: float = 1.0,
-        output: str = "loss",
-        **kwargs,
-    ):
-        super().__init__()
-        self.sd = SumAndDifference()
-        self.w_sum = w_sum
-        self.w_diff = w_diff
-        self.output = output
-        self.mrstft = MultiResolutionSTFTLoss(
-            fft_sizes,
-            hop_sizes,
-            win_lengths,
-            window,
-            **kwargs,
-        )
-
-    def forward(self, input: torch.Tensor, target: torch.Tensor):
-        """This loss function assumes batched input of stereo audio in the time domain.
-
-        Args:
-            input (torch.Tensor): Input tensor with shape (batch size, 2, seq_len).
-            target (torch.Tensor): Target tensor with shape (batch size, 2, seq_len).
-
-        Returns:
-            loss (torch.Tensor): Aggreate loss term. Only returned if output='loss'.
-            loss (torch.Tensor), sum_loss (torch.Tensor), diff_loss (torch.Tensor):
-                Aggregate and intermediate loss terms. Only returned if output='full'.
-        """
-        assert input.shape == target.shape  # must have same shape
-        bs, chs, seq_len = input.size()
-
-        # compute sum and difference signals for both
-        input_sum, input_diff = self.sd(input)
-        target_sum, target_diff = self.sd(target)
-
-        # compute error in STFT domain
-        sum_loss = self.mrstft(input_sum, target_sum)
-        diff_loss = self.mrstft(input_diff, target_diff)
-        loss = ((self.w_sum * sum_loss) + (self.w_diff * diff_loss)) / 2
-
-        if self.output == "loss":
-            return loss
-        elif self.output == "full":
-            return loss, sum_loss, diff_loss

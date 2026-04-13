@@ -28,53 +28,78 @@ torch.set_grad_enabled(False)
 FLAGS = flags.FLAGS
 
 # --- I/O ---
-flags.DEFINE_multi_string('input_path', None,
-    'Input directories; one LMDB is created per directory', required=True)
+flags.DEFINE_multi_string(
+    'input_path',
+    None,
+    'Input directories; one LMDB is created per directory',
+    required=True)
 flags.DEFINE_string('output_path', '.', 'Root output directory')
-flags.DEFINE_string('parser', 'simple_audio', 'File parser: simple_audio or simple_midi')
-flags.DEFINE_multi_string('ext', ['wav', 'opus', 'mp3', 'aac', 'flac'], 'Audio extensions')
+flags.DEFINE_string('parser', 'simple_audio',
+                    'File parser: simple_audio or simple_midi')
+flags.DEFINE_multi_string('ext', ['wav', 'opus', 'mp3', 'aac', 'flac'],
+                          'Audio extensions')
 flags.DEFINE_multi_string('exclude', [], 'Filename substrings to exclude')
-flags.DEFINE_multi_string('include', None, 'Filename substrings to include (any match)')
-flags.DEFINE_string('pad_mode', 'pad', 'Padding for short files: "pad" or "concat"')
+flags.DEFINE_multi_string('include', None,
+                          'Filename substrings to include (any match)')
+flags.DEFINE_string('pad_mode', 'pad',
+                    'Padding for short files: "pad" or "concat"')
 
 # --- Audio ---
-flags.DEFINE_integer('num_signal', 524288, 'Samples per chunk (default is~12 s at 44100)')
+flags.DEFINE_integer('num_signal', 524288,
+                     'Samples per chunk (default is~12 s at 44100)')
 flags.DEFINE_integer('sample_rate', 44100, 'Sample rate')
 flags.DEFINE_bool('normalize', True, 'Peak-normalize each file')
 flags.DEFINE_bool('cut_silences', False, 'Skip silent chunks')
-flags.DEFINE_bool('save_waveform', False, 'Store original int16 waveform in DB')
-flags.DEFINE_bool('stereo', False, 'Store stereo waveforms (2-channel); mono files are duplicated to stereo')
+flags.DEFINE_bool('save_waveform', False,
+                  'Store original int16 waveform in DB')
+flags.DEFINE_bool(
+    'stereo', False,
+    'Store stereo waveforms (2-channel); mono files are duplicated to stereo')
 
 # --- Embedding model ---
-flags.DEFINE_string('emb_model_path', None, 'TorchScript (.pt) embedding model')
+flags.DEFINE_string('emb_model_path', None,
+                    'TorchScript (.pt) embedding model')
 flags.DEFINE_integer('batch_size', 4, 'Chunk batch size for embedding')
 flags.DEFINE_integer('gpu', -1, 'CUDA device index; -1 for CPU')
 
 # --- Descriptors ---
-flags.DEFINE_multi_string('descriptors', [], 'Audio descriptors to compute (e.g. centroid)')
+flags.DEFINE_multi_string('descriptors', [],
+                          'Audio descriptors to compute (e.g. centroid)')
 
 # --- Augmentation ---
-flags.DEFINE_integer('num_augments', 4, 'Augmentations per chunk; 0 to disable')
+flags.DEFINE_integer('num_augments', 4,
+                     'Augmentations per chunk; 0 to disable')
 flags.DEFINE_bool('silence_aug', True, 'Use random silence in augmentations')
+flags.DEFINE_float(
+   'silence_aug_structure_pct', 0.075,
+    'Fraction of structure augmentations that are fully silenced (audio zeroed, MIDI emptied)'
+)
 flags.DEFINE_bool('midi', False, 'Extract MIDI with BasicPitch')
+flags.DEFINE_integer(
+    'basic_pitch_batch_size', 64,
+    'Number of audio windows processed at once by BasicPitch. Reduce if OOM on large files.'
+)
 flags.DEFINE_bool('beat_extract', False, 'Extract beats with BeatTrack')
-flags.DEFINE_float('midi_edge_oversample_pct', 0.1,
-                   'Total extra edge samples, as a fraction of the total chunk count, split across first and last chunks')
+flags.DEFINE_float(
+    'midi_edge_oversample_pct', 0.1,
+    'Total extra edge samples, as a fraction of the total chunk count, split across first and last chunks'
+)
+flags.DEFINE_bool('test', False, 'Run only one batch')
 
 # --- DB ---
-flags.DEFINE_integer('db_size', 1, 'Max LMDB size in GB')
-
+flags.DEFINE_integer('db_size', 10, 'Max LMDB size in GB')
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def normalize_signal(x, max_gain_db=30, gain_margin=0.9):
     peak = np.max(np.abs(x))
     if peak == 0:
         return x
     log_gain = min(max_gain_db, -20 * np.log10(peak))
-    return gain_margin * x * 10 ** (log_gain / 20)
+    return gain_margin * x * 10**(log_gain / 20)
 
 
 def pad_or_tile(audio, num_signal, pad_mode):
@@ -88,7 +113,8 @@ def pad_or_tile(audio, num_signal, pad_mode):
         where total is a multiple of num_signal
     """
     if audio.ndim != 2:
-        raise ValueError(f"Expected audio shape (channels, n), got {audio.shape}")
+        raise ValueError(
+            f"Expected audio shape (channels, n), got {audio.shape}")
 
     channels, n = audio.shape
 
@@ -114,7 +140,9 @@ def get_midi_chunk(midi_data, chunk_idx, num_signal, sr):
     tend = tstart + length
     midi_out = copy.deepcopy(midi_data)
     for inst in midi_out.instruments:
-        inst.notes = [n for n in inst.notes if n.end > tstart and n.start < tend]
+        inst.notes = [
+            n for n in inst.notes if n.end > tstart and n.start < tend
+        ]
         for n in inst.notes:
             n.start = max(0.0, n.start - tstart)
             n.end = min(n.end - tstart, length)
@@ -136,7 +164,7 @@ def encode_batch(model, audio_list, device):
 
 
 def to_int16(audio):
-    return np.clip(audio * (2 ** 15 - 1), -(2 ** 15), 2 ** 15 - 1).astype(np.int16)
+    return np.clip(audio * (2**15 - 1), -(2**15), 2**15 - 1).astype(np.int16)
 
 
 def get_midi_edge_repeat_count(chunk_idx, total_chunks):
@@ -146,7 +174,8 @@ def get_midi_edge_repeat_count(chunk_idx, total_chunks):
     if chunk_idx not in (0, total_chunks - 1):
         return 0
 
-    total_extra_edge_samples = int(np.floor(max(0.0, FLAGS.midi_edge_oversample_pct) * total_chunks))
+    total_extra_edge_samples = int(
+        np.floor(max(0.0, FLAGS.midi_edge_oversample_pct) * total_chunks))
     if total_extra_edge_samples <= 0:
         return 0
 
@@ -157,16 +186,29 @@ def get_midi_edge_repeat_count(chunk_idx, total_chunks):
 
 _STRUCTURE_AUG = None
 _TIMBRE_AUG = None
+_SILENCE_AUG_STRUCTURE_PCT = 0.0
 
 
-def _init_augment_pool(structure_aug, timbre_aug):
-    global _STRUCTURE_AUG, _TIMBRE_AUG
+def _init_augment_pool(structure_aug, timbre_aug, silence_aug_structure_pct):
+    global _STRUCTURE_AUG, _TIMBRE_AUG, _SILENCE_AUG_STRUCTURE_PCT
     _STRUCTURE_AUG = structure_aug
     _TIMBRE_AUG = timbre_aug
+    _SILENCE_AUG_STRUCTURE_PCT = silence_aug_structure_pct
 
 
 def _run_structure_augment(task):
     chunk, midi, beats, downbeats = task
+
+    if _SILENCE_AUG_STRUCTURE_PCT > 0 and np.random.rand(
+    ) < _SILENCE_AUG_STRUCTURE_PCT:
+        silent_chunk = np.zeros_like(chunk)
+        silent_midi = None
+        if midi is not None:
+            silent_midi = copy.deepcopy(midi)
+            for inst in silent_midi.instruments:
+                inst.notes = []
+        return silent_chunk, silent_midi, None
+
     beats_downbeats = None
     if beats is not None and downbeats is not None:
         beats_downbeats = (beats, downbeats)
@@ -181,9 +223,8 @@ def _run_timbre_augment(chunk):
     return _TIMBRE_AUG(chunk.copy())
 
 
-def flush_chunk_batch(entries, env, cur_index, device,
-                      emb_model, z_length, desc_model,
-                      augment_pool):
+def flush_chunk_batch(entries, env, cur_index, device, emb_model, z_length,
+                      desc_model, augment_pool):
     if not entries:
         return cur_index
 
@@ -196,23 +237,26 @@ def flush_chunk_batch(entries, env, cur_index, device,
         latents = encode_batch(emb_model, chunks, device)
 
         if desc_model is not None:
-            base_descriptors = [desc_model(chunk, z_length) for chunk in chunks]
+            base_descriptors = [
+                desc_model(chunk, z_length) for chunk in chunks
+            ]
 
         if augment_pool is not None:
-            structure_tasks = [
-                (entry["chunk"], entry["midi"], entry["beats"], entry["downbeats"])
-                for entry in entries
-            ]
+            structure_tasks = [(entry["chunk"], entry["midi"], entry["beats"],
+                                entry["downbeats"]) for entry in entries]
 
             if _STRUCTURE_AUG is not None:
                 for _ in range(FLAGS.num_augments):
-                    augmented = augment_pool.map(_run_structure_augment, structure_tasks)
+                    augmented = augment_pool.map(_run_structure_augment,
+                                                 structure_tasks)
                     aug_audio = [result[0] for result in augmented]
                     structure_results.append({
-                        "latents": encode_batch(emb_model, aug_audio, device),
+                        "latents":
+                        encode_batch(emb_model, aug_audio, device),
                         "midis": [result[1] for result in augmented],
                         "beats": [result[2] for result in augmented],
-                        "descriptors": [desc_model(audio, z_length) for audio in aug_audio]
+                        "descriptors":
+                        [desc_model(audio, z_length) for audio in aug_audio]
                         if desc_model is not None else None,
                     })
 
@@ -220,7 +264,8 @@ def flush_chunk_batch(entries, env, cur_index, device,
                 for _ in range(FLAGS.num_augments):
                     augmented = augment_pool.map(_run_timbre_augment, chunks)
                     aug_audio = [result[0] for result in augmented]
-                    timbre_latents.append(encode_batch(emb_model, aug_audio, device))
+                    timbre_latents.append(
+                        encode_batch(emb_model, aug_audio, device))
 
     for item_idx, entry in enumerate(entries):
         ae = AudioExample()
@@ -259,8 +304,10 @@ def flush_chunk_batch(entries, env, cur_index, device,
             aug_beats = result["beats"][item_idx]
             if aug_beats is not None:
                 metadata.update({
-                    f"beats_structure_aug_{aug_idx}": list(aug_beats[0]),
-                    f"downbeats_structure_aug_{aug_idx}": list(aug_beats[1]),
+                    f"beats_structure_aug_{aug_idx}":
+                    list(aug_beats[0]),
+                    f"downbeats_structure_aug_{aug_idx}":
+                    list(aug_beats[1]),
                 })
 
             if result["descriptors"] is not None:
@@ -286,16 +333,20 @@ def flush_chunk_batch(entries, env, cur_index, device,
 # Per-database processing
 # ---------------------------------------------------------------------------
 
-def process_db(input_path, output_path, device,
-               emb_model, z_length, desc_model,
-               bp, beat_tracker,
-               structure_aug, timbre_aug):
 
-    env = lmdb.open(output_path, map_size=FLAGS.db_size * 1024 ** 3,
-                    map_async=True, writemap=True, readahead=False)
+def process_db(input_path, output_path, device, emb_model, z_length,
+               desc_model, bp, beat_tracker, structure_aug, timbre_aug):
 
-    audio_files, midi_files, _ = get_parser(FLAGS.parser)(
-        input_path, None, FLAGS.ext, FLAGS.exclude, FLAGS.include)
+    env = lmdb.open(output_path,
+                    map_size=FLAGS.db_size * 1024**3,
+                    map_async=True,
+                    writemap=True,
+                    readahead=False)
+
+    audio_files, midi_files, _ = get_parser(FLAGS.parser)(input_path, None,
+                                                          FLAGS.ext,
+                                                          FLAGS.exclude,
+                                                          FLAGS.include)
 
     cur_index = 0
     chunk_entries = []
@@ -303,25 +354,32 @@ def process_db(input_path, output_path, device,
     interrupted = False
 
     if emb_model is not None and FLAGS.num_augments > 0:
-        _init_augment_pool(structure_aug, timbre_aug)
+        _init_augment_pool(structure_aug, timbre_aug,
+                           FLAGS.silence_aug_structure_pct)
         augment_pool = Pool(processes=max(1, FLAGS.batch_size),
                             initializer=_init_augment_pool,
-                            initargs=(structure_aug, timbre_aug))
+                            initargs=(structure_aug, timbre_aug,
+                                      FLAGS.silence_aug_structure_pct))
 
     try:
-        for file, preloaded_midi_path in zip(tqdm(audio_files, desc=pathlib.Path(input_path).name), midi_files):
+        for file, preloaded_midi_path in zip(
+                tqdm(audio_files, desc=pathlib.Path(input_path).name),
+                midi_files):
             try:
-                audio, _ = librosa.load(file, sr=FLAGS.sample_rate, mono=not FLAGS.stereo)
+                audio, _ = librosa.load(file,
+                                        sr=FLAGS.sample_rate,
+                                        mono=not FLAGS.stereo)
                 audio = audio.astype(np.float32).reshape(-1, audio.shape[-1])
                 # If stereo mode but file is mono (1-D), duplicate to (2, T)
                 if FLAGS.stereo and audio.shape[0] == 1:
                     audio = np.stack([audio, audio], axis=0)
-                    
+
             except Exception as e:
                 print(f"Load error {file}: {e}")
                 continue
 
-            if audio.shape[-1] == 0 or audio.shape[-1] < 0.25 * FLAGS.num_signal:
+            if audio.shape[
+                    -1] == 0 or audio.shape[-1] < 0.25 * FLAGS.num_signal:
                 print(f"Too short, skipping: {file}")
                 continue
 
@@ -329,7 +387,8 @@ def process_db(input_path, output_path, device,
                 audio = normalize_signal(audio)
 
             audio = pad_or_tile(audio, FLAGS.num_signal, FLAGS.pad_mode)
-            chunks = audio.reshape(audio.shape[0], -1, FLAGS.num_signal).transpose(1, 0, 2)
+            chunks = audio.reshape(audio.shape[0], -1,
+                                   FLAGS.num_signal).transpose(1, 0, 2)
 
             # --- Full-file feature extraction (only when embedding model is present) ---
             full_midi = full_beats = full_downbeats = None
@@ -341,14 +400,16 @@ def process_db(input_path, output_path, device,
                         print(f"MIDI load error ({preloaded_midi_path}): {e}")
                 elif bp is not None:
                     try:
-                        audio_mono = audio.mean(axis=0) if audio.ndim == 2 else audio
+                        audio_mono = audio.mean(
+                            axis=0) if audio.ndim == 2 else audio
                         full_midi = bp(audio_mono)
                     except Exception as e:
                         print(f"BasicPitch error ({file}): {e}")
 
                 if beat_tracker is not None:
                     try:
-                        audio_mono = audio.mean(axis=0) if audio.ndim == 2 else audio
+                        audio_mono = audio.mean(
+                            axis=0) if audio.ndim == 2 else audio
                         result = beat_tracker(audio_mono, return_beats=True)
                         full_beats = result["beats"]
                         full_downbeats = result["downbeats"]
@@ -362,16 +423,21 @@ def process_db(input_path, output_path, device,
 
                 midi = None
                 if full_midi is not None:
-                    midi = get_midi_chunk(full_midi, chunk_idx, FLAGS.num_signal, FLAGS.sample_rate)
+                    midi = get_midi_chunk(full_midi, chunk_idx,
+                                          FLAGS.num_signal, FLAGS.sample_rate)
 
                 beats = downbeats = None
                 if full_beats is not None:
-                    beats, downbeats = slice_beats(
-                        full_beats, full_downbeats, chunk_idx, FLAGS.num_signal, FLAGS.sample_rate)
+                    beats, downbeats = slice_beats(full_beats, full_downbeats,
+                                                   chunk_idx, FLAGS.num_signal,
+                                                   FLAGS.sample_rate)
 
                 base_entry = {
                     "chunk": chunk,
-                    "metadata": {"chunk_index": chunk_idx, "path": str(file)},
+                    "metadata": {
+                        "chunk_index": chunk_idx,
+                        "path": str(file)
+                    },
                     "midi": midi,
                     "beats": beats,
                     "downbeats": downbeats,
@@ -379,15 +445,24 @@ def process_db(input_path, output_path, device,
 
                 repeat_count = 0
                 if midi is not None:
-                    repeat_count = get_midi_edge_repeat_count(chunk_idx, total_chunks)
+                    repeat_count = get_midi_edge_repeat_count(
+                        chunk_idx, total_chunks)
 
                 for copy_idx in range(repeat_count + 1):
                     entry = {
-                        "chunk": base_entry["chunk"],
-                        "metadata": dict(base_entry["metadata"]),
-                        "midi": copy.deepcopy(base_entry["midi"]) if base_entry["midi"] is not None else None,
-                        "beats": None if base_entry["beats"] is None else np.array(base_entry["beats"], copy=True),
-                        "downbeats": None if base_entry["downbeats"] is None else np.array(base_entry["downbeats"], copy=True),
+                        "chunk":
+                        base_entry["chunk"],
+                        "metadata":
+                        dict(base_entry["metadata"]),
+                        "midi":
+                        copy.deepcopy(base_entry["midi"])
+                        if base_entry["midi"] is not None else None,
+                        "beats":
+                        None if base_entry["beats"] is None else np.array(
+                            base_entry["beats"], copy=True),
+                        "downbeats":
+                        None if base_entry["downbeats"] is None else np.array(
+                            base_entry["downbeats"], copy=True),
                     }
                     if copy_idx > 0:
                         entry["metadata"]["edge_oversample_copy"] = copy_idx
@@ -395,10 +470,14 @@ def process_db(input_path, output_path, device,
                     chunk_entries.append(entry)
 
                 if len(chunk_entries) >= FLAGS.batch_size:
-                    cur_index = flush_chunk_batch(chunk_entries, env, cur_index, device,
-                                                  emb_model, z_length, desc_model,
+                    cur_index = flush_chunk_batch(chunk_entries, env,
+                                                  cur_index, device, emb_model,
+                                                  z_length, desc_model,
                                                   augment_pool)
                     chunk_entries = []
+                    if FLAGS.test:
+                        print("Finished test batch")
+                        exit()
 
         cur_index = flush_chunk_batch(chunk_entries, env, cur_index, device,
                                       emb_model, z_length, desc_model,
@@ -416,16 +495,20 @@ def process_db(input_path, output_path, device,
             augment_pool.join()
         env.close()
 
-    print(f"  {cur_index} entries written to {output_path}, resulting in {cur_index*FLAGS.num_signal / FLAGS.sample_rate/3600:.3f} hours of audio.")
+    print(
+        f"  {cur_index} entries written to {output_path}, resulting in {cur_index*FLAGS.num_signal / FLAGS.sample_rate/3600:.3f} hours of audio."
+    )
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main(_):
-    device = f"cuda:{FLAGS.gpu}" if torch.cuda.is_available() and FLAGS.gpu >= 0 else "cpu"
-    
+    device = f"cuda:{FLAGS.gpu}" if torch.cuda.is_available(
+    ) and FLAGS.gpu >= 0 else "cpu"
+
     print(f"Device: {device}")
 
     # Embedding model
@@ -433,33 +516,51 @@ def main(_):
     if FLAGS.emb_model_path is not None:
         emb_model = torch.jit.load(FLAGS.emb_model_path).to(device).eval()
         with torch.no_grad():
-            dummy = torch.randn(1, 1 if not FLAGS.stereo else 2, FLAGS.num_signal).to(device)
+            dummy = torch.randn(1, 1 if not FLAGS.stereo else 2,
+                                FLAGS.num_signal).to(device)
             z_length = emb_model.encode(dummy).shape[-1]
-        print(f"Embedding model loaded; z_length={z_length} (ae_ratio={FLAGS.num_signal // z_length})")
+        print(
+            f"Embedding model loaded; z_length={z_length} (ae_ratio={FLAGS.num_signal // z_length})"
+        )
+    else:
+        if not FLAGS.save_waveform:
+            print(
+                "Warning: No embedding model specified and --save_waveform is False; the DB will contain no data!"
+            )
+            exit()
 
     # Descriptors
     desc_model = None
     if FLAGS.descriptors:
-        desc_model = AudioDescriptors(sr=FLAGS.sample_rate, descriptors=FLAGS.descriptors)
+        desc_model = AudioDescriptors(sr=FLAGS.sample_rate,
+                                      descriptors=FLAGS.descriptors)
 
     # Feature extractors
-    bp = BasicPitchPytorch(sr=FLAGS.sample_rate, device=device) if FLAGS.midi else None
-    beat_tracker = BeatTrack(sr=FLAGS.sample_rate, device=device) if FLAGS.beat_extract else None
+    bp = BasicPitchPytorch(
+        sr=FLAGS.sample_rate,
+        device=device,
+        batch_size=FLAGS.basic_pitch_batch_size) if FLAGS.midi else None
+    beat_tracker = BeatTrack(sr=FLAGS.sample_rate,
+                             device=device) if FLAGS.beat_extract else None
 
     # Augmenters
     structure_aug = timbre_aug = None
     if FLAGS.num_augments > 0:
         structure_aug = AudioAugment(
             sr=FLAGS.sample_rate,
-            pitch_min=-2, pitch_max=2,
-            ts_min=0.95, ts_max=1.05,
+            pitch_min=-2,
+            pitch_max=2,
+            ts_min=0.95,
+            ts_max=1.05,
             mode="whole",
             random_silence=FLAGS.silence_aug and not FLAGS.midi,
         )
         timbre_aug = AudioAugment(
             sr=FLAGS.sample_rate,
-            pitch_min=-2, pitch_max=2,
-            ts_min=0.95, ts_max=1.05,
+            pitch_min=-3,
+            pitch_max=3,
+            ts_min=0.9,
+            ts_max=1.1,
             mode="chunk",
             chunk_size=FLAGS.num_signal // 4,
             random_silence=FLAGS.silence_aug,
@@ -467,13 +568,13 @@ def main(_):
 
     for input_path in FLAGS.input_path:
         name = pathlib.Path(input_path).name
-        out_dir = os.path.join(FLAGS.output_path, name) if len(FLAGS.input_path) > 1 else FLAGS.output_path
+        out_dir = os.path.join(
+            FLAGS.output_path,
+            name) if len(FLAGS.input_path) > 1 else FLAGS.output_path
         os.makedirs(out_dir, exist_ok=True)
         print(f"\n--- {name}: {input_path} → {out_dir} ---")
-        process_db(input_path, out_dir, device,
-                   emb_model, z_length, desc_model,
-                   bp, beat_tracker,
-                   structure_aug, timbre_aug)
+        process_db(input_path, out_dir, device, emb_model, z_length,
+                   desc_model, bp, beat_tracker, structure_aug, timbre_aug)
 
 
 if __name__ == '__main__':

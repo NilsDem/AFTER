@@ -7,7 +7,6 @@ IN_SIZE = None
 N_SIGNAL = None
 
 ZS_CHANNELS = 64
-ZT_CHANNELS_FULL = 64
 ZT_CHANNELS = 6
 
 SR = 44100
@@ -19,25 +18,29 @@ LOCAL_ATTENTION_SIZE = 8
 ATTENTION_CHUNK_SIZE = 1
 
 # Data
-diffusion.utils.collate_fn:
+diffusion.utils.get_datasets:
+    db_list = None
+    emb_model_path = None
+
+diffusion.utils.collate_fn_after:
     n_signal = %N_SIGNAL
     structure_type = %STRUCTURE_TYPE
-    compress_midi = 4
+    compress_tc = 4
     shift_tc = 1
 
 ### ARCHITECTURE ### 
 encoder/diffusion.networks.ecapa_encoder.ECAPATDNN:
-    channels = [512, 512, 512, 1024, 2048]
-    dilations = [1, 1, 1, 1, 1 ]
+    attention_channels = 128
+    channels = [512, 512, 512, 1024]
+    dilations = [1, 1, 1, 1]
     global_context = True
-    groups = [1, 1, 1, 1, 1]
+    groups = [1, 1, 1, 1]
     in_size = %IN_SIZE
-    kernel_sizes = [3, 3, 3, 3, 3]
-    out_dim = %ZT_CHANNELS_FULL
+    kernel_sizes = [3, 3, 3, 3]
+    out_dim = %ZT_CHANNELS
     pooling = True
     res2net_scale = 8
-    se_channels = 256
-    attention_channels = 256
+    se_channels = 128
     spherical_normalisation = False
     use_tanh = False
     regularisation = "ac"
@@ -70,7 +73,6 @@ diffusion.model.Base:
     net= @diffusion.networks.transformerv2.DenoiserV2()
     encoder = @encoder/diffusion.networks.ecapa_encoder.ECAPATDNN()
     encoder_time = @encoder_time/diffusion.networks.Encoder1D()    
-    post_encoder = @diffusion.networks.LinearEncoder()
     time_transform = None
     drop_value = -4.
     drop_rate = 0.15
@@ -82,13 +84,13 @@ diffusion.model.Base.fit:
     ## Adversarial
     timbre_warmup = %PHASE_1_STEP
     adversarial_weight = 0.
-    adversarial_warmup = 0
+    adversarial_warmup = 1
 
     drop_targets = [0]
 
     # Noise augmentation to smooth the latent space
-    zsem_noise_aug = 0.
-    time_cond_noise_aug = 0.
+    timbre_noise_aug = 0.05
+    structure_noise_aug = 0.
 
     ## Encoder regularisation
     regularisation_weight_cond = 1.

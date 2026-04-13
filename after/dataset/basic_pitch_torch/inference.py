@@ -139,6 +139,7 @@ def run_inference(
     model: nn.Module,
     debug_file: Optional[pathlib.Path] = None,
     device="cpu",
+    batch_size: int = 64,
 ) -> Dict[str, np.array]:
     """Run the model on the input audio path.
 
@@ -146,6 +147,7 @@ def run_inference(
         audio_path: The audio to run inference on.
         model: A loaded keras model to run inference with.
         debug_file: An optional path to output debug data to. Useful for testing/verification.
+        batch_size: Number of windows to process at once. Reduce if OOM on large files.
 
     Returns:
        A dictionary with the notes, onsets and contours from model inference.
@@ -157,11 +159,20 @@ def run_inference(
 
     audio_windowed, _, audio_original_length = get_audio_input(
         audio, overlap_len, hop_size)
-    audio_windowed = torch.from_numpy(audio_windowed).T
+    audio_windowed = torch.from_numpy(audio_windowed).T  # (n_windows, AUDIO_N_SAMPLES)
 
-    audio_windowed = audio_windowed.to(device)
+    n_windows = audio_windowed.shape[0]
+    output_batches: Dict[str, List[np.ndarray]] = {}
 
-    output = model(audio_windowed)
+    for start in range(0, n_windows, batch_size):
+        batch = audio_windowed[start:start + batch_size].to(device)
+        batch_out = model(batch)
+        for k, v in batch_out.items():
+            output_batches.setdefault(k, []).append(v.cpu())
+
+    # Concatenate along the window axis (dim 0) before unwrapping
+    output = {k: torch.cat(vs, dim=0) for k, vs in output_batches.items()}
+
     unwrapped_output = {
         k: unwrap_output(output[k], audio_original_length,
                          n_overlapping_frames)
@@ -176,10 +187,9 @@ def run_inference(
                     "audio_original_length": audio_original_length,
                     "hop_size_samples": hop_size,
                     "overlap_length_samples": overlap_len,
-                    "unwrapped_output": {
-                        k: v.tolist()
-                        for k, v in unwrapped_output.items()
-                    },
+                    "unwrapped_output":
+                    {k: v.tolist()
+                     for k, v in unwrapped_output.items()},
                 },
                 f,
             )
@@ -304,11 +314,9 @@ def predict(
     melodia_trick: bool = True,
     debug_file: Optional[pathlib.Path] = None,
     midi_tempo: float = 120,
-) -> Tuple[
-        Dict[str, np.array],
-        pretty_midi.PrettyMIDI,
-        List[Tuple[float, float, int, float, Optional[List[int]]]],
-]:
+    batch_size: int = 64,
+) -> Tuple[Dict[str, np.array], pretty_midi.PrettyMIDI, List[Tuple[
+        float, float, int, float, Optional[List[int]]]], ]:
     """Run a single prediction.
 
     Args:
@@ -326,7 +334,6 @@ def predict(
         The model output, midi data and note events from a single prediction
     """
 
-    print(onset_threshold)
     if model is None:
         model = BasicPitchTorch()
         model.load_state_dict(torch.load(str(model_path)))
@@ -334,7 +341,7 @@ def predict(
         if device is not None:
             model.to(device)
 
-    model_output = run_inference(audio, model, debug_file, device=device)
+    model_output = run_inference(audio, model, debug_file, device=device, batch_size=batch_size)
 
     min_note_len = int(
         np.round(minimum_note_length / 1000 * (AUDIO_SAMPLE_RATE / FFT_HOP)))

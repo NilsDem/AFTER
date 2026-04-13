@@ -64,20 +64,21 @@ class Base(nn.Module):
     def cycle_step(self, interpolant, t, time_cond, cond, cycle_mode,
                    cycle_swap_target, cycle_loss_type, cycle_scaling):
         pass
-    
+
     def cfgdrop(self, datas, bsize, drop_targets=[], drop_rate=0.2):
         draw = torch.rand(bsize)
         test_drop_all = (draw < drop_rate)
-        
-        if len(drop_targets) == 1:  
+
+        if len(drop_targets) == 1:
             test_drop_all = torch.zeros_like(test_drop_all)
 
         for i in range(len(datas)):
             if i in drop_targets:
-                test_drop_i = (draw > drop_rate * (i + 1)) & (draw < drop_rate *
-                                                            (i + 2))
-                test_drop = (test_drop_all +
-                         test_drop_i) if i in drop_targets else test_drop_all
+                test_drop_i = (draw > drop_rate *
+                               (i + 1)) & (draw < drop_rate * (i + 2))
+                test_drop = (
+                    test_drop_all +
+                    test_drop_i) if i in drop_targets else test_drop_all
             else:
                 test_drop = torch.zeros_like(test_drop_all)
 
@@ -88,11 +89,9 @@ class Base(nn.Module):
             anti_test_drop = self.broadcast_to(anti_test_drop.to(datas[i]),
                                                datas[i].shape)
 
-            datas[i] = anti_test_drop * datas[
-                    i] + test_drop * torch.ones_like(
-                        datas[i]) * self.drop_value
+            datas[i] = anti_test_drop * datas[i] + test_drop * torch.ones_like(
+                datas[i]) * self.drop_value
         return datas
-
 
     def broadcast_to(self, alpha, shape):
         assert type(shape) == torch.Size
@@ -116,6 +115,9 @@ class Base(nn.Module):
             self.opt_classifier = AdamW(self.classifier.parameters(),
                                         lr=lr,
                                         betas=(0.9, 0.999))
+
+        else:
+            self.opt_classifier = None
 
         self.opt = AdamW(params, lr=lr, betas=(0.9, 0.999))
         self.step = 0
@@ -145,10 +147,9 @@ class Base(nn.Module):
                 for k, v in state_dict.items() if "emb_model" not in k
             }
             d = {
-                "model_state": {
-                    k: v
-                    for k, v in state_dict.items() if "emb_model" not in k
-                },
+                "model_state":
+                {k: v
+                 for k, v in state_dict.items() if "emb_model" not in k},
                 "opt_state":
                 self.opt.state_dict(),
                 "opt_classifier_state":
@@ -156,13 +157,9 @@ class Base(nn.Module):
                 if self.classifier is not None else None,
             }
 
-            if self.distill:
-                d["opt_discriminator_state"] = self.opt_discriminator.state_dict(
-                )
+            torch.save(d,
+                       model_dir + "/checkpoint" + str(self.step) + "_EMA.pt")
 
-            torch.save(
-                d, model_dir + "/checkpoint" + str(self.step) + "_EMA.pt")
-            
     @gin.configurable
     def fit(self,
             dataloader,
@@ -189,7 +186,8 @@ class Base(nn.Module):
             train_encoder_time=True,
             update_classifier_every=2,
             timbre_noise_aug=0.,
-            structure_noise_aug=0.):
+            structure_noise_aug=0.,
+            logger=None):
 
         self.train_encoder = train_encoder
         self.train_encoder_time = train_encoder_time
@@ -198,13 +196,12 @@ class Base(nn.Module):
 
         self.init_train(lr=lr, dataloader=validloader)
 
-
         if restart_step is not None and restart_step > 0:
             state_dict = torch.load(f"{model_dir}/checkpoint" +
                                     str(restart_step) + "_EMA.pt",
                                     map_location="cpu")
 
-            self.load_state_dict(state_dict, strict=False)
+            self.load_state_dict(state_dict["model_state"], strict=False)
 
             try:
                 self.opt.load_state_dict(state_dict["opt_state"])
@@ -212,12 +209,13 @@ class Base(nn.Module):
                 print(e)
                 print("Could not load optimizer state")
 
-            try:
-                self.opt_classifier.load_state_dict(
-                    state_dict["opt_classifier_state"])
-            except Exception as e:
-                print(e)
-                print("Could not load optimizer state for classifier")
+            if self.opt_classifier is not None:
+                try:
+                    self.opt_classifier.load_state_dict(
+                        state_dict["opt_classifier_state"])
+                except Exception as e:
+                    print(e)
+                    print("Could not load optimizer state for classifier")
 
             self.step = restart_step + 1
             print("Restarting from step ", self.step)
@@ -229,7 +227,8 @@ class Base(nn.Module):
             self.ema = ExponentialMovingAverage(params, decay=0.999)
 
         # Loging
-        logger = SummaryWriter(log_dir=model_dir + "/logs")
+        if logger is None:
+            logger = SummaryWriter(log_dir=model_dir + "/logs")
         self.tepoch = tqdm(total=max_steps, initial=self.step, unit="batch")
 
         n_epochs = max_steps // len(dataloader) + 1
@@ -241,12 +240,14 @@ class Base(nn.Module):
         with open(os.path.join(model_dir, "config.gin"), "w") as config_out:
             config_out.write(gin.operative_config_str())
 
-        self.save_model(model_dir)
+        if restart_step is None:
+            self.save_model(model_dir)
+
         for e in range(n_epochs):
             for batch in dataloader:
                 if (self.step > stop_training_encoder_step
                         and self.train_encoder == True):
-                    print("detaching encoder")
+                    print("detaching timbre encoder")
                     for param in self.encoder.parameters():
                         param.requires_grad = False
                     self.encoder.eval()
@@ -254,7 +255,7 @@ class Base(nn.Module):
 
                 if (self.step > stop_training_encoder_time_step
                         and self.train_encoder_time == True):
-                    print("detaching encoder")
+                    print("detaching structure encoder")
                     if self.encoder_time is not None:
                         for param in self.encoder_time.parameters():
                             param.requires_grad = False
@@ -266,11 +267,10 @@ class Base(nn.Module):
 
                 if self.step > stop_training_encoder_step or not train_encoder:
                     with torch.no_grad():
-                        cond, _, cond_reg = self.encoder(
-                            x1_cond, return_full=True)
+                        cond, _, cond_reg = self.encoder(x1_cond,
+                                                         return_full=True)
                 else:
-                    cond, _, cond_reg = self.encoder(x1_cond,
-                                                             return_full=True)
+                    cond, _, cond_reg = self.encoder(x1_cond, return_full=True)
 
                 cond = cond + timbre_noise_aug * torch.randn_like(cond)
 
@@ -300,12 +300,11 @@ class Base(nn.Module):
                     time_cond = time_cond + structure_noise_aug * torch.randn_like(
                         time_cond)
 
-
-                cond_drop, time_cond_drop = self.cfgdrop([cond, time_cond],
-                                                      bsize=x1.shape[0],
-                                                      drop_targets=[0],
-                                                      drop_rate=self.drop_rate)
-
+                time_cond_drop, cond_drop = self.cfgdrop(
+                    [time_cond, cond],
+                    bsize=x1.shape[0],
+                    drop_targets=[0],
+                    drop_rate=self.drop_rate)
 
                 if self.step > timbre_warmup and not (
                         self.step % update_classifier_every
@@ -358,7 +357,7 @@ class Base(nn.Module):
                         classifier_loss = torch.tensor(0.)
                         adversarial_weight_cur = 0.
 
-                    diffusion_loss, t = self.diffusion_step(
+                    diffusion_loss = self.diffusion_step(
                         x1, time_cond=time_cond_drop, cond=cond_drop)
 
                     # Compute weights
@@ -385,8 +384,8 @@ class Base(nn.Module):
                     }
 
                     loss = diffusion_loss - adversarial_weight_cur * classifier_loss + regularisation_weight_cond_cur * cond_reg.mean(
-                            ) + regularisation_weight_time_cond_cur * time_cond_reg.mean(
-                            )
+                    ) + regularisation_weight_time_cond_cur * time_cond_reg.mean(
+                    )
 
                     self.opt.zero_grad()
                     loss.backward()
@@ -404,7 +403,7 @@ class Base(nn.Module):
                         loss=losses_sum.get("Diffusion loss", 0.) /
                         steps_display)
                     for k in losses_sum:
-                        logger.add_scalar('Loss/' + k,
+                        logger.add_scalar('Training/' + k,
                                           losses_sum[k] /
                                           max(1, losses_sum_count[k]),
                                           global_step=self.step)
@@ -413,112 +412,123 @@ class Base(nn.Module):
 
                 if self.step % steps_valid == 0 and validloader is not None:
                     with torch.no_grad():
-                      with self.ema.average_parameters():
-                        ## VALIDATION
-                        lossval = {}
-                        nloss = 0
+                        with self.ema.average_parameters():
+                            ## VALIDATION
+                            lossval = {}
+                            nloss = 0
 
-                        for i, batch in enumerate(validloader):
-                            x1, x1_cond, x1_time_cond = self.prep_data(
-                                batch, device=self.device)
+                            for i, batch in enumerate(validloader):
+                                x1, x1_cond, x1_time_cond = self.prep_data(
+                                    batch, device=self.device)
 
-                            full_cond = self.encoder(x1_cond)
-                            if self.post_encoder is not None:
-                                cond = self.post_encoder(full_cond)
-                            else:
-                                cond = full_cond
-                            time_cond = self.encoder_time(
-                                x1_time_cond
-                            ) if self.encoder_time is not None else x1_time_cond
+                                full_cond = self.encoder(x1_cond)
+                                if self.post_encoder is not None:
+                                    cond = self.post_encoder(full_cond)
+                                else:
+                                    cond = full_cond
+                                time_cond = self.encoder_time(
+                                    x1_time_cond
+                                ) if self.encoder_time is not None else x1_time_cond
 
-                            if self.step < timbre_warmup:
-                                time_cond = self.drop_value * torch.ones_like(
-                                    time_cond)
-                            if self.drop_rate > 0:
-                                cond_drop, time_cond_drop = self.cfgdrop(
-                                    [cond, time_cond],
-                                    bsize=x1.shape[0],
-                                    drop_targets=drop_targets,
-                                    drop_rate=self.drop_rate)
-                            diffusion_loss, _, _ = self.diffusion_step(
-                                x1, time_cond=time_cond_drop, cond=cond_drop)
+                                if self.step < timbre_warmup:
+                                    time_cond = self.drop_value * torch.ones_like(
+                                        time_cond)
+                                if self.drop_rate > 0:
+                                    time_cond_drop, cond_drop = self.cfgdrop(
+                                        [
+                                            time_cond,
+                                            cond,
+                                        ],
+                                        bsize=x1.shape[0],
+                                        drop_targets=drop_targets,
+                                        drop_rate=self.drop_rate)
+                                diffusion_loss = self.diffusion_step(
+                                    x1,
+                                    time_cond=time_cond_drop,
+                                    cond=cond_drop)
 
-                            lossdict = {
-                                "Diffusion loss": diffusion_loss.item(),
-                            }
+                                lossdict = {
+                                    "Diffusion loss": diffusion_loss.item(),
+                                }
 
-                            for k in lossdict:
-                                lossval[k] = lossval.get(k, 0.) + lossdict[k]
-                            nloss += 1
+                                for k in lossdict:
+                                    lossval[k] = lossval.get(k,
+                                                             0.) + lossdict[k]
+                                nloss += 1
 
-                            if i == 50:
-                                break
+                                if i == 50:
+                                    break
 
-                        for k in lossval:
-                            logger.add_scalar('Loss/valid/' + k,
-                                              lossval[k] / nloss,
-                                              global_step=self.step)
+                            for k in lossval:
+                                logger.add_scalar('Validation/' + k,
+                                                  lossval[k] / nloss,
+                                                  global_step=self.step)
 
-                        ## SAMPLING
-                        x1 = x1[:4].to(self.device)
-                        time_cond = time_cond[:4] if time_cond is not None else None
-                        cond = cond[:4] if cond is not None else None
-                        x0 = self.sample_prior(x1.shape)
-
-                        with torch.no_grad():
-                            audio_true = self.emb_model.decode(x1.detach().cpu()).cpu()
-
-                        nb_steps = [20]
-
-                        for nb_step in nb_steps:
-                            x1_rec = self.sample(x0,
-                                                 nb_steps=nb_step,
-                                                 time_cond=time_cond,
-                                                 cond=cond)
-                            with torch.no_grad():
-                                audio_rec = self.emb_model.decode(
-                                    x1_rec.detach().cpu()).cpu()
-
-                            # SAMPLING TRANSFERS
-                            shifted_cond = torch.roll(cond, shifts=-1, dims=0)
-                            x1_transfer = self.sample(x0,
-                                                      nb_steps=nb_step,
-                                                      time_cond=time_cond,
-                                                      cond=shifted_cond)
+                            ## SAMPLING
+                            x1 = x1[:4].to(self.device)
+                            time_cond = time_cond[:
+                                                  4] if time_cond is not None else None
+                            cond = cond[:4] if cond is not None else None
+                            x0 = self.sample_prior(x1.shape)
 
                             with torch.no_grad():
-                                audio_transfer = self.emb_model.decode(
-                                    x1_transfer.detach().cpu()).cpu()
+                                audio_true = self.emb_model.decode(
+                                    x1.detach().cpu()).cpu()
 
-                            with warnings.catch_warnings():
-                                warnings.simplefilter("ignore")
-                                if audio_true.shape[1] == 2:
-                                    audio_true = audio_true.mean(1,
-                                                                 keepdim=True)
-                                    audio_rec = audio_rec.mean(1, keepdim=True)
-                                    audio_transfer = audio_transfer.mean(
-                                        1, keepdim=True)
-                                for i in range(x1.shape[0]):
+                            nb_steps = [20]
 
-                                    logger.add_audio("true/" + str(i),
-                                                     audio_true[i],
-                                                     global_step=self.step,
-                                                     sample_rate=self.sr)
+                            for nb_step in nb_steps:
+                                x1_rec = self.sample(x0,
+                                                     nb_steps=nb_step,
+                                                     time_cond=time_cond,
+                                                     cond=cond)
+                                with torch.no_grad():
+                                    audio_rec = self.emb_model.decode(
+                                        x1_rec.detach().cpu()).cpu()
 
-                                    logger.add_audio("reconstruction_" +
-                                                     str(nb_step) + "steps/" +
-                                                     str(i),
-                                                     audio_rec[i],
-                                                     global_step=self.step,
-                                                     sample_rate=self.sr)
+                                # SAMPLING TRANSFERS
+                                shifted_cond = torch.roll(cond,
+                                                          shifts=-1,
+                                                          dims=0)
+                                x1_transfer = self.sample(x0,
+                                                          nb_steps=nb_step,
+                                                          time_cond=time_cond,
+                                                          cond=shifted_cond)
 
-                                    logger.add_audio(
-                                        "transfer_" + str(nb_step) + "steps/" +
-                                        str(i) + "_to_" + str(
-                                            (i + 1) % x1.shape[0]),
-                                        audio_transfer[i],
-                                        global_step=self.step,
-                                        sample_rate=self.sr)
+                                with torch.no_grad():
+                                    audio_transfer = self.emb_model.decode(
+                                        x1_transfer.detach().cpu()).cpu()
+
+                                with warnings.catch_warnings():
+                                    warnings.simplefilter("ignore")
+                                    if audio_true.shape[1] == 2:
+                                        audio_true = audio_true.mean(
+                                            1, keepdim=True)
+                                        audio_rec = audio_rec.mean(
+                                            1, keepdim=True)
+                                        audio_transfer = audio_transfer.mean(
+                                            1, keepdim=True)
+                                    for i in range(x1.shape[0]):
+
+                                        logger.add_audio("true/" + str(i),
+                                                         audio_true[i],
+                                                         global_step=self.step,
+                                                         sample_rate=self.sr)
+
+                                        logger.add_audio("reconstruction_" +
+                                                         str(nb_step) +
+                                                         "steps/" + str(i),
+                                                         audio_rec[i],
+                                                         global_step=self.step,
+                                                         sample_rate=self.sr)
+
+                                        logger.add_audio(
+                                            "transfer_" + str(nb_step) +
+                                            "steps/" + str(i) + "_to_" + str(
+                                                (i + 1) % x1.shape[0]),
+                                            audio_transfer[i],
+                                            global_step=self.step,
+                                            sample_rate=self.sr)
 
                 if self.step % steps_save == 0:
                     self.save_model(model_dir)
@@ -534,7 +544,6 @@ class RectifiedFlow(Base):
 
     def smooth_function_cond(self, x, slope=7):
         return 0.5 * (1 + torch.tanh(slope * (0.4 - x)))
-
 
     def diffusion_step(self, x1, time_cond, cond):
 
@@ -553,7 +562,7 @@ class RectifiedFlow(Base):
 
         loss = ((model_output - target)**2).mean()
 
-        return loss, interpolant, t
+        return loss
 
     def model_forward(self,
                       x: torch.Tensor,
@@ -605,13 +614,15 @@ class RectifiedFlow(Base):
         return dx
 
     @torch.no_grad()
-    def sample(self,
-               x0,
-               cond,
-               time_cond,
-               nb_steps,
-               guidance_timbre=1.,
-               guidance_structure=1.,):
+    def sample(
+        self,
+        x0,
+        cond,
+        time_cond,
+        nb_steps,
+        guidance_timbre=1.,
+        guidance_structure=1.,
+    ):
         dt = 1 / nb_steps
         t_values = torch.linspace(0, 1, nb_steps + 1).to(self.device)[:-1]
         x = x0.to(self.device)
@@ -625,7 +636,5 @@ class RectifiedFlow(Base):
                 time_cond=time_cond,
                 guidance_timbre=guidance_timbre,
                 guidance_structure=guidance_structure) * dt
-
-    
 
         return x

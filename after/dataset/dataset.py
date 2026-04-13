@@ -7,6 +7,45 @@ import numpy as np
 import os
 import json
 import pretty_midi
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+
+def _cache_worker(args):
+    """
+    Top-level picklable worker for SimpleDataset.build_cache.
+    Opens its own LMDB connection so it is safe under both fork and spawn.
+    """
+    path, key_bytes, buffer_keys, ae_ratio, compress_tc, sr = args
+
+    env = lmdb.open(path,
+                    lock=False,
+                    readonly=True,
+                    readahead=True,
+                    map_async=False)
+    try:
+        with env.begin() as txn:
+            ae = AudioExample(txn.get(key_bytes))
+
+        out = {}
+        for key in buffer_keys:
+            if key == "metadata":
+                out[key] = ae.get_metadata()
+            else:
+                dat = ae.get(key)
+                if isinstance(dat, pretty_midi.PrettyMIDI):
+                    if ae_ratio is None or compress_tc is None or sr is None:
+                        raise ValueError(
+                            "ae_ratio, compress_tc and sr must be set on the "
+                            "dataset to cache MIDI piano rolls.")
+                    z_length = ae.get("z").shape[-1]
+                    times = np.linspace(0, z_length * ae_ratio / sr,
+                                        z_length * compress_tc)
+                    out["piano_roll_" + key] = dat.get_piano_roll(times=times)
+                out[key] = dat
+        return out
+    finally:
+        env.close()
 
 
 class SimpleDataset(torch.utils.data.Dataset):
@@ -15,9 +54,6 @@ class SimpleDataset(torch.utils.data.Dataset):
         self,
         path,
         keys=['waveform', 'metadata'],
-        max_samples=None,
-        num_sequential=100,
-        recache_every=None,
         init_cache=False,
         validation_size=0.02,
         map_size=None,
@@ -27,13 +63,15 @@ class SimpleDataset(torch.utils.data.Dataset):
             "include": [],
             "exclude": []
         },
-        try_load_indices=False,
+        ae_ratio=None,
+        compress_tc=None,
+        sr=None,
     ) -> None:
         super().__init__()
-        self.num_sequential = num_sequential
-        self.max_samples = max_samples
-        self.recache_every = recache_every
-        self.recache_counter = 0
+        self.path = path
+        self.ae_ratio = ae_ratio
+        self.compress_tc = compress_tc
+        self.sr = sr
         self.env = lmdb.open(path,
                              lock=False,
                              readonly=readonly,
@@ -45,18 +83,6 @@ class SimpleDataset(torch.utils.data.Dataset):
         with self.env.begin() as txn:
             self.keys = list(txn.cursor().iternext(values=False))
 
-        if try_load_indices:
-            try:
-                indices_file = os.path.join(path, "balanced_indices.json")
-                with open(indices_file, "r") as f:
-                    balanced_indices = json.load(f)
-                print("retaining ", len(balanced_indices),
-                      " balanced indices from file: ", indices_file,
-                      "from original :", len(self.keys))
-                self.keys = [self.keys[i] for i in balanced_indices]
-            except:
-                print("could not load balanced indices from file")
-
         if split in ["train", "validation"]:
             train_ids, valid_ids = train_test_split(list(range(len(
                 self.keys))),
@@ -67,14 +93,6 @@ class SimpleDataset(torch.utils.data.Dataset):
                 self.keys = [self.keys[i] for i in valid_ids]
             elif split == "train":
                 self.keys = [self.keys[i] for i in train_ids]
-
-        if self.max_samples is not None and self.max_samples < len(self.keys):
-            np.random.seed(0)
-            self.keys = np.random.choice(self.keys,
-                                         self.max_samples,
-                                         replace=False)
-        else:
-            self.max_samples = None
 
         if len(filter["include"]) > 0 or len(filter["exclude"]) > 0:
             keys_retained = []
@@ -113,7 +131,6 @@ class SimpleDataset(torch.utils.data.Dataset):
         else:
             self.buffer_keys = keys + ["metadata"]
 
-        print(self.buffer_keys)
         if init_cache:
             self.build_cache()
 
@@ -125,35 +142,35 @@ class SimpleDataset(torch.utils.data.Dataset):
             ae = AudioExample(txn.get(self.keys[1]))
             return ae.get_keys()
 
-    def build_cache(self):
+    def build_cache(self, num_workers=None):
+        if num_workers is None:
+            num_workers = min(mp.cpu_count(), 8)
+
         self.cached = False
-        self.cache = []
+        self.cache = [None] * len(self.indexes)
 
-        self.indexes = list(range(len(self.keys)))
-        if self.max_samples is not None:
+        args_list = [(self.path, self.keys[i], self.buffer_keys, self.ae_ratio,
+                      self.compress_tc, self.sr) for i in self.indexes]
 
-            self.indexes_start = np.random.choice(
-                self.indexes[:-self.num_sequential],
-                self.max_samples // self.num_sequential,
-                replace=False)
+        print(f"Building cache with {num_workers} workers "
+              f"({len(self.indexes)} items)...")
 
-            self.indexes = [
-                start + i for start in self.indexes_start
-                for i in range(self.num_sequential)
-            ]
-
-        for i in tqdm(range(len(self.indexes))):
-            self.cache.append(self.__getitem__(i, build_cache=True))
+        with ProcessPoolExecutor(max_workers=num_workers,
+                                 mp_context=mp.get_context("fork")) as pool:
+            futures = {
+                pool.submit(_cache_worker, args): idx
+                for idx, args in enumerate(args_list)
+            }
+            for future in tqdm(as_completed(futures),
+                               total=len(futures),
+                               unit="item"):
+                idx = futures[future]
+                self.cache[idx] = future.result()
 
         self.cached = True
 
     def __getitem__(self, index, build_cache=False):
         if self.cached == True:
-            self.recache_counter += 1
-            if self.recache_every is not None and self.recache_counter == self.recache_every:
-                self.build_cache()
-                self.recache_counter = 0
-
             return self.cache[index]
 
         index = self.indexes[index]
@@ -168,11 +185,14 @@ class SimpleDataset(torch.utils.data.Dataset):
                 out[key] = ae.get_metadata()
             else:
                 dat = ae.get(key)
-                
-                if build_cache  and isinstance(dat, pretty_midi.PrettyMIDI):
+
+                if build_cache and isinstance(dat, pretty_midi.PrettyMIDI):
                     # print("Comuting piano roll for key: ", key)
-                    piano_roll = dat.get_piano_roll(fs = 44100/4096*4)
-                    out["piano_roll_"+key] = piano_roll
+                    z_length = ae.get("z").shape[-1]
+                    times = np.linspace(0, z_length * self.ae_ratio / self.sr,
+                                        z_length * self.compress_tc)
+                    piano_roll = dat.get_piano_roll(times=times)
+                    out["piano_roll_" + key] = piano_roll
                 out[key] = dat
         return out
 
@@ -182,20 +202,23 @@ from sklearn.model_selection import train_test_split
 
 class CombinedDataset(torch.utils.data.Dataset):
 
-    def __init__(self,
-                 path_dict=None,
-                 dataset_dict=None,
-                 keys=["waveform"],
-                 transforms=[],
-                 config="all",
-                 num_samples=None,
-                 freqs=None,
-                 init_cache=False,
-                 filter={
-                     "include": [],
-                     "exclude": []
-                 },
-                 **kwargs):
+    def __init__(
+        self,
+        path_dict=None,
+        dataset_dict=None,
+        keys=["waveform"],
+        transforms=[],
+        config="all",
+        freqs=None,
+        init_cache=False,
+        filter={
+            "include": [],
+            "exclude": []
+        },
+        ae_ratio=None,
+        compress_tc=None,
+        sr=None,
+    ):
         super().__init__()
         self.config = config
 
@@ -206,13 +229,16 @@ class CombinedDataset(torch.utils.data.Dataset):
         elif path_dict is not None:
 
             self.datasets = {
-                k:
-                SimpleDataset(v["path"],
-                              keys=keys,
-                              max_samples=num_samples,
-                              init_cache=init_cache,
-                              split=config,
-                              filter=filter)
+                k: SimpleDataset(
+                    v["path"],
+                    keys=keys,
+                    init_cache=init_cache,
+                    split=config,
+                    filter=filter,
+                    ae_ratio=ae_ratio,
+                    compress_tc=compress_tc,
+                    sr=sr,
+                )
                 for k, v in path_dict.items()
             }
             info_dict = path_dict
@@ -279,15 +305,11 @@ class CombinedDataset(torch.utils.data.Dataset):
         else:
             raise ValueError("config must be either train or val")
 
-    def build_cache(self):
-        print("building cache")
-        self.data = {}
-        for k in self.datasets.keys():
-            datalist = []
-            for idx in tqdm(range(len(self.keys[k]))):
-                datalist.append(self.datasets[k][idx])
-            self.data[k] = datalist
-
+    def build_cache(self, num_workers=16):
+        print("building cache with num_workers: ", num_workers)
+        for k, ds in self.datasets.items():
+            print(f"  Caching sub-dataset: {k}")
+            ds.build_cache(num_workers=num_workers)
         self.cache = True
 
     def __getitem__(self, idx):

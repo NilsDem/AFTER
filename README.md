@@ -18,114 +18,247 @@ pip install -e .
 
 If you want to use the model in MaxMSP or PureData for real-time generation, please refer to the [_nn_tilde_](https://github.com/acids-ircam/nn_tilde) external documentation and follow the installation steps.
 
+---
+
 ## Model Training
 
-Training AFTER involves 3 separate steps, _autoencoder training_, _model training_ and _model export_.
+Training AFTER involves 3 separate steps: _dataset preparation_, _autoencoder training_, and _diffusion model training.
 
-### Neural audio codec
+---
 
-If you already have a streamable audio codec such as a pretrained [RAVE](https://github.com/acids-ircam/RAVE) model, you can directly skip to the next section. Also, we provide four audio codecs already trained on different datasets [here](https://nubo.ircam.fr/index.php/s/8NFD5gWwbkT4G5P).
+### Step 1 — Dataset Preparation
 
-Before training the autoencoder, you need to preprocess your audio files into an lmdb database :
+All training data must be preprocessed into an LMDB database first.
 
-```bash
-after prepare_dataset --input_path /audio/folder --output_path /dataset/path_audio --save_waveform True 
-```
-
-Then, you can start the model training 
+#### Waveform-only dataset (for autoencoder training)
 
 ```bash
-after train_autoencoder --name AE_model_name --db_path /dataset/path_audio  --config baseAE --gpu 0
+after prepare_dataset \
+  --input_path /audio/folder \
+  --output_path /dataset/path_audio \
+  --save_waveform True
 ```
 
-where `db_path` refers to the prepared dataset location. The tensorboard logs and checkpoints are saved by default to `./autoencoder_runs/`.
-
-After training, the model has to be exported to a torchscript file using
+#### Latent embedding dataset (for diffusion training)
 
 ```bash
-after export_autoencoder  --model_path autoencoder_runs/AE_model_name 
+after prepare_dataset \
+  --input_path /audio/folder \
+  --output_path /dataset/path_latent \
+  --emb_model_path AE_model_run/export.ts
 ```
-This will save two .ts files in the run folder, one for streaming and one for offline inference (export_stream.ts and export.ts respectively). By default the last training step checkpoint is used for export.
 
-### AFTER training
-First, you need to prepare your dataset before training. Since our diffusion model works in the latent space of the autoencoder, we pre-compute the latent embeddings to speed up training : 
+Multiple input directories can be passed; one LMDB is created per directory:
 
 ```bash
-after prepare_dataset --input_path /audio/folder --output_path /dataset/path_latent_codes --emb_model_path AE_model_run_path/export.ts
+after prepare_dataset \
+  --input_path /audio/folder1 \
+  --input_path /audio/folder2 \
+  --output_path /dataset/root
 ```
 
-- `num_signal` flag sets the duration of the audio chunks for training in number of samples (must be a power of 2). (default: 524288 ~ 11 seconds)
-- `sample_rate` flag sets the resampling rate.  (default: 44100)
-- `gpu` device to use for computing the embeddings. Use -1 for cpu (default: 0)
+#### Full flag reference
 
-To train a midi-to-audio AFTER model you need to either use the flag `--basic_pitch_midi` to transcript the midi from the audio files or define your own file parsing function in `./after/dataset/parsers.py`.
+| Flag | Default | Description |
+|---|---|---|
+| `--input_path` | *(required)* | Input directories (repeatable) |
+| `--output_path` | `.` | Root output directory |
+| `--parser` | `simple_audio` | File parser: `simple_audio` or `simple_midi` |
+| `--ext` | `wav opus mp3 aac flac` | Audio extensions to include (repeatable) |
+| `--exclude` | `[]` | Filename substrings to exclude (repeatable) |
+| `--include` | `None` | Filename substrings to include — any match (repeatable) |
+| `--pad_mode` | `pad` | How to handle short files: `pad` (zero-pad) or `concat` (tile) |
+| `--num_signal` | `524288` | Samples per chunk (~12 s at 44100 Hz) |
+| `--sample_rate` | `44100` | Target sample rate |
+| `--normalize` | `True` | Peak-normalize each file |
+| `--cut_silences` | `False` | Skip silent chunks (peak < 0.05) |
+| `--save_waveform` | `False` | Store raw int16 waveform in the database |
+| `--stereo` | `False` | Store 2-channel waveforms (mono files are duplicated) |
+| `--emb_model_path` | `None` | TorchScript embedding model to pre-compute latents |
+| `--batch_size` | `4` | Chunk batch size for embedding inference |
+| `--gpu` | `-1` | CUDA device index; `-1` for CPU |
+| `--descriptors` | `[]` | Audio descriptors to compute (e.g. `centroid`) |
+| `--num_augments` | `4` | Augmented copies per chunk; `0` to disable |
+| `--silence_aug` | `True` | Allow random silence in augmentations |
+| `--midi` | `False` | Extract MIDI with BasicPitch |
+| `--beat_extract` | `False` | Extract beats with BeatTrack |
+| `--midi_edge_oversample_pct` | `0.1` | Extra edge samples fraction for MIDI boundary chunks |
+| `--db_size` | `10` | Max LMDB file size in GB |
 
-If you plan to have more advanced use of the models, please refer to the help function for all the arguments.
+---
 
-Then, a training is started with 
+### Step 2 — Neural Audio Codec (Autoencoder)
+
+If you already have a streamable audio codec (e.g. a pretrained [RAVE](https://github.com/acids-ircam/RAVE) model) you can skip this step. Pretrained codecs are also available [here](https://nubo.ircam.fr/index.php/s/8NFD5gWwbkT4G5P).
+
+#### Training
 
 ```bash
-after train  --name diff_model_name --db_path /dataset/path_latent_codes --emb_model_path AE_model_run_path/export.ts --config CONFIG_NAME
+after train_autoencoder \
+  --name AE_model_name \
+  --db_path /dataset/path_audio \
+  --config AE_4096 \
+  --gpu 0
 ```
 
-Different configurations are available in `diffusion/configs` and can be combined : 
-
-
-<table>
-  <thead>
-    <tr>
-      <th>Category</th>
-      <th>Config</th>
-      <th>Description</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td rowspan="2"><strong>Model</strong></td>
-      <td><strong>base</strong></td>
-      <td>Default audio-to-audio timbre and structure separation model.</td>
-    </tr>
-    <tr>
-      <td><strong>midi</strong></td>
-      <td>Uses MIDI as input for the structure encoder</td>
-    </tr>
-    <tr>
-      <td rowspan="2"><strong>Additional</strong></td>
-      <td><strong>tiny</strong></td>
-      <td>Reduces the model's capacity for faster inference. Useful for testing and low-resource environments.</td>
-    </tr>
-    <tr>
-      <td><strong>cycle</strong></td>
-      <td>Experimental: adds a cycle consistency phase during training, which can improve timbre and structure disentanglement.</td>
-    </tr>
-  </tbody>
-</table>
-
-
-The tensorboard logs and checkpoints are saved to  `/diffusion/runs/model_name`, and you can experiment with you trained model using the notebooks `notebooks/audio_to_audio_demo.ipynb` and `notebooks/midi_to_audio_demo.ipynb`.
-
-### Export
-
-Once the training is complete, you can export the model to an [_nn_tilde_](https://github.com/acids-ircam/nn_tilde) torchscript file for inference in MaxMSP, PureData or Ableton Live. 
-
-For an audio-to-audio model :
-```bash
-after export --model_path diff_model_name --emb_model_path AE_model_run_path/export_stream.ts
-```
-
-For a MIDI-to-audio model :
+Logs and checkpoints are saved to `./autoencoder_runs/<name>/` by default. You can train on several gpus (here 3) with 
 
 ```bash
-after export_midi --model_path diff_model_name --emb_model_path AE_model_run_path/export_stream.ts 
+CUDA_VISIBLE_DEVICES=0,1,2 torchrun --nproc_per_node=3  after_scripts/train_autoencoder \
+  --ddp 
+  --name AE_model_name
+  -> regular flags
 ```
 
-Make sure to use the streaming version of the exported autoencoder (denoted by _stream.ts).
+#### Keys flags reference
+
+| Flag | Default | Description |
+|---|---|---|
+| `--name` | `test` | Model name |
+| `--config` | `[]` | Gin config file(s) — repeatable |
+| `--db_path` | `[]` | LMDB dataset path(s) — repeatable |
+| `--db_folder` | `None` | Folder whose sub-directories are each an LMDB dataset |
+| `--freqs` | `None` | Sampling frequencies for weighted multi-dataset sampling |
+| `--save_dir` | `autoencoder_runs` | Path to save the runs |
+| `--stereo` | `False` | Train a 2-channel model |
+| `--restart` | `None` | Resume from this checkpoint step |
+| `--gpu` | `0` | CUDA GPU ID; `-1` for CPU |
+| `--use_psts` | `True` | Enable pitch-shift / time-stretch augmentation |
+
+#### Available autoencoder configs
+
+| Config | Description |
+|---|---|
+| `AE_4096` | Spectral (STFT-based) codec, 16-dim latent, compression ratio 4096 |
+
+#### Export
+
+```bash
+after export_autoencoder --model_path autoencoder_runs/AE_model_name
+```
+
+This exports two TorchScript files into the run folder:
+- `export.ts` — offline inference
+- `export_stream.ts` — real-time streaming inference
+
+---
+
+### Step 3 — AFTER Diffusion Model
+
+#### Training
+
+```bash
+after train \
+  --name diff_model_name \
+  --db_path /dataset/path_latent \
+  --emb_model_path AE_model_run/export.ts \
+  --config audio
+```
+
+Multiple datasets can be combined with repeated `--db_path` or via `--db_folder`:
+
+```bash
+after train \
+  --name diff_model_name \
+  --db_folder /dataset/root \
+  --emb_model_path AE_model_run/export.ts \
+  --config audio_simdino
+```
+
+#### Key flags reference
+
+| Flag | Default | Description |
+|---|---|---|
+| `--name` | `test` | Model name |
+| `--config` | `[]` | Gin config file(s) — repeatable |
+| `--db_path` | `[]` | LMDB dataset path(s) — repeatable |
+| `--db_folder` | `None` | Folder whose sub-directories are each an LMDB dataset |
+| `--freqs` | `None` | Sampling frequencies for weighted multi-dataset sampling |
+| `--emb_model_path` | `None` | Path to the codec TorchScript model |
+| `--out_path` | `./after_runs` | Output path for logs and checkpoints |
+| `--restart` | `None` | Resume from this checkpoint step |
+| `--gpu` | `0` | GPU ID; `-1` for CPU |
+| `--n_signal` | `64` | Training length in latent steps |
+| `--use_cache` | `False` | Pre-load dataset into RAM |
+
+Logs and checkpoints are saved to `<out_path>/<name>/`.
+
+#### Available diffusion configs
+
+| Config | Structure input | Notes |
+|---|---|---|
+| `audio_simdino` | Audio | Audio-to-audio with SimDino SSL pre-training of the timbre encoder |
+| `midi_simdino` | MIDI | MIDI-to-audio with SimDino SSL pre-training |
+| `audio` | Audio | Simple audio-to-audio model |
+| `midi` | MIDI (piano roll) | Simple MIDI-to-audio model |
+
+Config files live in `after/diffusion/configs/`. We recommend using the SimDino configs by default. 
+
+Key global parameters (overridable via gin bindings):
+
+| Parameter | `audio` | `midi` | Description |
+|---|---|---|---|
+| `ZT_CHANNELS` | 6 | 6 | Timbre latent dimension |
+| `ZS_CHANNELS` | 8 | 64 | Structure latent dimension |
+| `LOCAL_ATTENTION_SIZE` | 8 | 8 | Local attention window |
+| `ADV_WEIGHT` | 0.35 / 0.5 | 0. | Adversarial loss weight |
+| `MAX_STEPS` | 1M | 1M | Total training steps |
+| `SSL_STEPS` | 100k | 50k | SimDino pre-training steps |
+
+---
+
+### Step 4 — Export for Real-time Inference
+
+#### Audio-to-audio model
+
+```bash
+after export \
+  --model_path after_runs/diff_model_name \
+  --emb_model_path AE_model_run/export_stream.ts
+```
+
+#### MIDI-to-audio model
+
+```bash
+after export_midi \
+  --model_path after_runs/diff_model_name \
+  --emb_model_path AE_model_run/export_stream.ts
+```
+
+> Always use the **streaming** codec (`export_stream.ts`) for export.
+
+#### Exported nn_tilde methods
+
+**Audio-to-audio** (`after export`):
+
+| Method | Inputs | Outputs | Description |
+|---|---|---|---|
+| `structure` | 1 audio | `ZS_CHANNELS` latent | Encode structure from audio |
+| `diffuse` | `ZS + ZT` latent | `ae_latents` latent | Diffusion from pre-encoded latents |
+| `diffuse_timbre` | 1 audio + `ZT` latent | `ae_latents` latent | Diffusion with audio structure input |
+| `diffuse_timbre_modulate` | 1 audio + `ZT` + `2×ZS` | `ae_latents` latent | Diffusion with structure modulation |
+| `generate` | `ZT + ZS` latent | 1 audio | Full generation (decode included) |
+| `generate_timbre` | 1 audio + `ZT` latent | 1 audio | Generate from audio structure and timbre latents |
+| `generate_timbre_modulate` | 1 audio + `ZT` + `2×ZS` | 1 audio | Generate with structure modulation |
+| `encode` | `ae_latents` latent | `ae_latents` latent | Passthrough encode via codec |
+| `decode` | `ae_latents` latent | 1 audio | Decode latents to audio |
+| `latent2map` | Timbre latent | 2D Map position | Project timbre to 2D map |
+| `map2latent` | 2D Map position | Timbre latent | Back-project 2D map to timbre |
+
+**Controllable attributes** (via `set_*` / `get_*` methods):
+
+| Attribute | Default | Description |
+|---|---|---|
+| `guidance_structure` | `1.0` | Classifier-free guidance strength on structure (0 = no influence of structure)|
+| `nb_steps` | `2` | Number of diffusion steps |
+
+---
 
 ## Inference
 
-You can experiment with inference in MaxMSP using the patches in `./patchs` and the pretrained models available [here](https://nubo.ircam.fr/index.php/s/8NFD5gWwbkT4G5P).
+You can experiment with inference in MaxMSP using the patches in `./after.m4l/` and the pretrained models available [here](https://nubo.ircam.fr/index.php/s/8NFD5gWwbkT4G5P).
 
-We also provide two Max4Live devices to use your models in Ableton Live. By default the export scripts trains a small network to remap the timbre latent space to a 2D map that can be used for latent exploration in our Max4Live device (see below). If you use multiple datasets, each dataset will correspond to one color on the latent map. The 2D map is used for coarse latent control, which you can refine by directly changing the latent dimensions. Make sure to download the .ts file along with .png latent map created with the export script.
+We provide two Max4Live devices to use your models in Ableton Live. The export script trains a small network to remap the timbre latent space to a 2D map for latent exploration. If you use multiple datasets, each dataset will correspond to one color on the latent map. Make sure to download both the `.ts` file and the `.png` latent map created by the export script.
 
 <p align="center">
   <img src="docs/after_midi.png" />
@@ -133,36 +266,23 @@ We also provide two Max4Live devices to use your models in Ableton Live. By defa
   <img src="docs/after_audio.png" />
 </p>
 
+---
 
-<!-- ### MIDI-to-Audio 
+## Notebooks
 
-Our MIDI-to-audio model is a 4-voice polyphonic synthesizer that produces audio for pitch and velocity, as well as a timbre target in two modes:
-- **Audio-based**: Using the `forward` method, AFTER extracts timbre from an audio stream (with a 3 seconds receptive field). We’ve included audio samples from the training set in the repository.
-- **Manual exploration**: The `forward_manual` method lets you explore timbre with 8 sliders, which set a position in a learned 8-dimensional timbre space.
+| Notebook | Description |
+|---|---|
+| `notebooks/audio_to_audio_demo.ipynb` | Interactive audio-to-audio inference |
+| `notebooks/midi_to_audio_demo.ipynb` | Interactive MIDI-to-audio inference |
+| `notebooks/inspect_dataset_augmentations.ipynb` | Preview the dataset features |
 
-The guidance parameter sets the conditioning strength on the MIDI input, and diffusion steps can be adjusted to improve generation quality (at a higher CPU cost).
-
-Download our instrumental model trained on the [SLAKH](http://www.slakh.com/) dataset [here](https://nubo.ircam.fr/index.php/s/tHMmFmkF6kgn7ND/download).
-
-Audio Timbre Target           |  Manual Timbre Control
-:-------------------------:|:-------------------------:
-<img src="docs/midi_to_audio.png"   height="500"/>| <img src="docs/midi_to_audio_manual.png"  height="500"/>
-
-
-
-### Audio-to-Audio 
-
-In audio-to-audio mode, AFTER extracts the time-varying features from one audio stream and applies them to the timbre of a second audio source. The guidance parameter controls the conditioning strength on the structure input, and the diffusion steps improve generation quality with more CPU load.
-
-Download our instrumental model trained on the [SLAKH](http://www.slakh.com/) dataset [here](https://nubo.ircam.fr/index.php/s/NCHZ5Q9aMsFxmyp/download).
-
-<img src="docs/audio_to_audio.png"  height="500"/> -->
+---
 
 ## Artistic Applications
 
 AFTER has been applied in several projects:
 - [_The Call_](https://www.serpentinegalleries.org/whats-on/holly-herndon-mat-dryhurst-the-call/) by Holly Herndon and Mat Dryhurst, an interactive sound installation with singing voice transfer, at Serpentine Gallery in London until February 2, 2025.
-- A live performance by French electronic artist Canblaster for Forum Studio Session at IRCAM. The full concert is available on [YouTube](https://www.youtube.com/watch?v=0E9nNyz4pv4).
+- A live performance by French electronic artist Canblaster for Forum Studio Session at IRCAM and later on at Gaité Lyrique for Marathon Festival. The full concert is available on [YouTube](https://www.youtube.com/watch?v=0E9nNyz4pv4).
 - [Nature Manifesto](https://www.centrepompidou.fr/fr/programme/agenda/evenement/dkTTgJv), an immersive sound installation by Björk and Robin Meier, at Centre Pompidou in Paris from November 20 to December 9, 2024.
 
 We look forward to seeing new projects and creative uses of AFTER.

@@ -1,323 +1,150 @@
+"""
+Export autoencoder to nn_tilde .ts format.
+Supports both spectral (AE2D) and PQMF (SimpleNetsStream) architectures.
+Based on acids_codecs/export.py.
+"""
 import nn_tilde
 import torch
 import cached_conv as cc
-from after.autoencoder import AutoEncoder
-
 import gin
 from absl import app, flags
 import os
+import numpy as np
+import torch.nn.functional as F
+from after.autoencoder.networks.SimpleNet2D import AutoEncoder2D
 
 FLAGS = flags.FLAGS
 
 flags.DEFINE_integer("step", None, "Step to load the model from")
-flags.DEFINE_string("model_path", None, "Path of the trained model")
+flags.DEFINE_string("model_path", None, "Path of the trained model directory")
 
 
-class AE_notcausal(nn_tilde.Module):
+def _load_checkpoint(model_path, step):
+    if step is None:
+        steps = [
+            int(f.replace("checkpoint", "")[:-3])
+            for f in os.listdir(model_path)
+            if f.startswith("checkpoint") and f.endswith(".pt")
+        ]
+        step = max(steps)
+    ckpt = os.path.join(model_path, f"checkpoint{step}.pt")
+    print(f"Loading checkpoint: {ckpt}")
+    return torch.load(ckpt, map_location="cpu"), step
 
-    def __init__(self) -> None:
+
+# ─── Spectral (AE2D) wrapper ──────────────────────────────────────────────────
+class AE_Spectral(nn_tilde.Module):
+
+    def __init__(self, ckpt: str, latent_mean=None, latent_pca=None) -> None:
         super().__init__()
 
-        sr = gin.query_parameter("%SR")
-
-        config = os.path.join(FLAGS.model_path, "config.gin")
-
-        with gin.unlock_config():
-            gin.parse_config_files_and_bindings(
-                [config],
-                [],
-            )
-
-        model = AutoEncoder()
-
-        if FLAGS.step is None:
-            files = os.listdir(FLAGS.model_path)
-            files = [f for f in files if f.startswith("checkpoint")]
-            steps = [f.replace("checkpoint", "")[:-3] for f in files]
-            step = max([int(s) for s in steps])
-            checkpoint_file = "checkpoint" + str(step) + ".pt"
-        else:
-            checkpoint_file = "checkpoint" + str(FLAGS.step) + ".pt"
-
-        print("Export using : ", checkpoint_file)
-
-        d = torch.load(os.path.join(FLAGS.model_path, checkpoint_file))
-
+        model = AutoEncoder2D()
+        d = torch.load(ckpt, map_location="cpu")
         model.load_state_dict(d["model_state"], strict=False)
+        self.model = model.eval()
 
-        self.model = model
+        audio_channels = model.audio_channels
+        latent_size = gin.query_parameter("%LATENT_SIZE")
 
-        test_array = torch.zeros((3, 1, 131072))
-        z, _ = self.model.encode(test_array)
-        y = self.model.decode(z)
+        # Determine compression ratio from a forward pass
+        test = torch.zeros(1, audio_channels, 131072)
+        with torch.no_grad():
+            z = self.model.encode_stream(test)
+        self.comp_ratio = test.shape[-1] // z.shape[-1]
 
-        assert test_array.shape[-1] == y.shape[-1]
+        self.register_buffer("latent_pca", latent_pca)
+        self.register_buffer("latent_mean", latent_mean)
 
-        self.comp_ratio = test_array.shape[-1] // z.shape[-1]
-        self.n_fade = 4
+        in_labels = [f"(signal) Input {i+1}" for i in range(audio_channels)]
+        out_labels = [f"(signal) Channel {i+1}" for i in range(audio_channels)]
+        lat_in_labels = [f"(signal) Latent {i}" for i in range(latent_size)]
+        lat_out_labels = [f"Latent {i}" for i in range(latent_size)]
 
-        self.latent_size = gin.query_parameter("%LATENT_SIZE")
-        self.target_channels = 1
-
-        self.register_buffer("out_buffer",
-                             torch.zeros(4, 1, self.comp_ratio * self.n_fade))
-        self.register_buffer("z_buffer",
-                             torch.zeros(4, self.latent_size, self.n_fade))
-
-        self.register_method(
-            "encode",
-            in_channels=self.target_channels,
-            in_ratio=1,
-            out_channels=self.latent_size,
-            out_ratio=self.comp_ratio,
-            input_labels=['(signal) input 1'],
-            output_labels=[f"latent {i}" for i in range(self.latent_size)],
-            test_buffer_size=self.comp_ratio,
-        )
+        self.register_method("encode",
+                             in_channels=audio_channels,
+                             in_ratio=1,
+                             out_channels=latent_size,
+                             out_ratio=self.comp_ratio,
+                             input_labels=in_labels,
+                             output_labels=lat_out_labels,
+                             test_buffer_size=self.comp_ratio)
 
         self.register_method("decode",
-                             in_channels=self.latent_size,
+                             in_channels=latent_size,
                              in_ratio=self.comp_ratio,
-                             out_channels=self.target_channels,
+                             out_channels=audio_channels,
                              out_ratio=1,
-                             input_labels=[
-                                 f'(signal) Latent dimension {i+1}'
-                                 for i in range(self.latent_size)
-                             ],
-                             output_labels=[
-                                 '(signal) Channel %d' % d
-                                 for d in range(1, self.target_channels + 1)
-                             ])
+                             input_labels=lat_in_labels,
+                             output_labels=out_labels,
+                             test_buffer_size=self.comp_ratio)
 
         self.register_method("forward",
-                             in_channels=1,
+                             in_channels=audio_channels,
                              in_ratio=1,
-                             out_channels=1,
+                             out_channels=audio_channels,
                              out_ratio=1,
-                             input_labels=['(signal) input 1'],
-                             output_labels=[
-                                 '(signal) Channel %d' % d
-                                 for d in range(1, self.target_channels + 1)
-                             ])
+                             input_labels=in_labels,
+                             output_labels=out_labels,
+                             test_buffer_size=self.comp_ratio)
 
-    @torch.jit.export
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.model.use_pqmf:
-            x = self.model.pqmf(x)
+    def _post_process_latent(self, z):
+        z = z - self.latent_mean.unsqueeze(-1)
+        return F.conv1d(z, self.latent_pca.unsqueeze(-1))
 
-        z = self.model.encoder(x)
-
-        z, _ = self.model.bottleneck(z)
-
-        x = self.model.decoder(z)
-
-        if self.model.use_pqmf:
-            x = self.model.pqmf.inverse(x)
-
-        return x
+    def _pre_process_latent(self, z):
+        z = F.conv1d(z, self.latent_pca.T.unsqueeze(-1))
+        return z + self.latent_mean.unsqueeze(-1)
 
     @torch.jit.export
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        if self.model.use_pqmf:
-            x = self.model.pqmf(x)
-        z = self.model.encoder(x)
-        z, _ = self.model.bottleneck(z)
-
+        z = self.model.encode_stream(x)
+        if self.latent_pca is not None:
+            z = self._post_process_latent(z)
         return z
 
     @torch.jit.export
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-
-        n = z.shape[0]
-
-        z = torch.cat((self.z_buffer[:n], z), -1)
-
-        x = self.model.decoder(z)
-        if self.model.use_pqmf:
-            x = self.model.pqmf.inverse(x)
-
-        self.z_buffer[:n] = z[:n, :, -self.n_fade:].clone()
-
-        alpha = torch.linspace(0, 1,
-                               self.n_fade * self.comp_ratio)[None,
-                                                              None, :].to(x)
-
-        x[..., :self.comp_ratio *
-          self.n_fade] = (1 - alpha) * self.out_buffer[:n].to(x) + alpha * x[
-              ..., :self.comp_ratio * self.n_fade]
-
-        self.out_buffer[:n] = x[:n, :, -self.comp_ratio * self.n_fade:].clone()
-
-        x = x[..., :-self.comp_ratio * self.n_fade]
-
-        return x
-
-
-class AE_causal(nn_tilde.Module):
-
-    def __init__(self) -> None:
-        super().__init__()
-
-        sr = gin.query_parameter("%SR")
-
-        config = os.path.join(FLAGS.model_path, "config.gin")
-        with gin.unlock_config():
-            gin.parse_config_files_and_bindings(
-                [config],
-                [],
-            )
-
-        model = AutoEncoder()
-
-        if FLAGS.step is None:
-            files = os.listdir(FLAGS.model_path)
-            files = [f for f in files if f.startswith("checkpoint")]
-            steps = [f.replace("checkpoint", "")[:-3] for f in files]
-            step = max([int(s) for s in steps])
-            checkpoint_file = "checkpoint" + str(step) + ".pt"
-        else:
-            checkpoint_file = "checkpoint" + str(FLAGS.step) + ".pt"
-
-        print("Export using : ", checkpoint_file)
-
-        d = torch.load(os.path.join(FLAGS.model_path, checkpoint_file))
-
-        model.load_state_dict(d["model_state"], strict=False)
-
-        self.model = model
-
-        test_array = torch.zeros((3, 1, 131072))
-        z, _ = self.model.encode(test_array)
-        y = self.model.decode(z)
-        assert test_array.shape[-1] == y.shape[-1]
-
-        self.comp_ratio = test_array.shape[-1] // z.shape[-1]
-
-        self.latent_size = gin.query_parameter("%LATENT_SIZE")
-        self.target_channels = 1
-
-        self.register_method(
-            "encode",
-            in_channels=self.target_channels,
-            in_ratio=1,
-            out_channels=self.latent_size,
-            out_ratio=self.comp_ratio,
-            input_labels=['(signal) input 1'],
-            output_labels=[f"latent {i}" for i in range(self.latent_size)],
-            test_buffer_size=self.comp_ratio,
-        )
-
-        self.register_method("decode",
-                             in_channels=self.latent_size,
-                             in_ratio=self.comp_ratio,
-                             out_channels=self.target_channels,
-                             out_ratio=1,
-                             input_labels=[
-                                 f'(signal) Latent dimension {i+1}'
-                                 for i in range(self.latent_size)
-                             ],
-                             output_labels=[
-                                 '(signal) Channel %d' % d
-                                 for d in range(1, self.target_channels + 1)
-                             ])
-
-        self.register_method("forward",
-                             in_channels=1,
-                             in_ratio=1,
-                             out_channels=1,
-                             out_ratio=1,
-                             input_labels=['(signal) input 1'],
-                             output_labels=[
-                                 '(signal) Channel %d' % d
-                                 for d in range(1, self.target_channels + 1)
-                             ])
+        if self.latent_pca is not None:
+            z = self._pre_process_latent(z)
+        return self.model.decode_stream(z)
 
     @torch.jit.export
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.model.use_pqmf:
-            x = self.model.pqmf(x)
+        return self.decode(self.encode(x))
 
-        z = self.model.encoder(x)
 
-        z, _ = self.model.bottleneck(z)
-
-        x = self.model.decoder(z)
-
-        if self.model.use_pqmf:
-            x = self.model.pqmf.inverse(x)
-
-        return x
-
-    @torch.jit.export
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        if self.model.use_pqmf:
-            x = self.model.pqmf(x)
-        z = self.model.encoder(x)
-        z, _ = self.model.bottleneck(z)
-
-        return z
-
-    @torch.jit.export
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        x = self.model.decoder(z)
-        if self.model.use_pqmf:
-            x = self.model.pqmf.inverse(x)
-        return x
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 
 def main(argv):
+    model_path = FLAGS.model_path
+    config = os.path.join(model_path, "config.gin")
 
-    config = os.path.join(FLAGS.model_path, "config.gin")
+    gin.parse_config_files_and_bindings([config], [])
 
-    with gin.unlock_config():
-        gin.parse_config_files_and_bindings(
-            [config],
-            [],
-        )
-    try:
-        is_causal = gin.query_parameter("convs.get_padding.mode") == "causal"
-    except Exception as e:
-        print("Error in gin query: ", e)
-        print("This is normal if your model is not causal")
-        is_causal = False
+    d, step = _load_checkpoint(model_path, FLAGS.step)
+    ckpt = os.path.join(model_path, f"checkpoint{step}.pt")
 
-    print("is causal: ", is_causal)
-
+    # ── Offline export ──
     cc.use_cached_conv(False)
-    ae = AE_causal()
-    test_array = torch.zeros((3, 1, 131072))
-    z = ae.encode(test_array)
-    x = ae.decode(z)
-    ae.export_to_ts(os.path.join(FLAGS.model_path, "export.ts"))
+    with gin.unlock_config():
+        gin.bind_parameter("audio.StreamableSTFT.stream", False)
 
-    if is_causal:
-        gin.bind_parameter("SimpleNetsStream.CachedGroupNorm.stream", True)
-        cc.use_cached_conv(True)
-        ae_stream = AE_causal()
+    ae = AE_Spectral(ckpt=ckpt)
 
-        test_array = torch.zeros((3, 1, 131072))
-        z = ae_stream.encode(test_array)
-        x = ae_stream.decode(z)
+    path_offline = os.path.join(model_path, "export.ts")
+    ae.export_to_ts(path_offline)
+    print(f"Exported offline model to {path_offline}")
 
-        ae_stream.export_to_ts(
-            os.path.join(FLAGS.model_path, "export_stream.ts"))
-        print("Success !")
+    # ── Streaming export ──
+    cc.use_cached_conv(True)
+    with gin.unlock_config():
+        gin.bind_parameter("audio.StreamableSTFT.stream", True)
+    ae_stream = AE_Spectral(ckpt=ckpt)
 
-    else:
-        gin.bind_parameter("SimpleNetsStream.CachedGroupNorm.stream", True)
-        cc.use_cached_conv(True)
-        ae_encode = AE_notcausal()
-        cc.use_cached_conv(False)
-        ae_stream = AE_notcausal()
-        ae_stream.model.encoder = ae_encode.model.encoder
-
-        test_array = torch.zeros((3, 1, 131072))
-        z = ae_stream.encode(test_array)
-        x = ae_stream.decode(z)
-
-        ae_stream.export_to_ts(
-            os.path.join(FLAGS.model_path, "export_stream.ts"))
-        print("Success !")
+    path_stream = os.path.join(model_path, "export_stream.ts")
+    ae_stream.export_to_ts(path_stream)
+    print(f"Exported streaming model to {path_stream}")
 
 
 if __name__ == "__main__":

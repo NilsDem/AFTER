@@ -14,13 +14,17 @@ from einops import reduce, rearrange
 import warnings
 # from utils import KoLeoLoss
 import math
-from evaluation import linear_probe_torch, plot_embeddings, knn_classify
+from .evaluation import linear_probe_torch, plot_embeddings, knn_classify
 
 
 @gin.configurable
 class Base(nn.Module):
 
-    def __init__(self, data_transform, projection_head, encoder, device):
+    def __init__(self,
+                 data_transform=None,
+                 projection_head=None,
+                 encoder=None,
+                 device="cpu"):
         super().__init__()
         self.data_transform = data_transform(
             device=device) if data_transform is not None else None
@@ -89,11 +93,12 @@ class Base(nn.Module):
         steps_save: int,
         model_dir: str,
         max_steps: int,
+        logger: Optional[SummaryWriter] = None,
     ):
 
         self.init_train(lr=lr)
 
-        if restart_step > 0:
+        if restart_step is not None:
             state_dict = torch.load(f"{model_dir}/checkpoint" +
                                     str(restart_step) + ".pt",
                                     map_location="cpu")
@@ -107,7 +112,8 @@ class Base(nn.Module):
 
             print("Restarting from step ", self.step)
 
-        logger = SummaryWriter(log_dir=model_dir + "/logs")
+        logger = SummaryWriter(log_dir=model_dir +
+                               "/logs") if logger is None else logger
         self.tepoch = tqdm(total=max_steps, unit="batch")
         self.max_steps = max_steps
 
@@ -130,53 +136,67 @@ class Base(nn.Module):
                 if self.step % steps_display == 0:
                     self.tepoch.set_postfix(loss=losses_sum["total_loss"] /
                                             steps_display)
-                    logger.add_scalar('current_lr',
-                                      self.opt.param_groups[0]['lr'],
-                                      global_step=self.step)
                     for k in losses_sum:
 
-                        logger.add_scalar(k,
+                        logger.add_scalar("Training/" + k,
                                           losses_sum[k] /
                                           max(1, losses_sum_count[k]),
                                           global_step=self.step)
                         losses_sum[k] = 0.
                         losses_sum_count[k] = 0
 
-                if (self.step) % steps_valid == 0:
-                    print("Validation step")
+                # if (self.step) % steps_valid == 0:
+                #     print("Validation step")
 
-                    self.eval()
-                    with torch.no_grad():
-                        allemb, alllabels = [], []
-                        for batch in dataloader:
-                            batch = self.prep_data(batch)
-                            z, _, _, _, _, labels = batch
-                            emb = self.student(z)
-                            allemb.append(emb.cpu())
-                            alllabels.extend(labels)
-                            if len(alllabels) > 5000:
-                                break
-                        allemb = torch.cat(allemb, 0)
+                #     self.eval()
+                #     with torch.no_grad():
+                #         allemb, alllabels = [], []
+                #         for batch in dataloader:
+                #             batch = self.prep_data(batch)
+                #             z, _, _, _, _, labels = batch
+                #             emb = self.student(z)
+                #             allemb.append(emb.cpu())
+                #             alllabels.extend(labels)
+                #             if len(alllabels) > 5000:
+                #                 break
+                #         allemb = torch.cat(allemb, 0)
 
-                    from collections import Counter
+                #
+                # counts = Counter(alllabels)
 
-                    print(len(alllabels))
-                    counts = Counter(alllabels)
-                    for label, count in counts.items():
-                        print(f"{label}: {count}")
+                # allemb = torch.nan_to_num(allemb, nan=0.)
 
-                    allemb = torch.nan_to_num(allemb, nan=0.)
-                    f = plot_embeddings(emb=allemb.numpy(), labels=alllabels)
-                    logger.add_figure("UMAP of Embs", f, global_step=self.step)
+                # # keep only labels with at least 2 samples
+                # valid_labels = {
+                #     label
+                #     for label, count in counts.items() if count > 2
+                # }
 
-                    _, _, knn_accuracy = knn_classify(allemb,
-                                                      alllabels,
-                                                      k=5,
-                                                      test_size=0.2,
-                                                      random_state=42)
-                    logger.add_scalar("knn_classification",
-                                      knn_accuracy,
-                                      global_step=self.step)
+                # # filter labels + embeddings together
+                # filtered_labels = []
+                # filtered_emb = []
+
+                # for label, emb in zip(alllabels, allemb):
+                #     if label in valid_labels:
+                #         filtered_labels.append(label)
+                #         filtered_emb.append(emb)
+
+                # # convert back to tensor
+                # filtered_emb = torch.stack(filtered_emb)
+
+                # f = plot_embeddings(emb=filtered_emb.numpy(),
+                #                     labels=filtered_labels)
+
+                # logger.add_figure("UMAP of Embs", f, global_step=self.step)
+
+                # _, _, knn_accuracy = knn_classify(filtered_emb,
+                #                                   filtered_labels,
+                #                                   k=5,
+                #                                   test_size=0.2,
+                #                                   random_state=42)
+                # logger.add_scalar("knn_classification",
+                #                   knn_accuracy,
+                #                   global_step=self.step)
                     self.train()
 
                 if self.step % steps_save == 0:
@@ -184,6 +204,8 @@ class Base(nn.Module):
 
                 self.tepoch.update(1)
                 self.step += 1
+                if self.step > max_steps:
+                    break
 
 
 from info_nce import InfoNCE
@@ -506,8 +528,6 @@ class MCRLoss(nn.Module):
 class SimDino(Base):
 
     def __init__(self,
-                 data_transform,
-                 projection_head,
                  encoder,
                  device,
                  model_start_ema,
@@ -516,7 +536,7 @@ class SimDino(Base):
                  reg_weight,
                  cosine_space,
                  ac_regularisation=False):
-        super().__init__(data_transform, projection_head, encoder, device)
+        super().__init__(encoder=encoder, device=device)
         self.model_start_ema = self.model_ema = model_start_ema
         self.model_end_ema = model_end_ema
         self.koleo_weight = koleo_weight
@@ -524,8 +544,6 @@ class SimDino(Base):
         self.reg_weight = reg_weight
         self.student = encoder()
         self.teacher = encoder()
-        self.projection_head_student = projection_head()
-        self.projection_head_teacher = projection_head()
 
         for p, p_m in zip(self.student.parameters(),
                           self.teacher.parameters()):
@@ -564,11 +582,8 @@ class SimDino(Base):
     def training_step(self, batch):
 
         _, global_views, local_views, nglobal, nlocal, _ = batch
-
         with torch.no_grad():
             teacher_output = self.teacher(global_views)
-            teacher_output = self.projection_head_teacher(
-                teacher_output).detach()
 
         student_output_global = self.student(global_views)
         student_output_local = self.student(local_views)
@@ -576,11 +591,8 @@ class SimDino(Base):
         student_output = torch.cat(
             [student_output_global, student_output_local], 0)
 
-        student_output = self.projection_head_student(student_output)
-
         comp_loss, expa_loss = self.simloss(student_output, teacher_output,
                                             nglobal, nlocal)
-
 
         if self.ac_regularisation:
             reg = (torch.nn.functional.relu((abs(student_output) - 3))).mean()
@@ -599,8 +611,8 @@ class SimDino(Base):
             "total_loss": total_loss.item(),
             "distillation_loss": comp_loss.item(),
             "koleo_loss": expa_loss.item(),
-            "regularisation_loss": reg.item(),
-            "koleo_weight": self.koleo_weight,
+            # "regularisation_loss": reg.item(),
+            # "koleo_weight": self.koleo_weight,
             #"cosine_loss": cosine_loss.item(),
             "model_ema": self.model_ema,
         }

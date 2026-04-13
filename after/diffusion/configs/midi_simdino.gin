@@ -7,13 +7,13 @@ from after import encoder_ssl
 IN_SIZE = None
 N_SIGNAL = None
 
-ZS_CHANNELS = 8
+ZS_CHANNELS = 64
 ZT_CHANNELS_FULL = 64
 ZT_CHANNELS = 6
 
 SR = 44100
 STRUCTURE_TYPE = "midi"
-SSL_STEPS = 100000
+SSL_STEPS = 50000
 MAX_STEPS = 1000000
 SHUFFLE = None
 
@@ -21,10 +21,14 @@ LOCAL_ATTENTION_SIZE = 8
 ATTENTION_CHUNK_SIZE = 1
 
 # Data
-diffusion.utils.collate_fn:
+diffusion.utils.get_datasets:
+    db_list = None
+    emb_model_path = None
+
+diffusion.utils.collate_fn_after:
     n_signal = %N_SIGNAL
     structure_type = %STRUCTURE_TYPE
-    compress_midi = 4
+    compress_tc = 4
     shift_tc = 1
 
 ### ARCHITECTURE ### 
@@ -43,6 +47,7 @@ encoder/diffusion.networks.ecapa_encoder.ECAPATDNN:
     spherical_normalisation = True
     use_tanh = False
     regularisation = "none"
+
 
 diffusion.networks.LinearEncoder:
     in_size=64
@@ -99,13 +104,13 @@ diffusion.model.Base.fit:
     ## Adversarial
     timbre_warmup = %SSL_STEPS
     adversarial_weight = 0.
-    adversarial_warmup = 0
+    adversarial_warmup = 1
 
     drop_targets = [0]
 
     # Noise augmentation to smooth the latent space
-    zsem_noise_aug = 0.
-    time_cond_noise_aug = 0.
+    timbre_noise_aug = 0.
+    structure_noise_aug = 0.
 
     ## Encoder regularisation
     regularisation_weight_cond = 0.0002
@@ -130,7 +135,7 @@ encoder_ssl.model.SimDino:
 
 encoder_ssl.model.Base.fit:
     lr = 1e-4
-    steps_display = 100
+    steps_display = 200
     steps_valid = 5000
-    steps_save = 10000
+    steps_save = 25000
     max_steps = %SSL_STEPS

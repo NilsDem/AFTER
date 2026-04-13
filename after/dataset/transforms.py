@@ -410,7 +410,7 @@ class AudioDescriptors(BaseTransform):
 
 class BasicPitchPytorch(BaseTransform):
 
-    def __init__(self, sr, device="cpu") -> None:
+    def __init__(self, sr, device="cpu", batch_size=64) -> None:
         super().__init__(sr, "basic_pitch")
 
         self.pt_model = BasicPitchTorch()
@@ -422,6 +422,7 @@ class BasicPitchPytorch(BaseTransform):
         self.pt_model.eval()
         self.pt_model.to(device)
         self.device = device
+        self.batch_size = batch_size
 
     @torch.no_grad()
     def __call__(self, waveform, params_bp={}):
@@ -439,6 +440,7 @@ class BasicPitchPytorch(BaseTransform):
                 _, midi_data, _ = predict(model=self.pt_model,
                                           audio=wave.squeeze().cpu(),
                                           device=self.device,
+                                          batch_size=self.batch_size,
                                           **params_bp)
                 results.append(midi_data)
             return results
@@ -446,6 +448,7 @@ class BasicPitchPytorch(BaseTransform):
             _, midi_data, _ = predict(model=self.pt_model,
                                       audio=waveform.squeeze().cpu(),
                                       device=self.device,
+                                      batch_size=self.batch_size,
                                       **params_bp)
             return midi_data
 

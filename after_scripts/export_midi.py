@@ -4,9 +4,11 @@ import torch
 
 import argparse
 import os
+import pathlib
 from after.diffusion import RectifiedFlow
 from after.dataset import CombinedDataset
 from after.diffusion.latent_plot import prepare_training, train_autoencoder, generate_plot
+
 torch.jit.optimized_execution(False)
 torch.set_grad_enabled(False)
 
@@ -21,13 +23,15 @@ parser = argparse.ArgumentParser()
 FLAGS = flags.FLAGS
 # Flags definition
 flags.DEFINE_string("model_path",
-                    default="./after_runs/test",
+                    default=None,
                     help="Name of the experiment folder")
-flags.DEFINE_integer("step", default=None, help="Step number of checkpoint")
+flags.DEFINE_integer(
+    "step",
+    default=None,
+    help="Step number of checkpoint - defaults to last available")
 flags.DEFINE_string("emb_model_path",
-                    default="./pretrained/test.ts",
-                    help="Path to audio codec")
-flags.DEFINE_integer("chunk_size", default=1, help="Chunk size")
+                    default=None,
+                    help="Path to the codec - use streamable version")
 flags.DEFINE_integer("n_poly", default=8, help="Number of polyphonic voices")
 flags.DEFINE_bool("latent_project",
                   default=True,
@@ -37,25 +41,47 @@ flags.DEFINE_float(
     default=1.0,
     help="Scale the latent space visualisation to [-latent_range, latent_range]"
 )
-flags.DEFINE_string("label_mode",
-                    default="dataset",
-                    help="Mode for labeling data")
+flags.DEFINE_string(
+    "label_mode",
+    default="dataset",
+    help=
+    "Mode for labeling data and color the map. Chose( between 'dataset' for multi dataset and 'file' when using meaningful file names."
+)
 
 flags.DEFINE_integer("num_steps",
                      default=20000,
-                     help="Number of steps to build the map")
+                     help="Number of steps to train the AE map model")
 
-flags.DEFINE_integer("num_examples",
-                     default=None,
-                     help="Number of steps to build the map")
+flags.DEFINE_integer(
+    "num_examples",
+    default=None,
+    help=
+    "Number of sampled examples to build the map - defaults to full dataset")
 
-flags.DEFINE_string("ae_mode",
-                    default="lambert",
-                    help="Number of steps to build the map")
+flags.DEFINE_string(
+    "ae_mode",
+    default="linear",
+    help=
+    "Default organisation of the map (linear, spherical, lambert). Spherical and lambert are mapped on to a sphere and with (polar/lambert) coordinates respectively, linear is a simple 2D map."
+)
 
 flags.DEFINE_bool("reload_embeddings",
                   default=False,
-                  help="Reload precomputed embeddings if available")
+                  help="Reload precomputed timbre embeddings if available")
+
+flags.DEFINE_multi_string(
+    "db_path",
+    default=[],
+    help=
+    "Dataset path(s) for the latent map. Overrides the db_list from the config when provided."
+)
+
+flags.DEFINE_string(
+    "db_folder",
+    default=None,
+    help=
+    "Folder whose sub-directories are each an LMDB dataset. Merged with --db_path entries."
+)
 
 
 class DummyIdentity(nn.Module):
@@ -71,10 +97,11 @@ class DummyIdentity(nn.Module):
 
     def forward_stream(self, x: torch.Tensor):
         return x
+
     def encode(self, x: torch.Tensor):
         return x
 
-    def decode  (self, x: torch.Tensor):
+    def decode(self, x: torch.Tensor):
         return x
 
 
@@ -100,14 +127,32 @@ def main(argv):
                             "after.midi." + folder.split("/")[-1] + ".ts")
     # Parse config
     gin.parse_config_file(config)
-    SR = gin.query_parameter("%SR")
 
+    # Resolve codec path
+    emb_model_path = FLAGS.emb_model_path
+    if emb_model_path is None:
+        trained_path = gin.query_parameter(
+            "diffusion.utils.get_datasets.emb_model_path")
+        if not trained_path:
+            raise RuntimeError(
+                "No --emb_model_path provided and none saved in config.\n"
+                "Re-run training or pass --emb_model_path.")
+        stream_path = str(
+            pathlib.Path(trained_path).with_stem(
+                pathlib.Path(trained_path).stem + "_stream"))
+        if os.path.exists(stream_path):
+            emb_model_path = stream_path
+            print(f"Using streaming codec: {emb_model_path}")
+        else:
+            raise FileNotFoundError(
+                f"Streaming codec not found at '{stream_path}'.\n"
+                f"Please provide one explicitly with --emb_model_path.")
+
+    # ENABLE THE CACHE SYSTEM
     with gin.unlock_config():
-        cache_size = gin.query_parameter("%LOCAL_ATTENTION_SIZE")
-        gin.bind_parameter("transformerv2.DenoiserV2.max_cache_size",
-                           cache_size)
-        gin.bind_parameter("transformerv2.DenoiserV2.max_diffusion_steps", 8)
-        gin.bind_parameter("transformerv2.DenoiserV2.max_batch_size", 8)
+        gin.bind_parameter("transformerv2.DenoiserV2.streaming", True)
+        gin.bind_parameter("transformerv2.DenoiserV2.max_diffusion_steps", 12)
+        gin.bind_parameter("transformerv2.DenoiserV2.max_batch_size", 4)
 
     # Instantiate model
     blender = RectifiedFlow()
@@ -117,7 +162,6 @@ def main(argv):
     blender.load_state_dict(state_dict, strict=False)
 
     # Emb model
-    # Send to device
     blender = blender.eval()
 
     # Get some parameters
@@ -125,12 +169,25 @@ def main(argv):
     n_signal_timbre = gin.query_parameter('%N_SIGNAL')
     zt_channels = gin.query_parameter("%ZT_CHANNELS")
     ae_latents = gin.query_parameter("%IN_SIZE")
+    model_chunk_size = gin.query_parameter("%ATTENTION_CHUNK_SIZE")
 
     ### GENERATE EMBEDDING PLOT ###
     if FLAGS.latent_project:
 
         try:
-            path_dict = gin.query_parameter("utils.get_datasets.path_dict")
+            if FLAGS.db_path or FLAGS.db_folder:
+                db_list = list(FLAGS.db_path)
+                if FLAGS.db_folder is not None:
+                    subdirs = sorted([
+                        str(p)
+                        for p in pathlib.Path(FLAGS.db_folder).iterdir()
+                        if p.is_dir()
+                    ])
+                    db_list += subdirs
+            else:
+                db_list = gin.query_parameter(
+                    "diffusion.utils.get_datasets.db_list")
+            path_dict = {k: {"path": k, "name": k} for k in db_list}
             dataset = CombinedDataset(path_dict=path_dict,
                                       keys=["z", "metadata"])
 
@@ -192,12 +249,8 @@ def main(argv):
             if blender.encoder_time is not None:
                 print("Using Encoder time")
                 self.encoder_time = blender.encoder_time
-                try:
-                    self.time_cond_ratio = gin.query_parameter(
-                        "utils.collate_fn_new.compress_midi")
-                except:
-                    self.time_cond_ratio = gin.query_parameter(
-                        "utils.collate_fn.compress_midi")
+                self.time_cond_ratio = gin.query_parameter(
+                    "utils.collate_fn_after.compress_tc")
                 print("Time cond ratio : ", self.time_cond_ratio)
             else:
                 self.encoder_time = DummyIdentity()
@@ -206,11 +259,11 @@ def main(argv):
 
             self.n_signal = n_signal
             self.n_signal_timbre = n_signal_timbre
-            self.chunk_size = FLAGS.chunk_size
+            self.chunk_size = model_chunk_size
             self.n_poly = FLAGS.n_poly
             self.zt_channels = zt_channels
             self.ae_latents = ae_latents
-            self.emb_model_timbre = torch.jit.load(FLAGS.emb_model_path).eval()
+            self.emb_model_timbre = torch.jit.load(emb_model_path).eval()
 
             self.drop_value = blender.drop_value
 
@@ -317,7 +370,7 @@ def main(argv):
         @property
         def device(self):
             return self._device_tracker.device
-        
+
         @torch.jit.export
         def get_guidance_structure(self) -> float:
             return self.guidance_structure[0]
@@ -387,8 +440,7 @@ def main(argv):
                         t] = v_active  #torch.maximum(piano_roll[b, p_active, t],
                     #v_active)
             return piano_roll
-        
-        
+
         def model_forward(self, x: torch.Tensor, time: torch.Tensor,
                           cond: torch.Tensor, time_cond: torch.Tensor,
                           cache_index: int) -> torch.Tensor:
@@ -402,14 +454,14 @@ def main(argv):
                 return dx
 
             else:
-                dx = self.net(x.repeat(2),
-                            time=time.repeat(2, 1, 1),
-                            cond=cond.repeat(2,1),
-                            time_cond=torch.cat([
-                                     time_cond,
-                                     self.drop_value * torch.ones_like(time_cond),
-                                    ]),
-                            cache_index=cache_index)
+                dx = self.net(x.repeat(2, 1, 1),
+                              time=time.repeat(2, 1, 1),
+                              cond=cond.repeat(2, 1),
+                              time_cond=torch.cat([
+                                  time_cond,
+                                  self.drop_value * torch.ones_like(time_cond),
+                              ]),
+                              cache_index=cache_index)
 
                 dx_full, dx_none = torch.chunk(dx, 2, dim=0)
 
@@ -419,17 +471,17 @@ def main(argv):
 
         def sample(self, x_last: torch.Tensor, cond: torch.Tensor,
                    time_cond: torch.Tensor):
-            
-            dt = 1/self.nb_steps[0]
-            
+
+            dt = 1 / self.nb_steps[0]
+
             for i, t in enumerate(self.t_values_cache[:-1]):
                 t = t.repeat(x_last.shape[0])
 
                 x_last = x_last + dt * self.net(x_last,
-                             time=t,
-                             cond=cond,
-                             cache_index=i,
-                             time_cond=time_cond)
+                                                time=t,
+                                                cond=cond,
+                                                cache_index=i,
+                                                time_cond=time_cond)
 
                 self.net.roll_cache(x_last.shape[-1], i)
             return x_last

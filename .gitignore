@@ -1,4 +1,5 @@
 .codex
+tests/
 .claude/
 tests/
 encoder_checkpoints/*

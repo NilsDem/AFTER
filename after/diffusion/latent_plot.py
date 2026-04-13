@@ -10,76 +10,12 @@ import matplotlib.patches as mpatches
 from matplotlib import cm
 from scipy.ndimage import gaussian_filter
 from matplotlib.colors import to_rgb
-
-torch.set_grad_enabled(True)
 from sklearn.model_selection import train_test_split
 
 from tqdm import tqdm
 
 import csv
 import os
-
-
-def build_uuid_to_instrument(csv_path):
-    """Parse the Medley-Solos CSV and build a dict mapping uuid → instrument."""
-    uuid_to_inst = {}
-    with open(csv_path, "r") as f:
-        reader = csv.reader(f)
-        for row in reader:
-            if len(row) < 2:
-                continue
-            # Last field = uuid, 2nd field = instrument
-            uuid = row[-1].strip()
-            inst = row[1].strip().lower()
-            uuid_to_inst[uuid] = inst
-    return uuid_to_inst
-
-
-csv_path = "/data/nils/datasets/instruments/medley_solos/Medley-solos-DB_metadata.csv"
-uuid_map = build_uuid_to_instrument(csv_path)
-
-
-def get_instrument_from_filename(filepath, uuid_to_inst):
-    """Extract UUID from filename and return instrument name."""
-    basename = os.path.basename(filepath)
-    # Example: Medley-solos-DB_test-0_0aed2359-7d66-5da2-f041-8fb5d78b61c1.wav
-    uuid = basename.split("_")[-1].replace(".wav", "")
-    return uuid_to_inst.get(uuid, "unknown")
-
-
-def map_instrument_category_folders(path):
-    """Map specific instrument folder names to your broad categories."""
-    name = os.path.basename(path).lower()
-
-    mapping = {
-        "saxo": "winds",
-        "violin": "strings",
-        "cadenzawoodwind": "winds",
-        "filobass": "bass",
-        "guitar": "guitar",
-    }
-
-    # default if not in mapping
-    return mapping.get(name, "other")
-
-
-def map_instrument_category_medley(name):
-    """Map instrument name to broad category."""
-    name = name.lower().strip()
-
-    mapping = {
-        "piano": "piano",
-        "violin": "strings",
-        "strings": "strings",
-        "clarinet": "winds",
-        "flute": "winds",
-        "tenor saxophone": "winds",
-        "trumpet": "winds",
-        "distorted electric guitar": "distorted",
-        "female singer": "singer",
-    }
-
-    return mapping.get(name, "other")
 
 
 def pairwise_distances(x):
@@ -121,10 +57,6 @@ def distance_preserving_loss(x, z, zmode="angular"):
     return 1 - corr  # maximize correlation → minimize 1 - corr
 
 
-import torch
-import torch.nn.functional as F
-
-
 def tsne_loss(x, z, sigma=1.0, eps=1e-8):
     # pairwise Euclidean distances
     Dx = torch.cdist(x, x)
@@ -147,11 +79,6 @@ def tsne_loss(x, z, sigma=1.0, eps=1e-8):
     return loss
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
 class NormalizedLinear(nn.Module):
 
     def __init__(self):
@@ -159,10 +86,6 @@ class NormalizedLinear(nn.Module):
 
     def forward(self, x):
         return F.normalize(x, dim=-1)
-
-
-import torch
-import torch.nn as nn
 
 
 class SmallAutoencoder(nn.Module):
@@ -368,9 +291,6 @@ def train_autoencoder(embeddings,
 
             if mode == "linear":
                 regul_loss = 4 * uniformity_loss(latent)
-                # regul_loss += 1. * torch.exp(-2 * (
-                #     (latent.unsqueeze(1) - latent.unsqueeze(0))**
-                #     2).sum(-1)).mean()
 
                 regul_loss += 0.005 * tsne_loss(inputs, latent)
 
@@ -378,10 +298,6 @@ def train_autoencoder(embeddings,
                 regul_loss = 5. * torch.exp(-2 * (
                     (latent.unsqueeze(1) - latent.unsqueeze(0))**
                     2).sum(-1)).mean()
-
-                # regul_loss += 1. * distance_preserving_loss(inputs, latent)
-                # regul_loss += 0.02 * tsne_loss(inputs, latent)
-
             loss = recloss + regul_loss
 
             loss.backward()
@@ -444,73 +360,9 @@ def prepare_training(encoder,
             if post_encoder is not None:
                 zsem = post_encoder(zsem)
 
-            # path = data["metadata"]["path"]
-            # if "pads" in path.lower():
-            #     label = "PADS"
-            # elif "drums" in path.lower():
-            #     label = "Drums"
-            # elif "fx" in path.lower():
-            #     label = "FX"
-            # elif "tonal" in path.lower():
-            #     label = "Tonal"
-            # else:
-            # label = data["metadata"]["instrument"]
-            # label = label.replace("_synthetic", "")
-            # print(label)
-            # exit()
             if mode == "dataset":
                 label = name
-                print(name)
-            elif mode == "dataset_nature":
-                path = data["metadata"]["path"]
-                if "animals/" in path:
-                    label = path.split("/")[6]
-                else:
-                    label = name
-                print(label)
-
-            elif mode == "instruments":
-                meta = data["metadata"]
-
-                if "slakh" in name:
-                    mapping = {
-                        "piano": ["Piano", "Organ"],
-                        "guitar": ["Guitar"],
-                        "bass": ["Bass"],
-                        "winds": ["Reed", "Brass", "Pipe"],
-                        "synths": ["Synth Pad", "Synth Lead"],
-                        "strings": ["Strings", "Strings (continued)"],
-                    }
-
-                    def map_label(label):
-                        for cat, keys in mapping.items():
-                            if any(k.lower() in label.lower() for k in keys):
-                                return cat
-                        return "other"
-
-                    label = map_label(meta.get("instrument", "other"))
-                elif "maestro" in name:
-                    label = "piano"
-                else:
-                    source_folder = meta.get("source_folder", "other")
-
-                    source_folder = data["metadata"]["source_folder"].split(
-                        "/")[-1].lower()
-
-                    if "medley" in source_folder:
-                        instr = get_instrument_from_filename(
-                            data["metadata"]["path"], uuid_map)
-                        label = map_instrument_category_medley(instr)
-                    else:
-                        label = map_instrument_category_folders(source_folder)
-
-                if label is None:
-                    label = meta.get("instrument", None)
-
-                if label is None:
-                    label = name
-
-            elif mode == "path":
+            elif mode == "file":
                 label = data["metadata"]["path"]
             else:
                 label = "None"
@@ -518,8 +370,6 @@ def prepare_training(encoder,
             zsem = zsem.detach().cpu().numpy().squeeze()
             allzsem.append(zsem)
             alllabels.append(label)
-
-    print(set(alllabels))
 
     allzsem = np.stack(allzsem)
     return allzsem, alllabels

@@ -4,6 +4,7 @@ import torch
 
 import argparse
 import os
+import pathlib
 from after.diffusion import RectifiedFlow
 from after.dataset import CombinedDataset
 from after.diffusion.latent_plot import prepare_training, train_autoencoder, generate_plot
@@ -29,34 +30,55 @@ flags.DEFINE_integer(
 flags.DEFINE_string("emb_model_path",
                     default="./pretrained/test.ts",
                     help="Path to encoder model")
-flags.DEFINE_integer("chunk_size", default=1, help="Chunk size")
 flags.DEFINE_bool("latent_project",
                   default=True,
-                  help="Create latent map embedding plot")
+                  help="Train a 2D latent map for max4Live Device")
 flags.DEFINE_float(
     "latent_range",
     default=1.0,
     help="Scale the latent space visualisation to [-latent_range, latent_range]"
 )
-flags.DEFINE_string("label_mode",
-                    default="dataset",
-                    help="Mode for labeling data")
+flags.DEFINE_string(
+    "label_mode",
+    default="dataset",
+    help=
+    "Mode for labeling data and color the map. Chose( between 'dataset' for multi dataset and 'file' when using meaningful file names."
+)
 
 flags.DEFINE_integer("num_steps",
                      default=20000,
-                     help="Number of steps to build the map")
+                     help="Number of steps to train the AE map model")
 
-flags.DEFINE_integer("num_examples",
-                     default=None,
-                     help="Number of steps to build the map")
+flags.DEFINE_integer(
+    "num_examples",
+    default=None,
+    help=
+    "Number of sampled examples to build the map - defaults to full dataset")
 
-flags.DEFINE_string("ae_mode",
-                    default="linear",
-                    help="Number of steps to build the map")
+flags.DEFINE_string(
+    "ae_mode",
+    default="linear",
+    help=
+    "Default organisation of the map (linear, spherical, lambert). Spherical and lambert are mapped on to a sphere and with (polar/lambert) coordinates respectively, linear is a simple 2D map."
+)
 
 flags.DEFINE_bool("reload_embeddings",
                   default=False,
-                  help="Reload precomputed embeddings if available")
+                  help="Reload precomputed timbre embeddings if available")
+
+flags.DEFINE_multi_string(
+    "db_path",
+    default=[],
+    help=
+    "Dataset path(s) for the latent map. Overrides the db_list from the config when provided."
+)
+
+flags.DEFINE_string(
+    "db_folder",
+    default=None,
+    help=
+    "Folder whose sub-directories are each an LMDB dataset. Merged with --db_path entries."
+)
 
 
 class DummyIdentity(nn.Module):
@@ -91,16 +113,27 @@ def main(argv):
     SR = gin.query_parameter("%SR")
 
     with gin.unlock_config():
-        with gin.unlock_config():
-            if True:
-                print("success")
-                cache_denoiserv2 = gin.query_parameter("%LOCAL_ATTENTION_SIZE")
-                gin.bind_parameter("transformerv2.DenoiserV2.max_cache_size",
-                                   cache_denoiserv2)
-            # except:
-            #     cache_denoiserv1 = gin.query_parameter("%N_SIGNAL")
-            #     gin.bind_parameter("transformer.Denoiser.max_cache_size",
-            #                        cache_denoiserv1)
+        gin.bind_parameter("transformerv2.DenoiserV2.streaming", True)
+
+    # Resolve codec path
+    emb_model_path = FLAGS.emb_model_path
+    if emb_model_path == "./pretrained/test.ts" or emb_model_path is None:
+        trained_path = gin.query_parameter(
+            "diffusion.utils.get_datasets.emb_model_path")
+        if not trained_path:
+            raise RuntimeError(
+                "No --emb_model_path provided and none saved in config.\n"
+                "Re-run training or pass --emb_model_path.")
+        stream_path = str(
+            pathlib.Path(trained_path).with_stem(
+                pathlib.Path(trained_path).stem + "_stream"))
+        if os.path.exists(stream_path):
+            emb_model_path = stream_path
+            print(f"Using streaming codec: {emb_model_path}")
+        else:
+            raise FileNotFoundError(
+                f"Streaming codec not found at '{stream_path}'.\n"
+                f"Please provide one explicitly with --emb_model_path.")
 
     # Instantiate model
     blender = RectifiedFlow()
@@ -114,18 +147,29 @@ def main(argv):
     blender = blender.eval()
 
     # Get some parameters
-    n_signal = gin.query_parameter('%N_SIGNAL')
-    n_signal_timbre = gin.query_parameter('%N_SIGNAL')
+    n_signal = n_signal_timbre = gin.query_parameter('%N_SIGNAL')
     zt_channels = gin.query_parameter("%ZT_CHANNELS")
     zs_channels = gin.query_parameter("%ZS_CHANNELS")
     ae_latents = gin.query_parameter("%IN_SIZE")
+    model_chunk_size = gin.query_parameter("%ATTENTION_CHUNK_SIZE")
 
-    ### GENERATE EMBEDDING PLOT ###
     ### GENERATE EMBEDDING PLOT ###
     if FLAGS.latent_project:
 
         if True:
-            path_dict = gin.query_parameter("utils.get_datasets.path_dict")
+            if FLAGS.db_path or FLAGS.db_folder:
+                db_list = list(FLAGS.db_path)
+                if FLAGS.db_folder is not None:
+                    subdirs = sorted([
+                        str(p)
+                        for p in pathlib.Path(FLAGS.db_folder).iterdir()
+                        if p.is_dir()
+                    ])
+                    db_list += subdirs
+            else:
+                db_list = gin.query_parameter(
+                    "diffusion.utils.get_datasets.db_list")
+            path_dict = {k: {"path": k, "name": k} for k in db_list}
             dataset = CombinedDataset(path_dict=path_dict,
                                       keys=["z", "metadata"])
 
@@ -143,7 +187,7 @@ def main(argv):
 
                 torch.save((embeddings, labels), tmp)
 
-            print(set(labels))
+            print("Labels for the map : ", set(labels))
 
             embeddings = embeddings / (FLAGS.latent_range)
             torch.set_grad_enabled(True)
@@ -171,11 +215,6 @@ def main(argv):
                                             gamma=1.,
                                             brightness_scale=10.)
             torch.set_grad_enabled(False)
-        # except Exception as e:
-        #     print("Could not load dataset for embedding plot.")
-        #     print("Error : ", e)
-        #     print("Us --nolatent_project to disable latent projection.")
-        #     exit()
     else:
         project_model = DummyIdentity()
 
@@ -187,22 +226,13 @@ def main(argv):
             self.net = blender.net
             self.encoder = blender.encoder
             self.encoder_time = blender.encoder_time
-
-            self.n_signal = n_signal
-            self.n_signal_timbre = n_signal_timbre
-            self.chunk_size = FLAGS.chunk_size
+            self.project_model = project_model
+            self.chunk_size = model_chunk_size
             self.zs_channels = zs_channels
             self.zt_channels = zt_channels
             self.ae_latents = ae_latents
-            self.emb_model_structure = torch.jit.load(
-                FLAGS.emb_model_path).eval()
-
-            self.project_model = project_model
-
-            # self.emb_model_timbre = torch.jit.load(FLAGS.emb_model_path).eval()
-
+            self.emb_model_structure = torch.jit.load(emb_model_path).eval()
             self.drop_value = blender.drop_value
-
             self.latent_range = FLAGS.latent_range
 
             # Get the ae ratio
@@ -211,33 +241,26 @@ def main(argv):
             self.ae_ratio = 4 * 4096 // z.shape[-1]
 
             self.sr = gin.query_parameter("%SR")
-            self.zt_buffer = self.n_signal_timbre * self.ae_ratio
 
             ## ATTRIBUTES ##
-            self.register_attribute("nb_steps", 1)
-            self.register_attribute("guidance_timbre", 1.)
+            self.register_attribute("nb_steps", 2)
             self.register_attribute("guidance_structure", 1.)
 
             ## BUFFERS ##
+            self.register_buffer("_device_tracker", torch.zeros(1))
             self.register_buffer(
-                "previous_timbre",
-                torch.zeros(4, self.ae_latents, self.n_signal_timbre))
+                "t_values_cache",
+                torch.linspace(0, 1, self.nb_steps[0] + 1, device=self.device))
+
+            # Removed timbre for the moment as it requires two encoders
+            # self.zt_buffer = self.n_signal_timbre * self.ae_ratio
+            # self.emb_model_timbre = torch.jit.load(FLAGS.emb_model_path).eval()
+            # ## BUFFERS ##
+            # self.register_buffer(
+            #     "previous_timbre",
+            #     torch.zeros(4, self.ae_latents, self.n_signal_timbre))
 
             ## METHODS ##
-            # self.register_method(
-            #     "forward",
-            #     in_channels=2,
-            #     in_ratio=1,
-            #     out_channels=1,
-            #     out_ratio=1,
-            #     input_labels=[
-            #         f"(signal) Input structure",
-            #         f"(signal) Input timbre",
-            #     ],
-            #     output_labels=[f"(signal) Audio output"],
-            #     test_buffer_size=self.chunk_size * self.ae_ratio,
-            # )
-
             self.register_method(
                 "structure",
                 in_channels=1,
@@ -266,6 +289,20 @@ def main(argv):
             #     output_labels=[
             #         f"(signal) Output timbre {i}" for i in range(zt_channels)
             #     ],
+            #     test_buffer_size=self.chunk_size * self.ae_ratio,
+            # )
+
+            # self.register_method(
+            #     "forward",
+            #     in_channels=2,
+            #     in_ratio=1,
+            #     out_channels=1,
+            #     out_ratio=1,
+            #     input_labels=[
+            #         f"(signal) Input structure",
+            #         f"(signal) Input timbre",
+            #     ],
+            #     output_labels=[f"(signal) Audio output"],
             #     test_buffer_size=self.chunk_size * self.ae_ratio,
             # )
 
@@ -398,7 +435,7 @@ def main(argv):
                 output_labels=[
                     f"(signal) 2D Latent 1", f"(signal) 2D Latent 2"
                 ],
-                test_buffer_size=2048,
+                test_buffer_size=128,
             )
 
             self.register_method(
@@ -415,16 +452,21 @@ def main(argv):
                 input_labels=[
                     f"(signal) 2D Latent 1", f"(signal) 2D Latent 2"
                 ],
-                test_buffer_size=2048,
+                test_buffer_size=128,
             )
+
+        @property
+        def device(self):
+            return self._device_tracker.device
 
         @torch.jit.export
         def get_guidance_timbre(self) -> float:
-            return self.guidance_timbre[0]
+            print("Depreciated")
+            return 0.
 
         @torch.jit.export
         def set_guidance_timbre(self, guidance_timbre: float) -> int:
-            self.guidance_timbre = (guidance_timbre, )
+            print("Depreciated")
             return 0
 
         @torch.jit.export
@@ -443,115 +485,68 @@ def main(argv):
         @torch.jit.export
         def set_nb_steps(self, nb_steps: int) -> int:
             self.nb_steps = (nb_steps, )
+            self.t_values_cache = torch.linspace(0,
+                                                 1,
+                                                 nb_steps + 1,
+                                                 device=self.device)
             return 0
-
-        # def model_forward(self, x: torch.Tensor, time: torch.Tensor,
-        #                   cond: torch.Tensor, time_cond: torch.Tensor,
-        #                   cache_index: int) -> torch.Tensor:
-
-        #     guidance_timbre = self.guidance_timbre[0]
-        #     guidance_structure = self.guidance_structure[0]
-
-        #     full_time = time.repeat(3, 1, 1)
-        #     full_x = x.repeat(3, 1, 1)
-
-        #     full_cond = torch.cat([
-        #         cond,
-        #         self.drop_value * torch.ones_like(cond),
-        #         self.drop_value * torch.ones_like(cond),
-        #     ])
-
-        #     full_time_cond = torch.cat([
-        #         time_cond,
-        #         time_cond,
-        #         self.drop_value * torch.ones_like(time_cond),
-        #     ])
-
-        #     dx = self.net(full_x,
-        #                   time=full_time,
-        #                   cond=full_cond,
-        #                   time_cond=full_time_cond,
-        #                   cache_index=cache_index)
-
-        #     dx_full, dx_time_cond, dx_none = torch.chunk(dx, 3, dim=0)
-
-        #     total_guidance = 0.5 * (guidance_structure + guidance_timbre)
-
-        #     guidance_cond_factor = guidance_timbre / (max(
-        #         guidance_structure, 0.1))
-
-        #     dx = dx_none + total_guidance * (
-        #         dx_time_cond + guidance_cond_factor *
-        #         (dx_full - dx_time_cond) - dx_none)
-
-        #     return dx
 
         def model_forward(self, x: torch.Tensor, time: torch.Tensor,
                           cond: torch.Tensor, time_cond: torch.Tensor,
                           cache_index: int) -> torch.Tensor:
 
-            guidance_timbre = self.guidance_timbre[0]
-            guidance_structure = self.guidance_structure[0]
+            if self.guidance_structure[0] == 1.:
+                dx = self.net(x,
+                              time=time,
+                              cond=cond,
+                              time_cond=time_cond,
+                              cache_index=cache_index)
+                return dx
+            else:
+                dx = self.net(x.repeat(2, 1, 1),
+                              time=time.repeat(2, 1, 1),
+                              cond=cond.repeat(2, 1),
+                              time_cond=torch.cat([
+                                  time_cond,
+                                  self.drop_value * torch.ones_like(time_cond),
+                              ]),
+                              cache_index=cache_index)
 
-            # if guidance_structure == guidance_timbre == 1.:
-            #     dx = self.net(x,
-            #                   time=time,
-            #                   cond=cond,
-            #                   time_cond=time_cond,
-            #                   cache_index=cache_index)
-            #     return dx
+                dx_full, dx_none = torch.chunk(dx, 2, dim=0)
 
-            # if guidance_structure == guidance_timbre:
-            full_time = time.repeat(2, 1, 1)
-            full_x = x.repeat(2, 1, 1)
+                dx = dx_none + self.guidance_structure[0] * (dx_full - dx_none)
 
-            full_cond = torch.cat([
-                cond,
-                self.drop_value * torch.ones_like(cond),
-            ])
-
-            full_time_cond = torch.cat([
-                time_cond,
-                self.drop_value * torch.ones_like(time_cond),
-            ])
-
-            dx = self.net(full_x,
-                          time=full_time,
-                          cond=full_cond,
-                          time_cond=full_time_cond,
-                          cache_index=cache_index)
-
-            dx_full, dx_none = torch.chunk(dx, 2, dim=0)
-
-            dx = dx_none + guidance_structure * (dx_full - dx_none)
-
-            return dx
+                return dx
 
         def sample(self, x_last: torch.Tensor, cond: torch.Tensor,
                    time_cond: torch.Tensor):
 
-            x = x_last
-            t = torch.linspace(0, 1, self.nb_steps[0] + 1)
             dt = 1 / self.nb_steps[0]
-            for i, t_value in enumerate(t[:-1]):
-                x = x + self.model_forward(x=x,
-                                           time=t_value.repeat(
-                                               x.shape[0], 1, x.shape[-1]),
-                                           cond=cond,
-                                           time_cond=time_cond,
-                                           cache_index=i) * dt
 
-                self.net.roll_cache(x.shape[-1], i)
-            return x
+            for i, t in enumerate(self.t_values_cache[:-1]):
+                t = t.repeat(x_last.shape[0])
+
+                x_last = x_last + dt * self.net(x_last,
+                                                time=t,
+                                                cond=cond,
+                                                cache_index=i,
+                                                time_cond=time_cond)
+
+                self.net.roll_cache(x_last.shape[-1], i)
+            return x_last
 
         # @torch.jit.export
         # def timbre(self, x) -> torch.Tensor:
         #     x = self.emb_model_timbre.encode(x)
+
         #     self.previous_timbre[:x.shape[0]] = torch.cat(
         #         (self.previous_timbre[:x.shape[0]], x), -1)[..., x.shape[-1]:]
 
         #     zsem = self.encoder.forward_stream(
         #         self.previous_timbre[:x.shape[0]])
+
+        #     if self.post_encoder is not None:
+        #         zsem = self.post_encoder(zsem)
 
         #     zsem = zsem / self.latent_range
 
@@ -585,17 +580,9 @@ def main(argv):
             Apply FiLM-style modulation where modulators are organized as:
             [scale1, bias1, scale2, bias2, ...]
             """
-            batch_size, channels, time_dim = time_cond.shape
-            n_mod_pairs = modulators.shape[1] // 2
-
             # Split interleaved scale/bias pairs
             scales = modulators[:, 0::2, :]  # take even indices → scale_i
             shifts = modulators[:, 1::2, :]  # take odd indices  → bias_i
-
-            # Match shapes for broadcasting
-            # scales = scales.view(batch_size, n_mod_pairs, 1)
-            # shifts = shifts.view(batch_size, n_mod_pairs, 1)
-
             # Apply modulation
             time_cond = time_cond * scales + shifts
             return time_cond
@@ -617,14 +604,11 @@ def main(argv):
                                                          self.ae_ratio,
                                                          mode="nearest")
 
-
             time_cond = self.modulate(time_cond, modulators)
 
             x = torch.randn(n, self.ae_latents, time_cond.shape[-1])
-            x = self.sample(x[:1], time_cond=time_cond[:1], cond=zsem[:1])
+            x = self.sample(x, time_cond=time_cond, cond=zsem)
 
-            if n > 1:
-                x = x.repeat(n, 1, 1)
             return x
 
         @torch.jit.export
@@ -638,17 +622,14 @@ def main(argv):
             time_cond = self.structure(audio)
 
             x = torch.randn(n, self.ae_latents, time_cond.shape[-1])
-            x = self.sample(x[:1], time_cond=time_cond[:1], cond=zsem[:1])
+            x = self.sample(x, time_cond=time_cond, cond=zsem)
 
-            if n > 1:
-                x = x.repeat(n, 1, 1)
             return x
 
         @torch.jit.export
         def decode(self, x: torch.Tensor) -> torch.Tensor:
-            n = x.shape[0]
-            audio = self.emb_model_structure.decode(x[:1])
-            return audio.repeat(n, 1, 1)
+            audio = self.emb_model_structure.decode(x)
+            return audio
 
         @torch.jit.export
         def generate(self, x: torch.Tensor) -> torch.Tensor:
@@ -668,15 +649,6 @@ def main(argv):
             audio = self.decode(z)
             return audio
 
-        # def forward(self, x: torch.Tensor) -> torch.Tensor:
-        #     x_structure, x_timbre = x[:, :1], x[:, 1:]
-        #     structure, timbre = self.structure(x_structure), self.timbre(
-        #         x_timbre)
-        #     x = torch.cat((structure, timbre), 1)
-        #     z = self.diffuse(x)
-        #     audio = self.decode(z)
-        #     return audio
-
         @torch.jit.export
         def map2latent(self, x: torch.Tensor) -> torch.Tensor:
             tdim = x.shape[-1]
@@ -695,10 +667,11 @@ def main(argv):
 
     streamer = Streamer()
 
+    # Some tests
     dummmy = torch.randn(1, 1 + 2 * zs_channels + zt_channels, 8192)
     out = streamer.diffuse_timbre_modulate(dummmy)
 
-    dummmy = torch.randn(1, zs_channels + zt_channels, FLAGS.chunk_size)
+    dummmy = torch.randn(1, zs_channels + zt_channels, model_chunk_size)
     out = streamer.diffuse(dummmy)
     out_name = os.path.join(folder,
                             "after.audio." + folder.split("/")[-1] + ".ts")

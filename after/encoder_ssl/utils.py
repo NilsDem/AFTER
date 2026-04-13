@@ -1,7 +1,7 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
-import gin 
+import gin
 import numpy as np
 
 
@@ -12,11 +12,6 @@ def add_gin_extension(config_name: str) -> str:
 
 
 def double_crop(array, shape):
-    
-    if array.shape!= (12, 128):
-        print("error on array shape", array.shape)
-        array = np.zeros((12,128))
-
     if len(array.shape) == 1:
         print("error on array")
         array = np.zeros((64, 128))
@@ -31,12 +26,12 @@ def double_crop(array, shape):
 
 @gin.configurable
 def collate_fn_simdino(batch,
-                    n_global=2,
-                    n_local=4,
-                    n_signal_global=262144,
-                    n_signal_local=262144 // 2,
-                    ae_ratio=4096,
-                    augmentation_keys=[]):
+                       n_global=2,
+                       n_local=4,
+                       n_signal_global=262144,
+                       n_signal_local=262144 // 2,
+                       ae_ratio=4096,
+                       augmentation_keys=[]):
 
     n_signal_global //= ae_ratio
     n_signal_local //= ae_ratio

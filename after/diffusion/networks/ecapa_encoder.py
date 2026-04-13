@@ -605,6 +605,8 @@ class ECAPATDNN(nn.Module):
 
         if self.spherical_normalisation:
             Z = Z / torch.norm(Z, dim=-1, keepdim=True)
+            mean = Z
+            kl = torch.tensor(0.0)
 
         if self.regularisation == "vae":
             mean, scale = Z.chunk(2, 1)

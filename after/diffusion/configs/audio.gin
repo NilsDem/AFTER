@@ -14,30 +14,34 @@ STRUCTURE_TYPE = "audio"
 
 PHASE_1_STEP = 100000
 MAX_STEPS = 1000000
-ADV_WEIGHT = 0.5
+ADV_WEIGHT = 0.35
 SHUFFLE = None
 
 LOCAL_ATTENTION_SIZE = 8
 ATTENTION_CHUNK_SIZE = 1
 
 # Data
+diffusion.utils.get_datasets:
+    db_list = None
+    emb_model_path = None
+
 diffusion.utils.collate_fn_after:
     n_signal = %N_SIGNAL
     structure_type = %STRUCTURE_TYPE
 
 ### ARCHITECTURE ### 
 encoder/diffusion.networks.ecapa_encoder.ECAPATDNN:
-    channels = [512, 512, 512, 1024, 2048]
-    dilations = [1, 1, 1, 1, 1 ]
+    attention_channels = 128
+    channels = [512, 512, 512, 1024]
+    dilations = [1, 1, 1, 1]
     global_context = True
-    groups = [1, 1, 1, 1, 1]
+    groups = [1, 1, 1, 1]
     in_size = %IN_SIZE
-    kernel_sizes = [3, 3, 3, 3, 3]
+    kernel_sizes = [3, 3, 3, 3]
     out_dim = %ZT_CHANNELS
     pooling = True
     res2net_scale = 8
-    se_channels = 256
-    attention_channels = 256
+    se_channels = 128
     spherical_normalisation = False
     use_tanh = False
     regularisation = "ac"
@@ -56,7 +60,7 @@ encoder_time/diffusion.networks.Encoder1D:
 
 classifier/diffusion.networks.Encoder1D:
     in_size = %ZS_CHANNELS
-    channels = [64, 64, 64, 64, %ZT_CHANNELS_FULL]
+    channels = [64, 64, 64, 64, %ZT_CHANNELS]
     ratios = [2, 2, 2, 1, 1]
     average_out = True
     norm_type = "batch_norm"
@@ -102,18 +106,12 @@ diffusion.model.Base.fit:
     drop_targets = [0]
 
     # Noise augmentation to smooth the latent space
-    zsem_noise_aug = 0.
-    time_cond_noise_aug = 0.03
+    timbre_noise_aug = 0.03
+    structure_noise_aug = 0.03
 
     ## Encoder regularisation
     regularisation_weight_cond = 1
     regularisation_weight_time_cond = 1
-
-    ## Cycle loss
-    cycle_consistency = False
-
-    ### DATA ###
-    shuffle_zsem = %SHUFFLE
 
     ## Log ## 
     steps_valid = 10000

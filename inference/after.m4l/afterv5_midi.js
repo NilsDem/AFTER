@@ -9,7 +9,7 @@ var timbre_recv = 0;
 var timbre_unp = 0;
 var cur_z = 0;
 // Instance prefix
-var prefix_z = "z";
+var prefix_z = "";
 var prefix_p = "";
 // Object creation variable
 var p = this.patcher
@@ -24,9 +24,9 @@ function prefix(val_z, val_p)
 }
 
 // Create a given model
-function create(model_name, prior) 
+function create(model_name, buffer_size, prior) 
 {
-	if (model_name == "off")
+	if (String(model_name).indexOf("off") !== -1)//(model_name == "off")
 	{
 		_delete_current()
 		return
@@ -40,10 +40,19 @@ function create(model_name, prior)
 		_delete_current()
 
 	// Create decoder
-	var max_decoder = p.newdefault(100, 350, "nn~", model_name, "generate", 8192);
+	var max_decoder = p.newdefault(100, 350, "nn~", model_name, "diffuse", buffer_size);
+	
+	var max_codec_decoder = p.newdefault(100, 600, "nn~", model_name, "decode", buffer_size);
+	
+	
+	
 	max_decoder.rect = [100, 350, 850, 25]
+	max_codec_decoder.rect = [100, 600, 850, 25]
+	
 	// Number of latents
 	var n_latents = 8//(max_decoder.getboxattr('numinlets') - 2)/2
+	
+	var n_ae_latents  = max_decoder.getboxattr('numoutlets')
 
 	// Gather all 
 	cur_z = []
@@ -54,8 +63,12 @@ function create(model_name, prior)
 
 	// Make major in / out connections
 	p.connect(p.getnamed("model_props"), 0, max_decoder, 0)
+	p.connect(p.getnamed("model_props"), 0, max_codec_decoder, 0)
 	p.connect(p.getnamed("msg_in"), 0, max_decoder, 0)
-	p.connect(max_decoder, 0, p.getnamed("rave_out"), 0)
+	
+	
+	
+	p.connect(max_codec_decoder, 0, p.getnamed("rave_out"), 0)
 
 	var router = p.getnamed("midi_router")
 	cur_prior = 0
@@ -65,6 +78,7 @@ function create(model_name, prior)
 	main_plot.setattr("bkgndpict", model_name + ".png")
 	// Create prior
 
+	// ### DIFFUSION MODEL ### 
 	for (var z = 0; z < n_latents; z+=1)
 	{
 		// cur_connect = []
@@ -89,7 +103,9 @@ function create(model_name, prior)
 		cur_connect.push(sig1)
 
 	}
-
+	
+	
+	//### TIMBRE CONTROL####
 	var timbre_recv = p.getnamed("timbre_receive")
 	var timbre_unp = p.newdefault(100 + (100 * z), 190, "mc.unpack~",8);
 	timbre_unp.rect = [100 + (100 * z), 190, 190 + (100 * z), 190]
@@ -104,27 +120,28 @@ function create(model_name, prior)
 
 	cur_connect.push(timbre_unp)
 
+	
+	
+	
+	//### AE LATENTS #### 
+	for (var z = 0; z < n_ae_latents; z+=1)
+	{
+		//
+
+	
+		
+		p.connect(max_decoder, z, max_codec_decoder, z);
+		cur_z.push(cur_connect)
+		}
+		
+	cur_connect.push(max_codec_decoder);
+	
+
+	
+
 
 	//### TIMBRE CONNECTION ###
 	
-	var max_encoder_timbre =  p.newdefault(2150, 920, "nn~", model_name, "timbre", 8192);
-	// max_encoder_timbre.rect = [2500, 1200, 400, 25]
-
-	var receive_timbre = p.getnamed("receive_timbre");
-	var pack_timbre = p.getnamed("pack_timbre");
-	var enable_timbre = p.getnamed("enable_timbre");
-
-	cur_connect.push(max_encoder_timbre)
-	
-	p.connect(receive_timbre, 0,max_encoder_timbre,  0);
-	p.connect(enable_timbre, 0,max_encoder_timbre,  0);
-
-
-	for (var j = 0; j < 8; j++)
-		{
-			p.connect(max_encoder_timbre, j ,pack_timbre,  j)
-		}
-
 
 	var sigm2l1 = p.getnamed("sigm2l1");
 	var sigm2l2 = p.getnamed("sigm2l2");
@@ -135,8 +152,8 @@ function create(model_name, prior)
 	var snapl2m1= p.getnamed("snapl2m1");
 	var snapl2m2 = p.getnamed("snapl2m2");
 
-	var max_m2l =  p.newdefault(2800, 930, "nn~", model_name, "map2latent");
-	var max_l2m =  p.newdefault(3150, 1400, "nn~", model_name, "latent2map");
+	var max_m2l =  p.newdefault(2048, 1750, "nn~", model_name, "map2latent");
+	var max_l2m =  p.newdefault(2400, 2250, "nn~", model_name, "latent2map");
 
 
 	p.connect(sigm2l1, 0 ,max_m2l,  0);

@@ -1,5 +1,6 @@
-from music2latent import EncoderDecoder
 import numpy as np
+import torch.nn.functional as F
+import torchaudio
 import torch.nn.functional as F
 
 
@@ -7,13 +8,16 @@ class M2LWrapper():
     """Wrapper for the EncoderDecoder model to use it with the AudioExample class."""
 
     def __init__(self, device="cpu"):
+        from music2latent import EncoderDecoder
         self.model = EncoderDecoder(device=device)
 
     def to(self, device):
+        from music2latent import EncoderDecoder
         self.model = EncoderDecoder(device=device)
         return self
 
     def cpu(self):
+        from music2latent import EncoderDecoder
         self.model = EncoderDecoder(device="cpu")
         return self
 
@@ -33,9 +37,6 @@ class M2LWrapper():
 
     def __call__(self, x):
         return self.decode(self.encode(x))
-
-
-import torchaudio
 
 
 class AudioGenWrapper():
@@ -83,15 +84,11 @@ class AudioGenWrapper():
         return self.decode(self.encode(x))
 
 
-from dac import DAC
-import dac
-import torch
-
-
 class DACWrapper:
     """Wrapper around Descript's DAC model."""
 
     def __init__(self, device="cpu", model_type="44khz"):
+        from dac import DAC
         self.device = device
 
         self.model = DAC.load(
@@ -126,16 +123,11 @@ class DACWrapper:
         return self.decode(self.encode(x))
 
 
-from encodec import EncodecModel
-import torch.nn.functional as F
-
-import torchaudio
-
-
 class EncodecWrapper:
     """Wrapper around Facebook's Encodec model."""
 
     def __init__(self, device="cpu", bandwidth=6.0):
+        from encodec import EncodecModel
         self.device = device
         self.model = EncodecModel.encodec_model_24khz()  # or 48khz
         self.model.set_target_bandwidth(bandwidth)
@@ -383,211 +375,3 @@ class SAOWrapper:
         """shortcut: encode+decode"""
         z = self.encode(x, **kwargs)
         return self.decode(z, **kwargs)
-
-
-import sys
-
-sys.path.append("/data/nils/repos/codecs_benchmark/beats/unilm/beats")
-
-import torch
-from BEATs import BEATs, BEATsConfig
-
-
-class BeatsWrapper:
-    """Wrapper around Facebook's Encodec model."""
-
-    def __init__(self, device="cpu"):
-        self.device = device
-
-        self.fwd_resampler = torchaudio.transforms.Resample(orig_freq=44100,
-                                                            new_freq=16000).to(
-                                                                self.device)
-        self.inverse_resampler = torchaudio.transforms.Resample(
-            orig_freq=16000, new_freq=44100).to(self.device)
-
-        # load the pre-trained checkpoints
-        checkpoint = torch.load(
-            '/data/nils/repos/codecs_benchmark/beats/unilm/beats/beats2.pt')
-
-        cfg = BEATsConfig(checkpoint['cfg'])
-        self.BEATs_model = BEATs(cfg)
-        self.BEATs_model.load_state_dict(checkpoint['model'])
-        self.BEATs_model.eval()
-        self.to(device)
-
-    def to(self, device):
-        self.BEATs_model.to(device)
-        self.inverse_resampler.to(device)
-        self.fwd_resampler.to(device)
-        self.device = device
-        return self
-
-    def cpu(self):
-        self.to("cpu")
-        return self
-
-    def eval(self):
-        self.BEATs_model.eval()
-        return self
-
-    def encode(self, x):
-        # expects x: (B,1,T)
-        x = self.fwd_resampler(x)  # repeat to stereo
-        # extract the the audio representation
-        padding_mask = None
-
-        representation = self.BEATs_model.extract_features(
-            x.squeeze(1), padding_mask=padding_mask)
-
-        representation = torch.permute(representation, (0, 2, 1))
-        return representation
-
-    def decode(self, codes):
-        return None
-
-    def __call__(self, x):
-        return None
-
-
-# import torch
-
-# from laion_clap import CLAP_Module
-
-
-class CLAPWrapper:
-    """Wrapper around Facebook's Encodec model."""
-
-    def __init__(self, device="cpu"):
-        self.device = device
-
-        self.fwd_resampler = torchaudio.transforms.Resample(orig_freq=44100,
-                                                            new_freq=48000).to(
-                                                                self.device)
-        self.inverse_resampler = torchaudio.transforms.Resample(
-            orig_freq=48000, new_freq=44100).to(self.device)
-
-        self.model = CLAP_Module(enable_fusion=False)
-        self.model.load_ckpt()
-        self.model.to(device)
-
-        self.to(device)
-
-    def to(self, device):
-        self.model.to(device)
-        self.inverse_resampler.to(device)
-        self.fwd_resampler.to(device)
-        self.device = device
-        return self
-
-    def cpu(self):
-        self.to("cpu")
-        return self
-
-    def eval(self):
-        self.model.eval()
-        return self
-
-    def encode(self, x):
-        # expects x: (B,1,T)
-        x = self.fwd_resampler(x)  # repeat to stereo
-
-        x = x.squeeze(1)
-        embed = self.model.get_audio_embedding_from_data(x=x, use_tensor=True)
-        return embed.unsqueeze(-1).repeat(1, 1, 4)
-
-    def decode(self, codes):
-        return None
-
-    def __call__(self, x):
-        return None
-
-
-# from transformers import Wav2Vec2Processor
-from transformers import Wav2Vec2FeatureExtractor
-from transformers import AutoModel
-import torch
-from torch import nn
-import torchaudio.transforms as T
-from datasets import load_dataset
-
-
-class MERTWrapper:
-    """Wrapper around Facebook's Encodec model."""
-
-    def __init__(self,
-                 device="cpu",
-                 layer_target=-1,
-                 mode="mert",
-                 target_ratio=None):
-        self.device = device
-
-        self.fwd_resampler = torchaudio.transforms.Resample(orig_freq=44100,
-                                                            new_freq=24000).to(
-                                                                self.device)
-
-        # loading our model weights
-        self.model = AutoModel.from_pretrained("m-a-p/MERT-v1-95M",
-                                               trust_remote_code=True)
-        # loading the corresponding preprocessor config
-        self.processor = Wav2Vec2FeatureExtractor.from_pretrained(
-            "m-a-p/MERT-v1-95M", trust_remote_code=True)
-        self.layer_target = layer_target
-        self.target_ratio = target_ratio
-        self.mode = mode
-
-        self.to(device)
-
-    def to(self, device):
-        self.model.to(device)
-        self.fwd_resampler.to(device)
-        self.device = device
-        return self
-
-    def cpu(self):
-        self.to("cpu")
-        return self
-
-    def eval(self):
-        self.model.eval()
-        return self
-
-    def encode(self, x):
-        # expects x: (B,1,T)
-        x_resamp = self.fwd_resampler(x)  # repeat to stereo
-        # extract the the audio representation
-
-        inputs = self.processor(x_resamp.squeeze(1).cpu().numpy(),
-                                sampling_rate=self.processor.sampling_rate,
-                                return_tensors="pt",
-                                padding=True)
-
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        outputs = self.model(**inputs, output_hidden_states=True)
-
-        all_layer_hidden_states = torch.stack(outputs.hidden_states)
-
-        embed = all_layer_hidden_states[self.layer_target]
-        embed = torch.permute(embed, (0, 2, 1))
-
-        if self.mode == "mert":
-            pass
-        elif self.mode == "linear":
-            target_size = x.shape[-1] // self.target_ratio
-            embed = torch.nn.functional.interpolate(embed,
-                                                    size=target_size,
-                                                    mode='linear',
-                                                    align_corners=False)
-        elif self.mode == "nearest":
-            target_size = x.shape[-1] // self.target_ratio
-            embed = torch.nn.functional.interpolate(embed,
-                                                    size=target_size,
-                                                    mode='nearest')
-        print(x.shape, embed.shape)
-        return embed
-
-    def decode(self, codes):
-        return None
-
-    def __call__(self, x):
-        return None

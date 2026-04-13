@@ -22,7 +22,11 @@ LOCAL_ATTENTION_SIZE = 8
 ATTENTION_CHUNK_SIZE = 1
 
 # Data
-diffusion.utils.collate_fn:
+diffusion.utils.get_datasets:
+    db_list = None
+    emb_model_path = None
+
+diffusion.utils.collate_fn_after:
     n_signal = %N_SIGNAL
     structure_type = %STRUCTURE_TYPE
 
@@ -111,18 +115,12 @@ diffusion.model.Base.fit:
     drop_targets = [0]
 
     # Noise augmentation to smooth the latent space
-    zsem_noise_aug = 0.
-    time_cond_noise_aug = 0.03
+    timbre_noise_aug = 0.
+    structure_noise_aug = 0.03
 
     ## Encoder regularisation
     regularisation_weight_cond = 0.0002
     regularisation_weight_time_cond = 1
-
-    ## Cycle loss
-    cycle_consistency = False
-
-    ### DATA ###
-    shuffle_zsem = %SHUFFLE
 
     ## Log ## 
     steps_valid = 10000
