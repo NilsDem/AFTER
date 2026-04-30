@@ -57,14 +57,12 @@ after prepare_dataset \
   --output_path /dataset/root
 ```
 
-#### Full flag reference
+#### Key flags reference
 
 | Flag | Default | Description |
 |---|---|---|
 | `--input_path` | *(required)* | Input directories (repeatable) |
 | `--output_path` | `.` | Root output directory |
-| `--parser` | `simple_audio` | File parser: `simple_audio` or `simple_midi` |
-| `--ext` | `wav opus mp3 aac flac` | Audio extensions to include (repeatable) |
 | `--exclude` | `[]` | Filename substrings to exclude (repeatable) |
 | `--include` | `None` | Filename substrings to include — any match (repeatable) |
 | `--pad_mode` | `pad` | How to handle short files: `pad` (zero-pad) or `concat` (tile) |
@@ -72,17 +70,14 @@ after prepare_dataset \
 | `--sample_rate` | `44100` | Target sample rate |
 | `--normalize` | `True` | Peak-normalize each file |
 | `--cut_silences` | `False` | Skip silent chunks (peak < 0.05) |
-| `--save_waveform` | `False` | Store raw int16 waveform in the database |
+| `--save_waveform` | `False` | Store raw waveform in the database |
 | `--stereo` | `False` | Store 2-channel waveforms (mono files are duplicated) |
 | `--emb_model_path` | `None` | TorchScript embedding model to pre-compute latents |
 | `--batch_size` | `4` | Chunk batch size for embedding inference |
-| `--gpu` | `-1` | CUDA device index; `-1` for CPU |
-| `--descriptors` | `[]` | Audio descriptors to compute (e.g. `centroid`) |
+| `--gpu` | `0` | CUDA device index; `-1` for CPU |
 | `--num_augments` | `4` | Augmented copies per chunk; `0` to disable |
 | `--silence_aug` | `True` | Allow random silence in augmentations |
 | `--midi` | `False` | Extract MIDI with BasicPitch |
-| `--beat_extract` | `False` | Extract beats with BeatTrack |
-| `--midi_edge_oversample_pct` | `0.1` | Extra edge samples fraction for MIDI boundary chunks |
 | `--db_size` | `10` | Max LMDB file size in GB |
 
 ---
@@ -245,7 +240,7 @@ after export_midi \
 | `latent2map` | Timbre latent | 2D Map position | Project timbre to 2D map |
 | `map2latent` | 2D Map position | Timbre latent | Back-project 2D map to timbre |
 
-**Controllable attributes** (via `set_*` / `get_*` methods):
+**Controllable attributes**:
 
 | Attribute | Default | Description |
 |---|---|---|
@@ -261,9 +256,9 @@ You can experiment with inference in MaxMSP using the patches in `./after.m4l/` 
 We provide two Max4Live devices to use your models in Ableton Live. The export script trains a small network to remap the timbre latent space to a 2D map for latent exploration. If you use multiple datasets, each dataset will correspond to one color on the latent map. Make sure to download both the `.ts` file and the `.png` latent map created by the export script.
 
 <p align="center">
-  <img src="docs/after_midi.png" />
+  <img src="docs/after_midi.png" height="200" />
   <br/>
-  <img src="docs/after_audio.png" />
+  <img src="docs/after_audio.png" height="200"/>
 </p>
 
 ---

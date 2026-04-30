@@ -2,6 +2,31 @@ import torch
 import gin
 import numpy as np
 from after.dataset import CombinedDataset
+from after.dataset.utils import get_piano_roll_cropped
+
+
+def make_key_sampler(structure_type, structure_keys, timbre_keys):
+    """
+    Returns a zero-argument callable that randomly selects, for one item:
+      - target_key  : the latent key to use as the diffusion target
+      - timbre_key  : the key to use for timbre conditioning
+      - needed_keys : the minimal set of LMDB keys required for that item
+
+    Passed to SimpleDataset so __getitem__ loads only what collate_fn needs.
+    """
+    timbre_keys = timbre_keys or []
+
+    def sampler():
+        target_key = np.random.choice(["z"] * 3 + structure_keys)
+        timbre_key = np.random.choice(timbre_keys) if timbre_keys else "z"
+        needed = {"metadata", target_key, timbre_key}
+        if structure_type == "midi":
+            midi_key = ("midi" if target_key == "z"
+                        else target_key.replace("z", "midi"))
+            needed.add(midi_key)
+        return target_key, timbre_key, needed
+
+    return sampler
 
 
 def crop(arrays, length, idxs):
@@ -27,7 +52,18 @@ def get_datasets(
     compress_tc=None,
     sr=None,
     emb_model_path=None,
+    # Lazy-loading: when set, __getitem__ loads only the keys collate_fn needs.
+    # Mirror the structure_type / structure_keys / timbre_keys from collate_fn_after.
+    structure_type=None,
+    structure_keys=None,
+    timbre_keys=None,
 ):
+    # Build a key sampler so each dataset item only loads what collate needs.
+    # Falls back to loading all data_keys when structure_type is not provided.
+    key_sampler = None
+    if not use_cache and structure_type is not None and structure_keys is not None:
+        key_sampler = make_key_sampler(structure_type, structure_keys,
+                                       timbre_keys)
 
     path_dict = {k: {"path": k, "name": k} for k in db_list}
 
@@ -41,6 +77,7 @@ def get_datasets(
         ae_ratio=ae_ratio,
         compress_tc=compress_tc,
         sr=sr,
+        key_sampler=key_sampler,
     )
     train_sampler = dataset.get_sampler()
 
@@ -57,6 +94,7 @@ def get_datasets(
         ae_ratio=ae_ratio,
         compress_tc=compress_tc,
         sr=sr,
+        key_sampler=key_sampler,
     )
     return dataset, valset, train_sampler, valset.get_sampler()
 
@@ -85,7 +123,10 @@ def collate_fn_after(batch,
         # -------------------------
         # 1. --- Select target key
         # -------------------------
-        key = np.random.choice(["z"] * 3 + structure_keys)
+        # Use pre-selected key from __getitem__ (lazy-load path) when available;
+        # fall back to sampling for cached items that carry all keys.
+        key = b.get("_target_key") or np.random.choice(["z"] * 3 +
+                                                        structure_keys)
         selected_target_keys.append(key)
 
         # Base signal (target)
@@ -108,7 +149,7 @@ def collate_fn_after(batch,
         # 3. --- Timbre conditioning
         # -------------------------
         if len(timbre_keys) > 0:
-            key_timbre = np.random.choice(timbre_keys)
+            key_timbre = b.get("_timbre_key") or np.random.choice(timbre_keys)
             x_timbre_full = np.array(b.get(key_timbre, b["z"]))
         else:
             x_timbre_full = x_full
@@ -166,19 +207,7 @@ def collate_fn_after(batch,
                     times_c = times[i0:i0 + n_signal]
 
                 # --- safe extraction ---
-                try:
-                    pr = midi_obj.get_piano_roll(times=times_c)
-                    print(pr.shape)
-                    if pr.size == 0:
-                        print(
-                            f"[WARN] Empty piano roll for key '{midi_key}'; replaced by zeros."
-                        )
-                        pr = np.zeros((128, len(times_c)))
-                except Exception as e:
-                    print(
-                        f"[WARN] MIDI parsing failed for key '{midi_key}' ({type(e).__name__}: {e}); using zeros."
-                    )
-                    pr = np.zeros((128, len(times_c)))
+                pr = get_piano_roll_cropped(midi_obj, times_c)
 
             if pr.shape != (128, compress_tc * x_list[-1].shape[-1]):
                 print(

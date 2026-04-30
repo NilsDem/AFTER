@@ -168,7 +168,6 @@ class CausalConv2d(nn.Conv2d):
 def __prepare_scriptable__(self):
     for hook in self._forward_pre_hooks.values():
         if hook.__module__ == "torch.nn.utils.weight_norm" and hook.__class__.__name__ == "WeightNorm":
-            print("Removing weight_norm from %s", self.__class__.__name__)
             torch.nn.utils.remove_weight_norm(self)
     return self
 
@@ -217,7 +216,6 @@ class CachedConv2d(nn.Module):
             # super().__init__(*args, **kwargs)
             if kwargs["normalization"]:
 
-                print("using wn")
                 causal_conv = CausalConv2d(*args, **kwargs)
                 self.causal_conv = normalization(causal_conv)
             else:
@@ -249,7 +247,6 @@ class CachedConv2d(nn.Module):
             if kwargs["normalization"]:
                 self.causal_conv = normalization(CausalConv2d(*args, **kwargs))
             else:
-                print("no using wirhgt norm")
                 self.causal_conv = CausalConv2d(*args, **kwargs)
             self.cumulative_delay = 0
             self.cache = nn.Identity()

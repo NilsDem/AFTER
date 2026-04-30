@@ -89,6 +89,18 @@ class DummyIdentity(nn.Module):
         self.encoder = nn.Identity()
         self.decoder = nn.Identity()
 
+    def forward(self, x: torch.Tensor):
+        return x
+
+    def forward_stream(self, x: torch.Tensor):
+        return x
+
+    def encode(self, x: torch.Tensor):
+        return x
+
+    def decode(self, x: torch.Tensor):
+        return x
+
 
 def main(argv):
     # Parse model folder
@@ -225,6 +237,7 @@ def main(argv):
 
             self.net = blender.net
             self.encoder = blender.encoder
+            self.post_encoder = blender.post_encoder
             self.encoder_time = blender.encoder_time
             self.project_model = project_model
             self.chunk_size = model_chunk_size

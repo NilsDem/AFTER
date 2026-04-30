@@ -60,7 +60,7 @@ flags.DEFINE_bool(
 flags.DEFINE_string('emb_model_path', None,
                     'TorchScript (.pt) embedding model')
 flags.DEFINE_integer('batch_size', 4, 'Chunk batch size for embedding')
-flags.DEFINE_integer('gpu', -1, 'CUDA device index; -1 for CPU')
+flags.DEFINE_integer('gpu', 0, 'CUDA device index; -1 for CPU')
 
 # --- Descriptors ---
 flags.DEFINE_multi_string('descriptors', [],
@@ -71,7 +71,7 @@ flags.DEFINE_integer('num_augments', 4,
                      'Augmentations per chunk; 0 to disable')
 flags.DEFINE_bool('silence_aug', True, 'Use random silence in augmentations')
 flags.DEFINE_float(
-   'silence_aug_structure_pct', 0.075,
+    'silence_aug_structure_pct', 0.075,
     'Fraction of structure augmentations that are fully silenced (audio zeroed, MIDI emptied)'
 )
 flags.DEFINE_bool('midi', False, 'Extract MIDI with BasicPitch')

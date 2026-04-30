@@ -625,6 +625,7 @@ class ECAPATDNN(nn.Module):
             return Z, mean, kl
         return Z
 
+    @torch.jit.export
     def forward_stream(self, X: torch.Tensor) -> torch.Tensor:
         """
         Forward pass.

@@ -142,7 +142,6 @@ class MHAttention(nn.Module):
 
         # Cache buffers
         if self.max_cache_size > 0:
-            print("Creating cache")
             self.register_buffer(
                 "last_k",
                 torch.zeros(max_batch_size, self.n_heads, 1,

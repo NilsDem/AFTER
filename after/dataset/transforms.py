@@ -15,12 +15,11 @@ import copy
 
 from .basic_pitch_torch.model import BasicPitchTorch
 from .basic_pitch_torch.inference import predict
-from after.dataset.beat_this.inference import Audio2Beats
-
 
 # ---------------------------------------------------------------------------
 # Base class
 # ---------------------------------------------------------------------------
+
 
 class BaseTransform():
 
@@ -35,6 +34,7 @@ class BaseTransform():
 # ---------------------------------------------------------------------------
 # Phase mangling utilities
 # ---------------------------------------------------------------------------
+
 
 def random_angle(min_f=20, max_f=8000, sr=24000):
     min_f = np.log(min_f)
@@ -60,6 +60,7 @@ def random_phase_mangle(x, min_f, max_f, amp, sr):
 # ---------------------------------------------------------------------------
 # Audio augmentation
 # ---------------------------------------------------------------------------
+
 
 class AudioAugment(BaseTransform):
     """
@@ -105,7 +106,9 @@ class AudioAugment(BaseTransform):
                  silence_length=(0.03, 0.05),
                  silence_max_count=4):
         if mode not in ("whole", "chunk", "continuous"):
-            raise ValueError(f"mode must be 'whole', 'chunk', or 'continuous', got '{mode}'")
+            raise ValueError(
+                f"mode must be 'whole', 'chunk', or 'continuous', got '{mode}'"
+            )
         super().__init__(sr, "audio_augment")
         self.pitch_min = pitch_min
         self.pitch_max = pitch_max
@@ -147,8 +150,11 @@ class AudioAugment(BaseTransform):
     def _crossfade(self, chunk_a, chunk_b, fade_len):
         fade_in = np.linspace(0, 1, fade_len)
         fade_out = 1 - fade_in
-        crossfaded = chunk_a[..., -fade_len:] * fade_out + chunk_b[..., :fade_len] * fade_in
-        return np.concatenate([chunk_a[..., :-fade_len], crossfaded, chunk_b[..., fade_len:]], axis=-1)
+        crossfaded = chunk_a[..., -fade_len:] * fade_out + chunk_b[
+            ..., :fade_len] * fade_in
+        return np.concatenate(
+            [chunk_a[..., :-fade_len], crossfaded, chunk_b[..., fade_len:]],
+            axis=-1)
 
     def _chunk_transform(self, audio):
         total_len = audio.shape[-1]
@@ -156,14 +162,19 @@ class AudioAugment(BaseTransform):
         for start in range(0, total_len, self.chunk_size):
             chunk_start = max(0, start - self.margin)
             chunk_end = min(total_len, start + self.chunk_size + self.margin)
-            chunks.append(self._apply_transforms_stereo(audio[..., chunk_start:chunk_end]))
+            chunks.append(
+                self._apply_transforms_stereo(audio[...,
+                                                    chunk_start:chunk_end]))
 
         output = chunks[0]
         for next_chunk in chunks[1:]:
-            if output.shape[-1] < self.margin or next_chunk.shape[-1] < self.margin:
+            if output.shape[-1] < self.margin or next_chunk.shape[
+                    -1] < self.margin:
                 output = np.concatenate([output, next_chunk], axis=-1)
             else:
-                output = self._crossfade(output, next_chunk, fade_len=self.margin)
+                output = self._crossfade(output,
+                                         next_chunk,
+                                         fade_len=self.margin)
         return output
 
     # --- "continuous" helper ---
@@ -172,8 +183,10 @@ class AudioAugment(BaseTransform):
         """Piecewise-linear curve with one random value per chunk_size block."""
         n_points = max(2, n_samples // self.chunk_size + 1)
         keypoints = np.linspace(0, n_samples - 1, n_points)
-        values = np.random.uniform(min_val, max_val, size=n_points).astype(np.float32)
-        return np.interp(np.arange(n_samples), keypoints, values).astype(np.float32)
+        values = np.random.uniform(min_val, max_val,
+                                   size=n_points).astype(np.float32)
+        return np.interp(np.arange(n_samples), keypoints,
+                         values).astype(np.float32)
 
     def _continuous_transform(self, audio):
         """Returns (audio, stretch_curve) so beats can be warped by the caller.
@@ -226,14 +239,16 @@ class AudioAugment(BaseTransform):
             (np.ndarray, pretty_midi.PrettyMIDI | None, np.ndarray | None):
                 Augmented audio, MIDI, and warped beat times.
         """
-        if self.mode == "chunk" and (midi is not None or beats_downbeats is not None):
-            raise ValueError("mode='chunk' does not support MIDI or beats input.")
+        if self.mode == "chunk" and (midi is not None
+                                     or beats_downbeats is not None):
+            raise ValueError(
+                "mode='chunk' does not support MIDI or beats input.")
         if self.mode == "continuous" and midi is not None:
             raise ValueError("mode='continuous' does not support MIDI input.")
 
         time_dim = audio.shape[-1]
         warped_beats = None
-        aug_midi=None
+        aug_midi = None
 
         if self.mode == "chunk":
             audio = self._chunk_transform(audio)
@@ -242,21 +257,27 @@ class AudioAugment(BaseTransform):
             audio, stretch_curve = self._continuous_transform(audio)
             if beats_downbeats is not None:
                 b, db = beats_downbeats
-                warped_b = warp_beats_with_stretch((np.asarray(b)), stretch_curve, self.sr)
-                warped_db = warp_beats_with_stretch((np.asarray(db)), stretch_curve, self.sr)
+                warped_b = warp_beats_with_stretch((np.asarray(b)),
+                                                   stretch_curve, self.sr)
+                warped_db = warp_beats_with_stretch((np.asarray(db)),
+                                                    stretch_curve, self.sr)
                 warped_beats = (warped_b, warped_db)
 
         else:  # "whole"
             audio = self._apply_transforms_stereo(audio)
-            stretch = self.time_aug.parameters["rate"] if self.time_aug is not None else 1.
-            pitch  = self.pitch_aug.parameters["num_semitones"] if self.pitch_aug is not None else 0
+            stretch = self.time_aug.parameters[
+                "rate"] if self.time_aug is not None else 1.
+            pitch = self.pitch_aug.parameters[
+                "num_semitones"] if self.pitch_aug is not None else 0
             if midi is not None:
                 aug_midi = shift_and_stretch_midi(midi, pitch, stretch)
             if beats_downbeats is not None:
                 stretch_curve = np.full(time_dim, stretch, dtype=np.float32)
                 b, db = beats_downbeats
-                warped_b = warp_beats_with_stretch((np.asarray(b)), stretch_curve, self.sr)
-                warped_db = warp_beats_with_stretch((np.asarray(db)), stretch_curve, self.sr)
+                warped_b = warp_beats_with_stretch((np.asarray(b)),
+                                                   stretch_curve, self.sr)
+                warped_db = warp_beats_with_stretch((np.asarray(db)),
+                                                    stretch_curve, self.sr)
                 warped_beats = (warped_b, warped_db)
 
         if self.silence_aug is not None:
@@ -278,6 +299,7 @@ class AudioAugment(BaseTransform):
 # ---------------------------------------------------------------------------
 # Piecewise time stretch (beat-aware)                              [PRIVATE]
 # ---------------------------------------------------------------------------
+
 
 def generate_piecewise_stretch_curve(
     n_samples: int,
@@ -326,9 +348,11 @@ def warp_beats_with_stretch(beats, time_stretchs, sr):
     warped_beats = np.interp(beats, t_orig, warped_time)
     return warped_beats
 
+
 # ---------------------------------------------------------------------------
 # MIDI utilities
 # ---------------------------------------------------------------------------
+
 
 def shift_and_stretch_midi(pm, pitch_shift=0, time_stretch=1.0):
     """
@@ -355,6 +379,7 @@ def shift_and_stretch_midi(pm, pitch_shift=0, time_stretch=1.0):
 # Audio descriptors                                                [PRIVATE]
 # ---------------------------------------------------------------------------
 
+
 class AudioDescriptors(BaseTransform):
 
     def __init__(self,
@@ -376,7 +401,10 @@ class AudioDescriptors(BaseTransform):
         }
         features = {}
         S, _ = librosa.magphase(
-            librosa.stft(y=y, n_fft=self.n_fft, hop_length=self.hop_length, center=True))
+            librosa.stft(y=y,
+                         n_fft=self.n_fft,
+                         hop_length=self.hop_length,
+                         center=True))
 
         audio_length = y.shape[-1]
         S_times = librosa.frames_to_time(np.arange(S.shape[-1]),
@@ -404,9 +432,11 @@ class AudioDescriptors(BaseTransform):
             audio = audio.mean(axis=0)
         return self.compute_librosa(audio, z_length)
 
+
 # ---------------------------------------------------------------------------
 # BasicPitch (audio → MIDI)
 # ---------------------------------------------------------------------------
+
 
 class BasicPitchPytorch(BaseTransform):
 
@@ -417,8 +447,10 @@ class BasicPitchPytorch(BaseTransform):
         file_path = pathlib.Path(__file__).parent.resolve()
         self.pt_model.load_state_dict(
             torch.load(
-                os.path.join(file_path,
-                             'basic_pitch_torch/assets/basic_pitch_pytorch_icassp_2022.pth')))
+                os.path.join(
+                    file_path,
+                    'basic_pitch_torch/assets/basic_pitch_pytorch_icassp_2022.pth'
+                )))
         self.pt_model.eval()
         self.pt_model.to(device)
         self.device = device
@@ -452,6 +484,9 @@ class BasicPitchPytorch(BaseTransform):
                                       **params_bp)
             return midi_data
 
+
+''' 
+from after.dataset.beat_this.inference import Audio2Beats
 
 # ---------------------------------------------------------------------------
 # Beat tracking                                                    [PRIVATE]
@@ -562,3 +597,4 @@ class BeatTrack(BaseTransform):
                 "beat_clock": list(beat_clock),
                 "downbeat_clock": list(downbeat_clock)
             }
+ '''

@@ -290,7 +290,7 @@ def train_autoencoder(embeddings,
             recloss = 2 * criterion(reconstructed, inputs)
 
             if mode == "linear":
-                regul_loss = 4 * uniformity_loss(latent)
+                regul_loss = 5 * uniformity_loss(latent)
 
                 regul_loss += 0.005 * tsne_loss(inputs, latent)
 

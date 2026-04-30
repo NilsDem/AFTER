@@ -271,7 +271,7 @@ def main(argv):
             valid_loader = torch.utils.data.DataLoader(
                 valset,
                 batch_size=FLAGS.batch_size_ssl,
-                shuffle=False,
+                shuffle=True,
                 num_workers=FLAGS.num_workers,
                 drop_last=True,
                 collate_fn=collate_fn_simdino,
