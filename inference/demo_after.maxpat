@@ -10,7 +10,7 @@
 		}
 ,
 		"classnamespace" : "box",
-		"rect" : [ 385.0, 98.0, 869.0, 706.0 ],
+		"rect" : [ 385.0, 87.0, 869.0, 706.0 ],
 		"gridsize" : [ 15.0, 15.0 ],
 		"boxes" : [ 			{
 				"box" : 				{
@@ -23,7 +23,7 @@
 					"formantcorrection" : 0,
 					"id" : "obj-9",
 					"maxclass" : "playlist~",
-					"mode" : 0,
+					"mode" : "basic",
 					"numinlets" : 1,
 					"numoutlets" : 5,
 					"originallength" : [ 0 ],
@@ -32,7 +32,7 @@
 					"parameter_enable" : 0,
 					"patching_rect" : [ 15.867346286773682, 313.210523366928101, 150.0, 92.0 ],
 					"pitchcorrection" : 0,
-					"quality" : 0,
+					"quality" : "basic",
 					"saved_attribute_attributes" : 					{
 						"candicane2" : 						{
 							"expression" : ""
@@ -3907,7 +3907,7 @@
 					"numinlets" : 1,
 					"numoutlets" : 0,
 					"patching_rect" : [ 17.0, 14.0, 435.0, 28.0 ],
-					"text" : "AFTER - Africa Voices"
+					"text" : "AFTER DEMO"
 				}
 
 			}
@@ -5165,7 +5165,7 @@
 		"dependency_cache" : [ 			{
 				"name" : "afterv5.audio.instr.png",
 				"bootpath" : "~/Documents/PHD/teaching/cours_ia_maxmsp/models",
-				"patcherrelativepath" : "../../teaching/cours_ia_maxmsp/models",
+				"patcherrelativepath" : "../Documents/PHD/teaching/cours_ia_maxmsp/models",
 				"type" : "PNG",
 				"implicit" : 1
 			}

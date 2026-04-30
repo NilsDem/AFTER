@@ -213,7 +213,7 @@ if (max_decoder && max_decoder.maxclass === "nn~") {
     // put your fallback or alternative logic here
 	set_knobs_enabled(0);
 	p.remove(max_decoder);
-	set_warning_message("V5 model required");
+	set_warning_message("After>=v2.0.0 model required");
 
 	var max_decoder = p.newdefault(100, 350, "nn~", model_name,"generate_timbre", buffer_size);
 	max_decoder.rect = [100, 350, 850, 25]

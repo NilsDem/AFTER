@@ -6,9 +6,16 @@ __AFTER__ is a diffusion-based generative model that creates new audio by blendi
 
 This repository is a real-time implementation of the research paper _Combining audio control and style transfer using latent diffusion_ ([read it here](https://arxiv.org/abs/2408.00196)) by Nils Demerlé, P. Esling, G. Doras, and D. Genova. Some transfer examples can be found on the [project webpage](https://nilsdem.github.io/control-transfer-diffusion/). This real-time version integrates with MaxMSP and Ableton Live through [_nn_tilde_](https://github.com/acids-ircam/nn_tilde), an external that embeds PyTorch models into MaxMSP.
 
+If you use AFTER as a part of a music performance or installation, be sure to cite either this repository or the article !
+
+If you want to share / discuss / ask things about AFTER and other research from ACIDS, you can do so in our [discord server](https://discord.gg/r9umPrGEWv) !
+
+
 You can find pretrained models and max patches for realtime inference in the last section of this page.
 
 ### Installation
+
+After can be installed in python 3.12 environnement by cloning this repository :
 
 ``` bash
 git clone https://github.com/acids-ircam/AFTER.git
@@ -22,13 +29,15 @@ If you want to use the model in MaxMSP or PureData for real-time generation, ple
 
 ## Model Training
 
-Training AFTER involves 3 separate steps: _dataset preparation_, _autoencoder training_, and _diffusion model training.
+AFTER is a latent diffusion model that operates in the latent space of an autoencoder, hence training involves 3 separated steps: _dataset preparation_, _autoencoder training_, and _diffusion model training.
+
+We provide more detailed explanations about AFTER design and training in the [training guide](docs/training_guide.md).
 
 ---
 
 ### Step 1 — Dataset Preparation
 
-All training data must be preprocessed into an LMDB database first.
+All training data must be preprocessed into an LMDB database first. Two independant data processing are required to train the autoencoder and the diffusion model. 
 
 #### Waveform-only dataset (for autoencoder training)
 
@@ -48,7 +57,7 @@ after prepare_dataset \
   --emb_model_path AE_model_run/export.ts
 ```
 
-Multiple input directories can be passed; one LMDB is created per directory:
+Multiple input directories can be passed, which will create one LMDB database per directory:
 
 ```bash
 after prepare_dataset \
@@ -65,20 +74,16 @@ after prepare_dataset \
 | `--output_path` | `.` | Root output directory |
 | `--exclude` | `[]` | Filename substrings to exclude (repeatable) |
 | `--include` | `None` | Filename substrings to include — any match (repeatable) |
-| `--pad_mode` | `pad` | How to handle short files: `pad` (zero-pad) or `concat` (tile) |
 | `--num_signal` | `524288` | Samples per chunk (~12 s at 44100 Hz) |
 | `--sample_rate` | `44100` | Target sample rate |
 | `--normalize` | `True` | Peak-normalize each file |
-| `--cut_silences` | `False` | Skip silent chunks (peak < 0.05) |
 | `--save_waveform` | `False` | Store raw waveform in the database |
-| `--stereo` | `False` | Store 2-channel waveforms (mono files are duplicated) |
+| `--stereo` | `False` | Save waveforms as stereo signals |
 | `--emb_model_path` | `None` | TorchScript embedding model to pre-compute latents |
-| `--batch_size` | `4` | Chunk batch size for embedding inference |
 | `--gpu` | `0` | CUDA device index; `-1` for CPU |
-| `--num_augments` | `4` | Augmented copies per chunk; `0` to disable |
-| `--silence_aug` | `True` | Allow random silence in augmentations |
+| `--silence_aug` | `True` | Introduce silence in the augmentations |
 | `--midi` | `False` | Extract MIDI with BasicPitch |
-| `--db_size` | `10` | Max LMDB file size in GB |
+| `--db_size` | `10` | Max LMDB file size in GB - Make sure to increase for large datasets |
 
 ---
 
@@ -115,7 +120,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 torchrun --nproc_per_node=3  after_scripts/train_auto
 | `--db_folder` | `None` | Folder whose sub-directories are each an LMDB dataset |
 | `--freqs` | `None` | Sampling frequencies for weighted multi-dataset sampling |
 | `--save_dir` | `autoencoder_runs` | Path to save the runs |
-| `--stereo` | `False` | Train a 2-channel model |
+| `--stereo` | `False` | Train a stereo model |
 | `--restart` | `None` | Resume from this checkpoint step |
 | `--gpu` | `0` | CUDA GPU ID; `-1` for CPU |
 | `--use_psts` | `True` | Enable pitch-shift / time-stretch augmentation |
@@ -168,12 +173,11 @@ after train \
 | `--config` | `[]` | Gin config file(s) — repeatable |
 | `--db_path` | `[]` | LMDB dataset path(s) — repeatable |
 | `--db_folder` | `None` | Folder whose sub-directories are each an LMDB dataset |
-| `--freqs` | `None` | Sampling frequencies for weighted multi-dataset sampling |
 | `--emb_model_path` | `None` | Path to the codec TorchScript model |
 | `--out_path` | `./after_runs` | Output path for logs and checkpoints |
 | `--restart` | `None` | Resume from this checkpoint step |
 | `--gpu` | `0` | GPU ID; `-1` for CPU |
-| `--n_signal` | `64` | Training length in latent steps |
+| `--n_signal` | `64` | Training length in latent frames |
 | `--use_cache` | `False` | Pre-load dataset into RAM |
 
 Logs and checkpoints are saved to `<out_path>/<name>/`.
@@ -189,6 +193,7 @@ Logs and checkpoints are saved to `<out_path>/<name>/`.
 
 Config files live in `after/diffusion/configs/`. We recommend using the SimDino configs by default. 
 
+<!-- 
 Key global parameters (overridable via gin bindings):
 
 | Parameter | `audio` | `midi` | Description |
@@ -200,7 +205,7 @@ Key global parameters (overridable via gin bindings):
 | `MAX_STEPS` | 1M | 1M | Total training steps |
 | `SSL_STEPS` | 100k | 50k | SimDino pre-training steps |
 
----
+--- -->
 
 ### Step 4 — Export for Real-time Inference
 
@@ -220,8 +225,16 @@ after export_midi \
   --emb_model_path AE_model_run/export_stream.ts
 ```
 
-> Always use the **streaming** codec (`export_stream.ts`) for export.
+Always use the **streaming** codec (`export_stream.ts`) for export.
 
+**Controllable attributes**:
+
+| Attribute | Default | Description |
+|---|---|---|
+| `guidance_structure` | `1.0` | Classifier-free guidance strength on structure (0 = no influence of structure)|
+| `nb_steps` | `2` | Number of diffusion steps |
+
+<!-- 
 #### Exported nn_tilde methods
 
 **Audio-to-audio** (`after export`):
@@ -247,11 +260,11 @@ after export_midi \
 | `guidance_structure` | `1.0` | Classifier-free guidance strength on structure (0 = no influence of structure)|
 | `nb_steps` | `2` | Number of diffusion steps |
 
----
+--- -->
 
 ## Inference
 
-You can experiment with inference in MaxMSP using the patches in `./after.m4l/` and the pretrained models available [here](https://nubo.ircam.fr/index.php/s/8NFD5gWwbkT4G5P).
+You can experiment with inference in MaxMSP using the patches in `./inference/` and the pretrained models available [here](https://nubo.ircam.fr/index.php/s/8NFD5gWwbkT4G5P).
 
 We provide two Max4Live devices to use your models in Ableton Live. The export script trains a small network to remap the timbre latent space to a 2D map for latent exploration. If you use multiple datasets, each dataset will correspond to one color on the latent map. Make sure to download both the `.ts` file and the `.png` latent map created by the export script.
 
