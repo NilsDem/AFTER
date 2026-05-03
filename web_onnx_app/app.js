@@ -71,7 +71,6 @@ const el = {
   status: document.getElementById("status"),
   modelSelect: document.getElementById("modelSelect"),
   loadModelButton: document.getElementById("loadModelButton"),
-  importModelButton: document.getElementById("importModelButton"),
 };
 
 ort.env.wasm.numThreads = 1;
@@ -89,20 +88,6 @@ el.loadModelButton.addEventListener("click", () => {
     refreshGenerateState();
   });
 });
-
-if (el.importModelButton) {
-  el.importModelButton.addEventListener("click", () => {
-    appendConsole("Import button clicked");
-    importLocalModel().catch((error) => {
-      console.error(error);
-      appendConsole(`Import error: ${error.message || String(error)}`);
-      setStatus(error.message || String(error), true);
-      setModelControlsBusy(false);
-    });
-  });
-} else {
-  console.error("importModelButton not found in DOM");
-}
 el.modelSelect.addEventListener("change", () => {
   state.selectedModelName = el.modelSelect.value;
   const model = getSelectedModel();
@@ -114,14 +99,23 @@ el.modelSelect.addEventListener("change", () => {
   refreshGenerateState();
 });
 
-document.addEventListener("dragover", (e) => {
+const dropZone = document.getElementById("dropZone");
+
+dropZone?.addEventListener("dragover", (e) => {
   e.preventDefault();
   e.stopPropagation();
+  dropZone.classList.add("active");
 });
 
-document.addEventListener("drop", (e) => {
+dropZone?.addEventListener("dragleave", (e) => {
+  e.preventDefault();
+  dropZone.classList.remove("active");
+});
+
+dropZone?.addEventListener("drop", (e) => {
   e.preventDefault();
   e.stopPropagation();
+  dropZone.classList.remove("active");
   handleDroppedFiles(e.dataTransfer.items || e.dataTransfer.files);
 });
 

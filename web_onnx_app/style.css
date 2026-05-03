@@ -675,3 +675,20 @@ audio {
     grid-template-columns: 1fr;
   }
 }
+
+.drop-zone-small {
+  border: 2px dashed var(--line);
+  border-radius: 6px;
+  padding: 16px;
+  text-align: center;
+  margin-top: 8px;
+  font-size: 14px;
+  color: var(--muted);
+  transition: all 0.2s;
+}
+
+.drop-zone-small.active {
+  border-color: var(--accent);
+  background: rgba(68, 68, 78, 0.05);
+  color: var(--accent);
+}
