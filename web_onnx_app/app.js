@@ -89,15 +89,20 @@ el.loadModelButton.addEventListener("click", () => {
     refreshGenerateState();
   });
 });
-el.importModelButton.addEventListener("click", () => {
-  appendConsole("Import button clicked");
-  importLocalModel().catch((error) => {
-    console.error(error);
-    appendConsole(`Import error: ${error.message || String(error)}`);
-    setStatus(error.message || String(error), true);
-    setModelControlsBusy(false);
+
+if (el.importModelButton) {
+  el.importModelButton.addEventListener("click", () => {
+    appendConsole("Import button clicked");
+    importLocalModel().catch((error) => {
+      console.error(error);
+      appendConsole(`Import error: ${error.message || String(error)}`);
+      setStatus(error.message || String(error), true);
+      setModelControlsBusy(false);
+    });
   });
-});
+} else {
+  console.error("importModelButton not found in DOM");
+}
 el.modelSelect.addEventListener("change", () => {
   state.selectedModelName = el.modelSelect.value;
   const model = getSelectedModel();
@@ -108,6 +113,119 @@ el.modelSelect.addEventListener("change", () => {
   }
   refreshGenerateState();
 });
+
+document.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+});
+
+document.addEventListener("drop", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  handleDroppedFiles(e.dataTransfer.items || e.dataTransfer.files);
+});
+
+async function readDirectoryRecursive(dirEntry, requiredFiles, fileMap) {
+  const reader = dirEntry.createReader();
+
+  return new Promise((resolve, reject) => {
+    const readEntries = () => {
+      reader.readEntries(
+        async (entries) => {
+          for (const entry of entries) {
+            if (entry.isDirectory) {
+              await readDirectoryRecursive(entry, requiredFiles, fileMap);
+            } else if (entry.isFile) {
+              const file = await new Promise((resolve, reject) => {
+                entry.file(resolve, reject);
+              });
+              if (requiredFiles.includes(file.name)) {
+                fileMap.set(file.name, file);
+                appendConsole(`Found: ${file.name}`);
+              }
+            }
+          }
+          if (entries.length < 100) {
+            resolve();
+          } else {
+            readEntries();
+          }
+        },
+        reject
+      );
+    };
+    readEntries();
+  });
+}
+
+async function handleDroppedFiles(items) {
+  appendConsole("Files/folders dropped, scanning for model...");
+  setModelControlsBusy(true);
+  setStatus("Importing dropped files...");
+
+  const requiredFiles = [MODEL_FILE, MODEL_DATA_FILE, MAP_IMAGE_FILE];
+  const fileMap = new Map();
+  let folderName = "";
+
+  try {
+    if (items instanceof DataTransferItemList) {
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.kind === "file") {
+          const entry = item.webkitGetAsEntry?.();
+          if (entry) {
+            if (entry.isDirectory) {
+              appendConsole(`Found directory: ${entry.name}`);
+              folderName = entry.name;
+              await readDirectoryRecursive(entry, requiredFiles, fileMap);
+            } else {
+              const file = item.getAsFile();
+              if (file && requiredFiles.includes(file.name)) {
+                fileMap.set(file.name, file);
+                appendConsole(`Found: ${file.name}`);
+              }
+            }
+          } else {
+            const file = item.getAsFile();
+            if (file && requiredFiles.includes(file.name)) {
+              fileMap.set(file.name, file);
+              appendConsole(`Found: ${file.name}`);
+            }
+          }
+        }
+      }
+    } else {
+      for (let i = 0; i < items.length; i++) {
+        const file = items[i];
+        if (requiredFiles.includes(file.name)) {
+          fileMap.set(file.name, file);
+          appendConsole(`Found: ${file.name}`);
+        }
+      }
+    }
+
+    if (fileMap.size === 0) {
+      setModelControlsBusy(false);
+      setStatus("No model files found in dropped items");
+      return;
+    }
+
+    folderName = `imported_${Date.now()}`;
+
+    const missing = requiredFiles.filter(f => !fileMap.has(f));
+    if (missing.length > 0) {
+      setModelControlsBusy(false);
+      setStatus(`Missing files: ${missing.join(", ")}`);
+      return;
+    }
+
+    await performImport(folderName, fileMap, requiredFiles);
+  } catch (error) {
+    appendConsole(`Drop import error: ${error.message}`);
+    setStatus(error.message || String(error), true);
+    setModelControlsBusy(false);
+  }
+}
 
 
 function setStatus(message, error = false) {
@@ -315,7 +433,10 @@ async function importLocalModel() {
   let fileMap = new Map();
   let folderName = "";
 
+  appendConsole(`showDirectoryPicker available: ${"showDirectoryPicker" in window}`);
+
   if ("showDirectoryPicker" in window) {
+    appendConsole("Using showDirectoryPicker API");
     let dirHandle;
     try {
       dirHandle = await window.showDirectoryPicker();
@@ -352,8 +473,10 @@ async function importLocalModel() {
     await performImport(folderName, fileMap, requiredFiles);
     return;
   } else {
+    appendConsole("Using webkitdirectory fallback");
     let input = document.getElementById("__importModelFileInput");
     if (!input) {
+      appendConsole("Creating file input element");
       input = document.createElement("input");
       input.id = "__importModelFileInput";
       input.type = "file";
@@ -364,6 +487,7 @@ async function importLocalModel() {
     }
 
     return new Promise((resolve, reject) => {
+      appendConsole("Waiting for file selection");
       input.onchange = async () => {
         try {
           const files = Array.from(input.files || []);
