@@ -16,9 +16,10 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   const cacheable =
-    url.pathname.startsWith("/AFTER/export_onnx/") ||
+    // url.pathname.startsWith("/AFTER/export_onnx/") ||
     url.pathname.startsWith("/export_onnx/") ||
-    url.pathname.startsWith("/api/custom-models/");
+    url.pathname.startsWith("../export_onnx/") ;
+    // url.pathname.startsWith("/api/custom-models/");
 
   if (!cacheable || event.request.method !== "GET") {
     return;
