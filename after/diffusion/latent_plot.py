@@ -17,6 +17,8 @@ from tqdm import tqdm
 import csv
 import os
 
+BACKGROUND_COLOR = "#f0ede5"  #"#bcbcbc"
+
 
 def pairwise_distances(x):
     # cosine distances or Euclidean
@@ -381,7 +383,8 @@ def generate_plot(embeddings,
                   bins=100,
                   sigma=2.0,
                   gamma=1.0,
-                  brightness_scale=5.0):
+                  brightness_scale=5.0,
+                  transparent_background=False):
 
     # ------------------------------------------------------------------------------
     # Embedded plotting function from your style
@@ -409,7 +412,7 @@ def generate_plot(embeddings,
 
         # image = np.ones((H, W, 3))  # white base
 
-        bg_rgb = np.array(to_rgb("#bcbcbc"))  # background color as RGB
+        bg_rgb = np.array(to_rgb(BACKGROUND_COLOR))  # background color as RGB
         # bg_rgb = np.array(to_rgb("#3c3c3c"))
         image = np.ones((H, W, 3)) * bg_rgb  # colored canvas
         for i, color in enumerate(cmap_list):
@@ -498,7 +501,7 @@ def generate_plot(embeddings,
         # --- Opacity: make colors own dense regions a bit more ---
         A_col = 1.0 - np.exp(-(brightness_scale * 1.4) * (D_norm**0.85))
 
-        bg_rgb = np.array(to_rgb("#bcbcbc"), dtype=np.float32)
+        bg_rgb = np.array(to_rgb(BACKGROUND_COLOR), dtype=np.float32)
         # bg_rgb = np.array(to_rgb("#3c3c3c"), dtype=np.float32)
 
         # --- Foreground contrast boost toward bg (punchier without touching bg) ---
@@ -510,20 +513,61 @@ def generate_plot(embeddings,
         # no gamma here (keeps chroma vivid)
         F_toned = np.clip(bg_rgb + F_rel, 0.0, 1.0)
 
-        # --- Composite ---
-        image = (1.0 - A_col)[..., None] * bg_rgb + A_col[..., None] * F_toned
+        if transparent_background:
+            sharpness = 1.7
+            W_soft = np.power(Wcls, sharpness)
+            W_soft = W_soft / (W_soft.sum(axis=0, keepdims=True) + eps)
+            blended = np.einsum('chw,ck->hwk', W_soft, colors)
 
-        # --- Bounded darkening (keep the moody look, avoid black holes) ---
-        dark_strength = 1.1  # was higher → reduce washout
-        dark_power = 4.  # darken mostly at peaks
-        S_cap = 0.5  # NEVER darken more than this
-        S = np.minimum(S_cap, dark_strength * (D_norm**dark_power))
+            weighted_colors = Wcls[..., None] * colors[:, None, None, :]
+            screen_glow = 1.0 - np.prod(
+                1.0 - np.clip(weighted_colors * 0.85, 0.0, 1.0),
+                axis=0,
+            )
+            F_transparent = 0.78 * blended + 0.22 * screen_glow
 
-        floor_ratio = 0.  # darker than bg, but not near black
-        floor = bg_rgb * floor_ratio
+            gray_transparent = F_transparent.mean(axis=2, keepdims=True)
+            F_transparent = gray_transparent + 1.2 * (
+                F_transparent - gray_transparent
+            )
+            F_transparent = np.power(np.clip(F_transparent, 0.0, 1.0), 0.96)
+            F_transparent = np.clip(F_transparent * 0.88 + 0.018, 0.0, 1.0)
 
-        image = (1.0 - S)[..., None] * image + S[..., None] * floor
-        image = np.clip(image, 0.0, 1.0)
+            luma = (
+                0.2126 * F_transparent[..., 0] +
+                0.7152 * F_transparent[..., 1] +
+                0.0722 * F_transparent[..., 2]
+            )
+            min_luma = 0.16
+            lift = np.maximum(0.0, min_luma - luma)
+            warm_lift = np.array([1.0, 0.92, 0.78], dtype=np.float32)
+            F_transparent = np.clip(
+                F_transparent + lift[..., None] * warm_lift,
+                0.0,
+                1.0,
+            )
+            depth = 1.0 - 0.18 * (D_norm**0.85)
+            F_transparent = np.clip(F_transparent * depth[..., None], 0.0, 1.0)
+
+            density_alpha = 1.0 - np.exp(-(brightness_scale * 0.95) * (D_norm**0.72))
+            alpha = np.clip(density_alpha, 0.0, 0.88)
+            image = np.dstack([F_transparent, alpha])
+        else:
+            # --- Composite ---
+            image = (1.0 - A_col)[..., None] * bg_rgb + A_col[..., None] * F_toned
+
+            # --- Bounded darkening (keep the moody look, avoid black holes) ---
+            dark_strength = 0.72
+            dark_power = 3.5  # darken mostly at peaks
+            S_cap = 0.34
+            S = np.minimum(S_cap, dark_strength * (D_norm**dark_power))
+
+            floor_ratio = 0.42
+            warm_shadow = np.array([0.08, 0.06, 0.035], dtype=np.float32)
+            floor = np.clip(bg_rgb * floor_ratio + warm_shadow, 0.0, 1.0)
+
+            image = (1.0 - S)[..., None] * image + S[..., None] * floor
+            image = np.clip(image, 0.0, 1.0)
 
         ax.imshow(image,
                   extent=[xmin, xmax, ymin, ymax],
@@ -539,7 +583,6 @@ def generate_plot(embeddings,
     # embedding_2d = np.c_[2 * (embedding_2d[:, 0] - minx) / (maxx - minx) - 1,
     #                      2 * (embedding_2d[:, 1] - miny) / (maxy - miny) - 1]
 
-    background_color = "#bcbcbc"
     # background_color = "#3c3c3c"
 
     le = LabelEncoder()
@@ -574,10 +617,13 @@ def generate_plot(embeddings,
     # ------------------------------------------------------------------------------
     # 2. Set up figure
     FIG_W, FIG_H = 8, 6
+    figure_facecolor = "none" if transparent_background else BACKGROUND_COLOR
     fig = plt.figure(figsize=(FIG_W, FIG_H),
-                     facecolor=background_color,
+                     facecolor=figure_facecolor,
                      constrained_layout=True)
-    ax = fig.add_subplot(facecolor=background_color)
+    ax = fig.add_subplot(facecolor=figure_facecolor)
+    fig.patch.set_alpha(0.0 if transparent_background else 1.0)
+    ax.patch.set_alpha(0.0 if transparent_background else 1.0)
     ax.axis('off')
     point_colors = np.array([colors[i] for i in label_ids])
     if use_blur:
@@ -658,8 +704,10 @@ def generate_plot(embeddings,
     # Legend
     LEGEND_WIDTH = 2
     legend_fig = plt.figure(figsize=(LEGEND_WIDTH, FIG_H),
-                            facecolor=background_color)
+                            facecolor=figure_facecolor)
+    legend_fig.patch.set_alpha(0.0 if transparent_background else 1.0)
     legend_ax = legend_fig.add_subplot(111)
+    legend_ax.patch.set_alpha(0.0 if transparent_background else 1.0)
     legend_ax.axis('off')
     handles = [
         mpatches.Patch(color=colors[i], label=unique_labels[i])

@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AFTER MIDI ONNX</title>
+    <link rel="stylesheet" href="./style.css">
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tonejs/midi/build/Midi.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <main class="app">
+      <header class="topbar">
+        <div style="width:300px; height:80px; overflow:hidden; display:flex; align-items:center;">
+          <img src="../docs/after_nobackground.png" style="height:100%; transform:translateX(-75px);">
+        </div>
+      
+        <div class="acids-brand">
+          <img src="../docs/acids-eps.png" alt="ACIDS logo" class="acids-logo">
+          <span class="acids-text">ACIDS</span>
+        </div>
+      </header>
+
+      <section class="grid">
+        <!-- MIDI / Sequencer panel -->
+        <div class="panel">
+          <div class="panel-head">
+            <h2>MIDI</h2>
+          </div>
+
+          <div class="tabs-with-duration">
+            <div class="tabs">
+              <button class="tab is-active" data-tab="sequencer" type="button">Sequencer</button>
+              <button class="tab" data-tab="midi" type="button">MIDI File</button>
+            </div>
+          
+            <div class="duration-row">
+              <label class="inline-label">
+                <span>Duration</span>
+                <select id="durationSelect">
+                  <option value="1">1 chunk</option>
+                  <option value="2">2 chunks</option>
+                  <option value="3">3 chunks</option>
+                  <option value="4">4 chunks</option>
+                </select>
+              </label>
+            </div>
+          </div>
+
+          <!-- Sequencer Tab -->
+          <div class="tab-content" id="tabSequencer">
+            <div class="seq-grid">
+              <label>
+                Note
+                <select id="sequenceNote">
+                  <option value="0">C</option>
+                  <option value="1">C#</option>
+                  <option value="2">D</option>
+                  <option value="3">D#</option>
+                  <option value="4">E</option>
+                  <option value="5">F</option>
+                  <option value="6">F#</option>
+                  <option value="7">G</option>
+                  <option value="8">G#</option>
+                  <option value="9">A</option>
+                  <option value="10">A#</option>
+                  <option value="11">B</option>
+                </select>
+              </label>
+              <label>
+                Octave
+                <select id="sequenceOctave">
+                  <option value="1">1</option>
+                  <option value="2">2</option>
+                  <option value="3" selected>3</option>
+                  <option value="4">4</option>
+                  <option value="5">5</option>
+                  <option value="6">6</option>
+                  <option value="7">7</option>
+                </select>
+              </label>
+              <label>
+                Chords / chunk
+                <input id="chordsPerChunk" type="number" min="1" max="16" step="1" value="4">
+              </label>
+              <label>
+                Progression
+                <select id="progressionSelect">
+                  <option value="I-V-vi-IV">I V vi IV</option>
+                  <option value="i-VI-III-VII">i VI III VII</option>
+                  <option value="ii-V-I">ii V I</option>
+                  <option value="I-vi-IV-V">I vi IV V</option>
+                  <option value="I-IV-V-I">I IV V I</option>
+                  <option value="custom">Custom</option>
+                </select>
+              </label>
+              <label>
+                Custom
+                <input id="customProgression" type="text" value="I V vi IV">
+              </label>
+              <label>
+                Notes / chord
+                <select id="notesPerChord">
+                  <option value="1">1</option>
+                  <option value="2">2</option>
+                  <option value="3" selected>3</option>
+                  <option value="4">4</option>
+                  <option value="5">5</option>
+                  <option value="6">6</option>
+                  <option value="random">Random</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="arp-row">
+              <label class="toggle-label">
+                <input id="arpEnabled" type="checkbox">
+                <span>Arpeggiate</span>
+              </label>
+              <label>
+                Mode
+                <select id="arpMode">
+                  <option value="up">Up</option>
+                  <option value="down">Down</option>
+                  <option value="random">Random</option>
+                  <option value="alt">Alternate</option>
+                </select>
+              </label>
+              <label>
+                Notes arpeggiated
+                <select id="notesArpeggiated">
+                  <option value="1">1</option>
+                  <option value="2" selected>2</option>
+                  <option value="3">3</option>
+                  <option value="4">4</option>
+                  <option value="5">5</option>
+                  <option value="6">6</option>
+                </select>
+              </label>
+              <button id="rerollArpButton" type="button" class="icon-button" aria-label="Reroll arpegiation"></button>
+            </div>
+
+            <div class="velocity-row">
+              <span class="vel-label">Velocity</span>
+              <label class="slider-label">
+                Min&nbsp;<span id="velocityMinVal">64</span>
+                <input id="velocityMin" type="range" min="0" max="127" step="1" value="64">
+              </label>
+              <label class="slider-label">
+                Max&nbsp;<span id="velocityMaxVal">115</span>
+                <input id="velocityMax" type="range" min="0" max="127" step="1" value="115">
+              </label>
+              <label class="slider-label">
+                Variance&nbsp;<span id="velocityVarianceVal">0.50</span>
+                <input id="velocityVariance" type="range" min="0" max="1" step="0.01" value="0.5">
+              </label>
+              <button id="rerollVelocityButton" type="button" class="icon-button" aria-label="Reroll velocities"></button>
+            </div>
+          </div>
+
+          <!-- MIDI File Tab -->
+          <div class="tab-content" id="tabMidi" hidden>
+            <div class="midi-file-row">
+              <label class="file-button" for="midiFile">Load MIDI</label>
+              <input id="midiFile" class="hidden-input" type="file" accept=".mid,.midi,audio/midi,audio/x-midi">
+              <label>
+                Start
+                <input id="startTime" type="number" min="0" step="0.25" value="0">
+              </label>
+            </div>
+          </div>
+
+          <div class="midi-canvas-wrap">
+            <canvas id="midiCanvas" class="midi-preview" width="1000" height="360"></canvas>
+            <div id="midiTooltip" class="midi-tooltip" hidden></div>
+          </div>
+          <div class="meta" id="midiMeta">No MIDI loaded</div>
+          <button id="generateButton" class="primary generate-btn" disabled>Generate</button>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Model</h2>
+          </div>
+          <div class="model-controls" aria-label="Model controls">
+            <label>
+              Model
+              <select id="modelSelect" disabled>
+                <option value="">Scanning...</option>
+              </select>
+            </label>
+            <button id="loadModelButton" type="button" class="primary" disabled>Load</button>
+          </div>
+          <div class="map-wrap" id="mapWrap">
+            <canvas id="mapCanvas" width="900" height="900"></canvas>
+            <div class="crosshair" id="crosshair" aria-hidden="true"></div>
+          </div>
+          <div class="coords" id="coords">x: 0.0000, y: 0.0000</div>
+        </div>
+      </section>
+
+      <section class="panel console-panel">
+        <div class="panel-head">
+          <h2>Console</h2>
+          <div class="status" id="status">Waiting for model and MIDI.</div>
+        </div>
+        <div id="consoleLog" class="console-log" aria-live="polite"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Generated Audio</h2>
+          <span id="historyEmpty">No generations yet</span>
+        </div>
+        <div id="historyList" class="history-list"></div>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
