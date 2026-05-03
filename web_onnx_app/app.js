@@ -31,6 +31,9 @@ const state = {
   generations: [],
   generationIndex: 0,
   noteSource: "sequencer",
+  importedModelData: new Map(),
+  _drawMapCallCount: 0,
+  _defaultMapLoadAbort: null,
 };
 
 const el = {
@@ -68,6 +71,7 @@ const el = {
   status: document.getElementById("status"),
   modelSelect: document.getElementById("modelSelect"),
   loadModelButton: document.getElementById("loadModelButton"),
+  importModelButton: document.getElementById("importModelButton"),
 };
 
 ort.env.wasm.numThreads = 1;
@@ -83,6 +87,13 @@ el.loadModelButton.addEventListener("click", () => {
     setStatus(error.message || String(error), true);
     setModelControlsBusy(false);
     refreshGenerateState();
+  });
+});
+el.importModelButton.addEventListener("click", () => {
+  importLocalModel().catch((error) => {
+    console.error(error);
+    setStatus(error.message || String(error), true);
+    setModelControlsBusy(false);
   });
 });
 el.modelSelect.addEventListener("change", () => {
@@ -141,15 +152,16 @@ function setModelControlsBusy(isBusy) {
 }
 
 function releaseCurrentModel() {
+  appendConsole("releaseCurrentModel called - clearing map");
   const oldSession = state.session;
   state.session = null;
   state.loadedModelName = "";
   state.mapImage = null;
   if (state.mapObjectUrl) {
+    appendConsole(`Revoking mapObjectUrl: ${state.mapObjectUrl}`);
     URL.revokeObjectURL(state.mapObjectUrl);
     state.mapObjectUrl = "";
   }
-  drawMap();
 
   try {
     oldSession?.release?.();
@@ -292,6 +304,169 @@ function renderModelOptions() {
   }
 }
 
+async function importLocalModel() {
+  appendConsole("=== IMPORT START ===");
+  setModelControlsBusy(true);
+  setStatus("Importing model from local folder...");
+
+  const requiredFiles = [MODEL_FILE, MODEL_DATA_FILE, MAP_IMAGE_FILE];
+  let fileMap = new Map();
+  let folderName = "";
+
+  if ("showDirectoryPicker" in window) {
+    let dirHandle;
+    try {
+      dirHandle = await window.showDirectoryPicker();
+    } catch (error) {
+      if (error.name === "AbortError") {
+        setModelControlsBusy(false);
+        setStatus("Import cancelled.");
+        return;
+      }
+      throw new Error(`Failed to open folder: ${error.message}`);
+    }
+
+    folderName = dirHandle.name;
+    appendConsole(`Scanning folder: ${folderName}`);
+
+    try {
+      for await (const [name, handle] of dirHandle.entries()) {
+        if (handle.kind === "file" && requiredFiles.includes(name)) {
+          fileMap.set(name, await handle.getFile());
+          appendConsole(`Found: ${name}`);
+        }
+      }
+    } catch (error) {
+      setModelControlsBusy(false);
+      throw new Error(`Failed to read folder: ${error.message}`);
+    }
+
+    const missing = requiredFiles.filter(f => !fileMap.has(f));
+    if (missing.length > 0) {
+      setModelControlsBusy(false);
+      throw new Error(`Missing required files: ${missing.join(", ")}`);
+    }
+
+    await performImport(folderName, fileMap, requiredFiles);
+    return;
+  } else {
+    let input = document.getElementById("__importModelFileInput");
+    if (!input) {
+      input = document.createElement("input");
+      input.id = "__importModelFileInput";
+      input.type = "file";
+      input.webkitdirectory = true;
+      input.multiple = true;
+      input.style.display = "none";
+      document.body.appendChild(input);
+    }
+
+    return new Promise((resolve, reject) => {
+      input.onchange = async () => {
+        try {
+          const files = Array.from(input.files || []);
+          if (!files.length) {
+            setModelControlsBusy(false);
+            setStatus("Import cancelled.");
+            resolve();
+            return;
+          }
+
+          const filesByName = new Map(files.map(f => [f.name, f]));
+          folderName = files[0].webkitRelativePath?.split("/")[0] || "imported_model";
+          appendConsole(`Scanning folder: ${folderName}`);
+
+          for (const fileName of requiredFiles) {
+            const file = filesByName.get(fileName);
+            if (file) {
+              fileMap.set(fileName, file);
+              appendConsole(`Found: ${fileName}`);
+            }
+          }
+
+          if (fileMap.size === requiredFiles.length) {
+            await performImport(folderName, fileMap, requiredFiles);
+            resolve();
+          } else {
+            const missing = requiredFiles.filter(f => !fileMap.has(f));
+            reject(new Error(`Missing required files: ${missing.join(", ")}`));
+          }
+        } catch (error) {
+          reject(error);
+        } finally {
+          input.value = "";
+        }
+      };
+
+      input.click();
+    });
+  }
+}
+
+async function performImport(folderName, fileMap, requiredFiles) {
+  setStatus("Processing model files...");
+
+  const baseUrl = `/api/custom-models/${folderName}`;
+  const modelData = {};
+
+  const useCache = "caches" in window;
+  if (useCache) {
+    setStatus("Caching model files...");
+    const cacheName = modelCacheName(folderName);
+    const cache = await caches.open(cacheName);
+
+    for (const fileName of requiredFiles) {
+      const file = fileMap.get(fileName);
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const response = new Response(arrayBuffer, {
+          headers: { "Content-Type": file.type || "application/octet-stream" },
+        });
+        const cacheKey = new Request(`${baseUrl}/${fileName}`);
+        await cache.put(cacheKey, response);
+        appendConsole(`Cached: ${baseUrl}/${fileName}`);
+      } catch (error) {
+        throw new Error(`Failed to cache ${fileName}: ${error.message}`);
+      }
+    }
+  } else {
+    appendConsole("Cache API unavailable. Storing model in memory (session only).");
+    for (const fileName of requiredFiles) {
+      const file = fileMap.get(fileName);
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        modelData[fileName] = arrayBuffer;
+        appendConsole(`Loaded to memory: ${fileName}`);
+      } catch (error) {
+        throw new Error(`Failed to read ${fileName}: ${error.message}`);
+      }
+    }
+    state.importedModelData.set(folderName, modelData);
+    appendConsole(`Stored imported model data: ${Object.keys(modelData).join(", ")}`);
+  }
+
+  const model = { name: folderName, baseUrl };
+
+  const existingIndex = state.availableModels.findIndex(m => m.name === folderName);
+  if (existingIndex >= 0) {
+    state.availableModels[existingIndex] = model;
+    appendConsole(`Updated existing model: ${folderName}`);
+  } else {
+    state.availableModels.push(model);
+    state.availableModels.sort((a, b) => a.name.localeCompare(b.name));
+    appendConsole(`Added new model: ${folderName}`);
+  }
+
+  renderModelOptions();
+  state.selectedModelName = folderName;
+  state.modelBaseUrl = baseUrl;
+  el.modelSelect.value = folderName;
+
+  setStatus(`Model imported: ${folderName}`);
+  setModelControlsBusy(false);
+  refreshGenerateState();
+}
+
 async function isModelFullyCached(model) {
   if (!("caches" in window)) {
     return false;
@@ -387,6 +562,15 @@ async function warmModelCache(model, forceReload = false) {
   const dataUrl = `${model.baseUrl}/${MODEL_DATA_FILE}`;
   const mapUrl = `${model.baseUrl}/${MAP_IMAGE_FILE}`;
 
+  const importedData = state.importedModelData.get(model.name);
+  if (importedData) {
+    appendConsole("Using imported model from memory");
+    return {
+      modelBytes: new Uint8Array(importedData[MODEL_FILE]),
+      dataBytes: new Uint8Array(importedData[MODEL_DATA_FILE]),
+    };
+  }
+
   if (!("caches" in window)) {
     appendConsole("Cache API unavailable, downloading model...");
     const modelBytes = await fetchBytes(modelUrl, forceReload);
@@ -453,7 +637,15 @@ async function loadMapImage(model, forceReload = false) {
   let blob;
 
   try {
-    if ("caches" in window) {
+    const importedData = state.importedModelData.get(model.name);
+    appendConsole(`Looking for imported map: model.name=${model.name}, importedData=${!!importedData}, has map=${!!importedData?.[MAP_IMAGE_FILE]}`);
+    if (importedData && importedData[MAP_IMAGE_FILE]) {
+      appendConsole("map image loaded from imported model");
+      const mapArrayBuffer = importedData[MAP_IMAGE_FILE];
+      appendConsole(`map arrayBuffer size: ${mapArrayBuffer.byteLength} bytes`);
+      blob = new Blob([mapArrayBuffer], { type: "image/png" });
+      appendConsole(`created blob size: ${blob.size} bytes`);
+    } else if ("caches" in window) {
       const cache = await caches.open(modelCacheName(model.name));
       const cached = !forceReload ? await cache.match(mapUrl) : null;
 
@@ -510,10 +702,18 @@ async function loadMapImage(model, forceReload = false) {
   }
 
   state.mapObjectUrl = URL.createObjectURL(blob);
+  appendConsole(`Created map object URL: ${state.mapObjectUrl}`);
   img.src = state.mapObjectUrl;
-  await img.decode();
+
+  try {
+    await img.decode();
+    appendConsole("Map image decoded successfully");
+  } catch (decodeError) {
+    appendConsole(`Warning: map image decode failed: ${decodeError.message}, but continuing`);
+  }
 
   state.mapImage = img;
+  appendConsole(`Set state.mapImage, calling drawMap()`);
   drawMap();
 }
 
@@ -1402,6 +1602,9 @@ async function loadDefaultMapImage() {
 }
 
 function drawMap() {
+  state._drawMapCallCount++;
+  const stack = new Error().stack?.split('\n').slice(1, 3).join(' | ') || '';
+  appendConsole(`[${state._drawMapCallCount}] drawMap: mapImage=${!!state.mapImage}, from: ${stack}`);
   const ctx = el.mapCanvas.getContext("2d");
   const cssSize = Math.round(el.mapWrap.getBoundingClientRect().width || 900);
   if (el.mapCanvas.width !== cssSize || el.mapCanvas.height !== cssSize) {
@@ -1409,13 +1612,16 @@ function drawMap() {
     el.mapCanvas.height = cssSize;
   }
   const { width, height } = el.mapCanvas;
+
+
   if (!state.mapImage) {
+    appendConsole("drawMap: state.mapImage is empty, loading default");
     loadDefaultMapImage().catch((error) => {
       appendConsole(`default map image failed: ${error.message || String(error)}`);
-      drawMap();
     });
     return;
   }
+  
   ctx.clearRect(0, 0, width, height);
   // ctx.fillStyle = "#eef1f4";
   // ctx.fillRect(0, 0, width, height);
