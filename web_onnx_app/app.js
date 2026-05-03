@@ -309,6 +309,7 @@ async function hasModelFiles(baseUrl) {
 }
 
 async function logDirectoryFiles(baseUrl) {
+  appendConsole("Trying to list the files");
   try {
     const response = await fetch(`${baseUrl}/`, { cache: "no-store" });
     if (!response.ok) {
