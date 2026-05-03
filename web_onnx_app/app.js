@@ -1,7 +1,8 @@
 const MODEL_ROOT_URLS = [
-  "/AFTER/export_onnx",        // GitHub Pages
-  "/export_onnx",              // Local development
-  "/web_onnx_app/export_onnx"  // Fallback
+  // "/AFTER/export_onnx",        // GitHub Pages
+  "../export_onnx",  
+  "export_onnx",             // Local development
+  // "/web_onnx_app/export_onnx"  // Fallback
 ];
 const MODEL_FILE = "midi_full_audio.onnx";
 const MODEL_DATA_FILE = "midi_full_audio.onnx.data";
@@ -309,10 +310,7 @@ async function hasModelFiles(baseUrl) {
 
 async function scanModels() {
   console.log("SCAN MODELS CALLED");
-
-  // el.modelStatus.textContent = "Scanning models...";
   appendConsole("Scanning models...");
-
 
   const byName = new Map();
   const failures = [];
