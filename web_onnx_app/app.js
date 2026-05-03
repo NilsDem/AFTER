@@ -90,8 +90,10 @@ el.loadModelButton.addEventListener("click", () => {
   });
 });
 el.importModelButton.addEventListener("click", () => {
+  appendConsole("Import button clicked");
   importLocalModel().catch((error) => {
     console.error(error);
+    appendConsole(`Import error: ${error.message || String(error)}`);
     setStatus(error.message || String(error), true);
     setModelControlsBusy(false);
   });
