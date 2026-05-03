@@ -630,7 +630,7 @@ async function loadSelectedModel(forceReload = null) {
     throw new Error("Select a model first.");
   }
   setModelControlsBusy(true);
-  const shouldRefreshCache = forceReload ?? await isModelFullyCached(model);
+  const shouldRefreshCache = forceReload ?? !(await isModelFullyCached(model));
   if (shouldRefreshCache) {
     appendConsole(`Refreshing cached model: ${model.name}`);
     setStatus("Refreshing cached model...");
