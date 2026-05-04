@@ -187,7 +187,8 @@ class Base(nn.Module):
             update_classifier_every=2,
             timbre_noise_aug=0.,
             structure_noise_aug=0.,
-            logger=None):
+            logger=None,
+            **kwargs):
 
         self.train_encoder = train_encoder
         self.train_encoder_time = train_encoder_time

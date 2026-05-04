@@ -11,7 +11,7 @@ from absl import flags, app
 from torch.utils.tensorboard import SummaryWriter
 
 from after.dataset import SimpleDataset
-from after.diffusion.utils import collate_fn_after, get_datasets
+from after.diffusion.utils import collate_fn, get_datasets
 from after.encoder_ssl.utils import collate_fn_simdino
 from after.diffusion.model import RectifiedFlow
 from after.encoder_ssl.model import SimDino
@@ -132,7 +132,7 @@ def main(argv):
           " - emb size : ", ae_emb_size)
 
     with gin.unlock_config():
-        gin.bind_parameter("diffusion.utils.collate_fn_after.ae_ratio",
+        gin.bind_parameter("diffusion.utils.collate_fn.ae_ratio",
                            ae_ratio)
 
         gin.bind_parameter("%IN_SIZE", ae_emb_size)
@@ -157,11 +157,11 @@ def main(argv):
             gin.bind_parameter(
                 "diffusion.utils.get_datasets.compress_tc",
                 gin.query_parameter(
-                    "diffusion.utils.collate_fn_after.compress_tc"))
+                    "diffusion.utils.collate_fn.compress_tc"))
             gin.bind_parameter("diffusion.utils.get_datasets.sr",
                                gin.query_parameter("%SR"))
 
-            gin.bind_parameter("diffusion.utils.collate_fn_after.precomp_pr",
+            gin.bind_parameter("diffusion.utils.collate_fn.precomp_pr",
                                FLAGS.use_cache)
 
     blender = RectifiedFlow(device=device, emb_model=emb_model)
@@ -182,9 +182,9 @@ def main(argv):
                      if "midi" in k] if structure_type == "midi" else []
     elif augmentation_keys == "config":
         structure_keys = gin.query_parameter(
-            "diffusion.utils.collate_fn_after.structure_keys")
+            "diffusion.utils.collate_fn.structure_keys")
         timbre_keys = gin.query_parameter(
-            "diffusion.utils.collate_fn_after.timbre_keys")
+            "diffusion.utils.collate_fn.timbre_keys")
         midi_keys = []
     else:
         structure_keys = timbre_keys = midi_keys = []
@@ -195,9 +195,9 @@ def main(argv):
     with gin.unlock_config():
         if FLAGS.use_timbre_augments_structure:
             structure_keys = structure_keys + timbre_keys
-        gin.bind_parameter("diffusion.utils.collate_fn_after.structure_keys",
+        gin.bind_parameter("diffusion.utils.collate_fn.structure_keys",
                            structure_keys)
-        gin.bind_parameter("diffusion.utils.collate_fn_after.timbre_keys",
+        gin.bind_parameter("diffusion.utils.collate_fn.timbre_keys",
                            timbre_keys)
 
         gin.bind_parameter(
@@ -206,7 +206,7 @@ def main(argv):
         print(structure_keys + timbre_keys + ["z"])
 
     try:  # Writing parameters to config
-        dummy = collate_fn_after([])
+        dummy = collate_fn([])
         dummy = collate_fn_simdino([])
     except:
         pass
@@ -314,7 +314,7 @@ def main(argv):
         num_workers=FLAGS.num_workers,
         drop_last=True,
         pin_memory=True,
-        collate_fn=collate_fn_after,
+        collate_fn=collate_fn,
         sampler=train_sampler)
 
     if FLAGS.use_validation:
@@ -325,7 +325,7 @@ def main(argv):
             num_workers=FLAGS.num_workers,
             drop_last=True,
             pin_memory=True,
-            collate_fn=collate_fn_after,
+            collate_fn=collate_fn,
             sampler=val_sampler)
     else:
         valid_loader = None

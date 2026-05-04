@@ -25,7 +25,7 @@ diffusion.utils.get_datasets:
     db_list = None
     emb_model_path = None
 
-diffusion.utils.collate_fn_after:
+diffusion.utils.collate_fn:
     n_signal = %N_SIGNAL
     structure_type = %STRUCTURE_TYPE
     compress_tc = 4

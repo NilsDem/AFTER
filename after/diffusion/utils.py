@@ -21,8 +21,8 @@ def make_key_sampler(structure_type, structure_keys, timbre_keys):
         timbre_key = np.random.choice(timbre_keys) if timbre_keys else "z"
         needed = {"metadata", target_key, timbre_key}
         if structure_type == "midi":
-            midi_key = ("midi" if target_key == "z"
-                        else target_key.replace("z", "midi"))
+            midi_key = ("midi" if target_key == "z" else target_key.replace(
+                "z", "midi"))
             needed.add(midi_key)
         return target_key, timbre_key, needed
 
@@ -52,11 +52,10 @@ def get_datasets(
     compress_tc=None,
     sr=None,
     emb_model_path=None,
-    # Lazy-loading: when set, __getitem__ loads only the keys collate_fn needs.
-    # Mirror the structure_type / structure_keys / timbre_keys from collate_fn_after.
     structure_type=None,
     structure_keys=None,
     timbre_keys=None,
+    **kwargs,
 ):
     # Build a key sampler so each dataset item only loads what collate needs.
     # Falls back to loading all data_keys when structure_type is not provided.
@@ -100,16 +99,17 @@ def get_datasets(
 
 
 @gin.configurable
-def collate_fn_after(batch,
-                     n_signal,
-                     structure_type,
-                     ae_ratio,
-                     timbre_limit=None,
-                     timbre_keys=None,
-                     structure_keys=None,
-                     precomp_pr=False,
-                     compress_tc=None,
-                     shift_tc=0):
+def collate_fn(batch,
+               n_signal,
+               structure_type,
+               ae_ratio,
+               timbre_limit=None,
+               timbre_keys=None,
+               structure_keys=None,
+               precomp_pr=False,
+               compress_tc=None,
+               shift_tc=0,
+               **kwargs):
     """
     Simplified single-loop collate_fn that safely handles all structures.
     """
@@ -126,7 +126,7 @@ def collate_fn_after(batch,
         # Use pre-selected key from __getitem__ (lazy-load path) when available;
         # fall back to sampling for cached items that carry all keys.
         key = b.get("_target_key") or np.random.choice(["z"] * 3 +
-                                                        structure_keys)
+                                                       structure_keys)
         selected_target_keys.append(key)
 
         # Base signal (target)

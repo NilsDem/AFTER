@@ -125,13 +125,29 @@ def main(argv):
     SR = gin.query_parameter("%SR")
 
     with gin.unlock_config():
-        gin.bind_parameter("transformerv2.DenoiserV2.streaming", True)
+        try:
+            gin.bind_parameter("transformerv2.DenoiserV2.streaming", True)
+        except ValueError:
+            try:
+                cache_size = gin.query_parameter("%LOCAL_ATTENTION_SIZE")
+                gin.bind_parameter("transformerv2.MHAttention.max_cache_size",
+                                   cache_size)
+            except ValueError:
+                try:
+                    n_signal = gin.query_parameter("%N_SIGNAL")
+                    gin.bind_parameter("transformer.Denoiser.max_cache_size",
+                                       n_signal)
+                except ValueError:
+                    pass
 
     # Resolve codec path
     emb_model_path = FLAGS.emb_model_path
     if emb_model_path == "./pretrained/test.ts" or emb_model_path is None:
-        trained_path = gin.query_parameter(
-            "diffusion.utils.get_datasets.emb_model_path")
+        try:
+            trained_path = gin.query_parameter(
+                "diffusion.utils.get_datasets.emb_model_path")
+        except ValueError:
+            trained_path = None
         if not trained_path:
             raise RuntimeError(
                 "No --emb_model_path provided and none saved in config.\n"
@@ -179,8 +195,16 @@ def main(argv):
                     ])
                     db_list += subdirs
             else:
-                db_list = gin.query_parameter(
-                    "diffusion.utils.get_datasets.db_list")
+                try:
+                    db_list = gin.query_parameter(
+                        "diffusion.utils.get_datasets.db_list")
+                except ValueError:
+                    try:
+                        path_dict_legacy = gin.query_parameter(
+                            "utils.get_datasets.path_dict")
+                        db_list = list(path_dict_legacy.keys())
+                    except ValueError:
+                        db_list = []
             path_dict = {k: {"path": k, "name": k} for k in db_list}
             dataset = CombinedDataset(path_dict=path_dict,
                                       keys=["z", "metadata"])

@@ -123,6 +123,7 @@ class MHAttention(nn.Module):
         max_diffusion_steps: int = 16,
         max_batch_size: int = 4,
         max_seq_len: int = 128,
+        **kwargs,
     ):
         super().__init__()
         self.is_causal = bool(is_causal)
