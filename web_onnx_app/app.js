@@ -1,8 +1,8 @@
 const MODEL_ROOT_URLS = [
   // "/AFTER/export_onnx",        // GitHub Pages
   // "/after",
-  "../export_onnx",  
-  // "/export_onnx",             // Local development
+  // "../export_onnx",  
+  "/export_onnx",             // Local development
   // "/web_onnx_app/export_onnx"  // Fallback
 ];
 const MODEL_FILE = "midi_full_audio.onnx";

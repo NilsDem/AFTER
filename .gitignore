@@ -1,4 +1,5 @@
 # export_onnx*
+export_onnx_private
 .codex
 tests/
 .claude/

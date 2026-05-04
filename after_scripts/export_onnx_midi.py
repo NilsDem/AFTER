@@ -244,7 +244,6 @@ class MidiDiffuseLatentONNX(nn.Module):
         x = noise
         for i in range(self.nb_steps):
             t = self.t_vals[i].reshape(1).expand(x.shape[0])
-            print(time_cond.shape)
             dx = self.net(x,
                           time=t,
                           cond=cond,
@@ -478,7 +477,7 @@ def main():
     parser.add_argument("--latent_embeddings", default=None)
     parser.add_argument("--project_model_path", default=None)
     parser.add_argument("--save_project_model", default=None)
-    parser.add_argument("--projector_steps", type=int, default=200)
+    parser.add_argument("--projector_steps", type=int, default=10000)
     parser.add_argument("--projector_batch_size", type=int, default=128)
     parser.add_argument("--projector_lr", type=float, default=1e-4)
     parser.add_argument("--num_projector_examples", type=int, default=512)
