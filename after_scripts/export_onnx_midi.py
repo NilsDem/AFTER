@@ -3,7 +3,7 @@
 Export a browser-oriented ONNX MIDI AFTER pipeline.
 
 Target model:
-  map_pos [1, 2] + piano_roll [1, 128, 4 * N_SIGNAL] + noise [1, IN_SIZE, N_SIGNAL]
+  map_pos [1, 2] + piano_roll [1, 128, compress_tc * N_SIGNAL] + noise [1, IN_SIZE, N_SIGNAL]
     -> generated audio [1, 1, N_SIGNAL * 4096]
 
 The explicit noise input keeps the graph deterministic and browser-friendly.
@@ -244,6 +244,7 @@ class MidiDiffuseLatentONNX(nn.Module):
         x = noise
         for i in range(self.nb_steps):
             t = self.t_vals[i].reshape(1).expand(x.shape[0])
+            print(time_cond.shape)
             dx = self.net(x,
                           time=t,
                           cond=cond,
@@ -344,6 +345,43 @@ def get_dataset_path_dict() -> dict:
     raise ValueError("Could not resolve dataset paths from config. "
                      "Expected diffusion.utils.get_datasets.db_list or "
                      "utils.get_datasets.path_dict.")
+
+
+def get_time_cond_ratio() -> int:
+    for selector in ("utils.collate_fn_after.compress_tc",
+                     "diffusion.utils.collate_fn_after.compress_tc",
+                     "utils.get_datasets.compress_tc",
+                     "diffusion.utils.get_datasets.compress_tc"):
+        try:
+            ratio = gin.query_parameter(selector)
+            break
+        except (ValueError, AttributeError):
+            pass
+    else:
+        ratio = None
+
+    if ratio is None:
+        return 1
+
+    ratio = int(ratio)
+    if ratio <= 0:
+        raise ValueError(f"compress_tc must be positive or None, got {ratio}")
+    return ratio
+
+
+def get_structure_type() -> Optional[str]:
+    for selector in ("%STRUCTURE_TYPE",
+                     "utils.collate_fn_after.structure_type",
+                     "diffusion.utils.collate_fn_after.structure_type",
+                     "utils.get_datasets.structure_type",
+                     "diffusion.utils.get_datasets.structure_type"):
+        try:
+            structure_type = gin.query_parameter(selector)
+            if structure_type is not None:
+                return str(structure_type)
+        except (ValueError, AttributeError):
+            pass
+    return None
 
 
 def ensure_latent_embeddings(
@@ -468,12 +506,17 @@ def main():
     args.n_signal = gin.query_parameter("%N_SIGNAL")
     args.zs_channels = gin.query_parameter("%ZS_CHANNELS")
     args.zt_channels = gin.query_parameter("%ZT_CHANNELS")
-    midi_frames = args.n_signal * 4
+    time_cond_ratio = get_time_cond_ratio()
+    midi_frames = args.n_signal * time_cond_ratio
+    structure_type = get_structure_type()
     has_encoder_time = blender.encoder_time is not None
-    structure_name = "piano_roll" if has_encoder_time else "time_cond"
+    uses_piano_roll = structure_type == "midi"
+    structure_name = "piano_roll" if uses_piano_roll else "time_cond"
 
     print(f"Loaded diffusion checkpoint: {checkpoint}")
-    if has_encoder_time:
+    print(f"Structure type: {structure_type or 'unknown'}")
+    print(f"Time condition ratio: {time_cond_ratio}")
+    if uses_piano_roll:
         print(f"Shapes: map_pos=[1,2], piano_roll=[1,128,{midi_frames}], "
               f"noise=[1,{args.in_size},{args.n_signal}]")
     else:
@@ -499,7 +542,7 @@ def main():
     piano_roll = torch.zeros(1, 128, midi_frames)
     piano_roll[:, 60, ::4] = 1.0
     time_cond = torch.zeros(1, args.zs_channels, args.n_signal)
-    structure_input = piano_roll if has_encoder_time else time_cond
+    structure_input = piano_roll if uses_piano_roll else time_cond
     noise = torch.randn(1, args.in_size, args.n_signal)
     timbre = torch.randn(1, args.zt_channels)
 

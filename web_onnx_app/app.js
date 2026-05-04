@@ -12,9 +12,6 @@ const DEFAULT_MODEL_NAME = "orchestral_simdino";
 const SAMPLE_RATE = 44100;
 const CHUNK_SAMPLES = 262144;
 const CHUNK_SECONDS = CHUNK_SAMPLES / SAMPLE_RATE;
-const PR_FRAMES = 256;
-const LATENT_FRAMES = 64;
-const TIME_COND_CHANNELS = 128;
 const MAP_RANGE = 1.25;
 
 const state = {
@@ -32,6 +29,10 @@ const state = {
   generationIndex: 0,
   noteSource: "sequencer",
   importedModelData: new Map(),
+  inputDimsByName: {},
+  noiseDims: null,
+  pianoRollDims: null,
+  pianoRollInputName: null,
   _drawMapCallCount: 0,
   _defaultMapLoadAbort: null,
 };
@@ -74,6 +75,43 @@ const el = {
 };
 
 ort.env.wasm.numThreads = 1;
+
+
+function makeSessionOptions(executionProviders, dataBytes) {
+  return {
+    executionProviders,
+    graphOptimizationLevel: "all",
+    externalData: [
+      {
+        path: "midi_full_audio.onnx.data",
+        data: dataBytes,
+      },
+    ],
+  };
+}
+
+async function createOnnxSession(modelFiles) {
+  const canUseWebGpu = Boolean(navigator.gpu);
+  const providers = canUseWebGpu ? ["webgpu", "wasm"] : ["wasm"];
+  appendConsole(`ONNX execution providers: ${providers.join(", ")}`);
+
+  try {
+    return await ort.InferenceSession.create(
+      modelFiles.modelBytes,
+      makeSessionOptions(providers, modelFiles.dataBytes),
+    );
+  } catch (error) {
+    if (!canUseWebGpu) {
+      throw error;
+    }
+
+    appendConsole(`WebGPU session failed, retrying WASM: ${error.message || String(error)}`);
+    return await ort.InferenceSession.create(
+      modelFiles.modelBytes,
+      makeSessionOptions(["wasm"], modelFiles.dataBytes),
+    );
+  }
+}
 
 
 function modelCacheName(modelName) {
@@ -624,22 +662,15 @@ async function loadModel(model, forceReload = false) {
     const modelFiles = await warmModelCache(model, forceReload);
     await loadMapImage(model, forceReload);
     appendConsole("Creating ONNX session...");
-    state.session = await ort.InferenceSession.create(modelFiles.modelBytes, {
-      executionProviders: ["wasm"],
-      graphOptimizationLevel: "all",
-      externalData: [
-        {
-          path: "midi_full_audio.onnx.data",
-          data: modelFiles.dataBytes,
-        },
-      ],
-    });
+    state.session = await createOnnxSession(modelFiles);
 
     console.log("inputNames:", state.session.inputNames);
     console.log("inputMetadata:", state.session.inputMetadata);
 
     state.inputDimsByName = {};
     state.noiseDims = null;
+    state.pianoRollDims = null;
+    state.pianoRollInputName = null;
 
     // for (const inputName of state.session.inputNames) {
     //   try {
@@ -1147,8 +1178,15 @@ function drawMidiPreview() {
 }
 
 function buildPianoRoll(windowStartSeconds) {
-  const roll = new Float32Array(128 * PR_FRAMES);
-  const frameSeconds = CHUNK_SECONDS / PR_FRAMES;
+  const dims = getPianoRollDims();
+  const channels = dims[1];
+  const frames = dims[2];
+  if (channels !== 128) {
+    throw new Error(`Expected piano_roll pitch dimension 128, got ${channels}.`);
+  }
+
+  const roll = new Float32Array(channels * frames);
+  const frameSeconds = CHUNK_SECONDS / frames;
   const windowEnd = windowStartSeconds + CHUNK_SECONDS;
   for (const note of getActiveNotes()) {
     const noteStart = note.time;
@@ -1157,13 +1195,13 @@ function buildPianoRoll(windowStartSeconds) {
       continue;
     }
     const first = Math.max(0, Math.floor((noteStart - windowStartSeconds) / frameSeconds));
-    const last = Math.min(PR_FRAMES - 1, Math.ceil((noteEnd - windowStartSeconds) / frameSeconds));
+    const last = Math.min(frames - 1, Math.ceil((noteEnd - windowStartSeconds) / frameSeconds));
     const value = clamp01(note.velocity ?? 1);
     for (let frame = first; frame <= last; frame++) {
-      roll[note.midi * PR_FRAMES + frame] = Math.max(roll[note.midi * PR_FRAMES + frame], value);
+      roll[note.midi * frames + frame] = Math.max(roll[note.midi * frames + frame], value);
     }
   }
-  return new ort.Tensor("float32", roll, [1, 128, PR_FRAMES]);
+  return new ort.Tensor("float32", roll, dims);
 }
 
 function makeMapTensor() {
@@ -1226,6 +1264,39 @@ function getNoiseDims() {
   return state.noiseDims;
 }
 
+function getPianoRollDims() {
+  if (state.pianoRollDims) {
+    return state.pianoRollDims;
+  }
+
+  const inputName = getPianoRollInputName();
+  state.pianoRollDims = getInputDims(inputName, null);
+  const noiseFrames = getNoiseDims()[2];
+  const pianoRollFrames = state.pianoRollDims[2];
+  appendConsole(`${inputName} frames from ONNX metadata: ${pianoRollFrames} (${pianoRollFrames / noiseFrames}x noise frames)`);
+
+  return state.pianoRollDims;
+}
+
+function getPianoRollInputName() {
+  if (state.pianoRollInputName) {
+    return state.pianoRollInputName;
+  }
+
+  if (state.session?.inputNames.includes("piano_roll")) {
+    state.pianoRollInputName = "piano_roll";
+    return state.pianoRollInputName;
+  }
+
+  if (state.session?.inputNames.includes("time_cond")) {
+    state.pianoRollInputName = "time_cond";
+    appendConsole("Using legacy time_cond input as piano_roll.");
+    return state.pianoRollInputName;
+  }
+
+  throw new Error("Model has no piano_roll input.");
+}
+
 function getInputMeta(name) {
   const metadata = state.session?.inputMetadata;
 
@@ -1275,11 +1346,6 @@ function normalizeDims(dims) {
   }
 
   return normalized;
-}
-
-function makeTimeCondTensor() {
-  const dims = getInputDims("time_cond", [1, TIME_COND_CHANNELS, LATENT_FRAMES]);
-  return new ort.Tensor("float32", new Float32Array(dims.slice(1).reduce((acc, value) => acc * value, 1)), dims);
 }
 
 function historyMeta(settings, seconds) {
@@ -1588,12 +1654,7 @@ async function generateAudio() {
         map_pos: mapTensor,
         noise: makeNoiseTensor(),
       };
-      if (state.session.inputNames.includes("piano_roll")) {
-        feeds.piano_roll = buildPianoRoll(start + chunk * CHUNK_SECONDS);
-      }
-      if (state.session.inputNames.includes("time_cond")) {
-        feeds.time_cond = makeTimeCondTensor();
-      }
+      feeds[getPianoRollInputName()] = buildPianoRoll(start + chunk * CHUNK_SECONDS);
       const result = await state.session.run(feeds);
       const resultKeys = Object.keys(result);
       // appendConsole(`chunk ${chunk + 1}: outputs ${resultKeys.join(", ")}`);
