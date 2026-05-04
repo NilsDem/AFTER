@@ -1,7 +1,9 @@
 const MODEL_ROOT_URLS = [
-  "/AFTER/export_onnx",        // GitHub Pages
-  "/export_onnx",              // Local development
-  "/web_onnx_app/export_onnx"  // Fallback
+  // "/AFTER/export_onnx",        // GitHub Pages
+  // "/after",
+  "../export_onnx",  
+  // "/export_onnx",             // Local development
+  // "/web_onnx_app/export_onnx"  // Fallback
 ];
 const MODEL_FILE = "midi_full_audio.onnx";
 const MODEL_DATA_FILE = "midi_full_audio.onnx.data";
@@ -393,12 +395,35 @@ async function hasModelFiles(baseUrl) {
   return true;
 }
 
+async function logDirectoryFiles(baseUrl) {
+  appendConsole("Trying to list the files");
+  try {
+    const response = await fetch(`${baseUrl}/`, { cache: "no-store" });
+    if (!response.ok) {
+      appendConsole(`Could not list ${baseUrl}/: HTTP ${response.status}`);
+      return;
+    }
+
+    const html = await response.text();
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const folderPath = new URL(`${baseUrl}/`, location.origin).pathname.replace(/\/$/, "");
+    const entries = [...doc.querySelectorAll("a[href]")]
+      .map((link) => link.getAttribute("href"))
+      .filter(Boolean)
+      .map((href) => new URL(href, response.url).pathname)
+      .filter((pathname) => pathname.startsWith(`${folderPath}/`))
+      .map((pathname) => pathname.slice(folderPath.length + 1).replace(/\/$/, ""))
+      .filter((name) => name && !name.includes("/"));
+
+    appendConsole(`Files in ${baseUrl}: ${entries.length ? entries.join(", ") : "(none)"}`);
+  } catch (error) {
+    appendConsole(`Could not list ${baseUrl}/: ${error.message || String(error)}`);
+  }
+}
+
 async function scanModels() {
   console.log("SCAN MODELS CALLED");
-
-  // el.modelStatus.textContent = "Scanning models...";
   appendConsole("Scanning models...");
-
 
   const byName = new Map();
   const failures = [];
@@ -430,7 +455,7 @@ async function scanModels() {
 
         const url = new URL(href, response.url);
         const pathname = url.pathname.replace(/\/$/, "");
-        const rootPath = new URL(rootUrl, location.origin).pathname.replace(/\/$/, "");
+        const rootPath = new URL(rootUrl, location.href).pathname.replace(/\/$/, "");
 
         if (!pathname.startsWith(rootPath)) {
           continue;
@@ -446,6 +471,7 @@ async function scanModels() {
         const baseUrl = pathname;
 
         appendConsole(`Checking model candidate: ${name} at ${baseUrl}`);
+        await logDirectoryFiles(baseUrl);
 
         if (!byName.has(name) && await hasModelFiles(baseUrl)) {
           byName.set(name, { name, baseUrl });
@@ -690,7 +716,7 @@ async function loadSelectedModel(forceReload = null) {
     throw new Error("Select a model first.");
   }
   setModelControlsBusy(true);
-  const shouldRefreshCache = forceReload ?? await isModelFullyCached(model);
+  const shouldRefreshCache = forceReload ?? !(await isModelFullyCached(model));
   if (shouldRefreshCache) {
     appendConsole(`Refreshing cached model: ${model.name}`);
     setStatus("Refreshing cached model...");
