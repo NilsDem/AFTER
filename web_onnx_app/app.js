@@ -90,27 +90,75 @@ function makeSessionOptions(executionProviders, dataBytes) {
   };
 }
 
-async function createOnnxSession(modelFiles) {
-  const canUseWebGpu = Boolean(navigator.gpu);
-  const providers = canUseWebGpu ? ["webgpu", "wasm"] : ["wasm"];
-  appendConsole(`ONNX execution providers: ${providers.join(", ")}`);
+function getBackendPreference() {
+  const value = new URLSearchParams(window.location.search).get("backend");
+  if (value === "webgpu" || value === "wasm") {
+    return value;
+  }
+  return "auto";
+}
+
+async function getWebGpuAdapter() {
+  if (!window.isSecureContext) {
+    appendConsole(`WebGPU unavailable: ${window.location.origin} is not a secure context. Use HTTPS or open the app through localhost.`);
+    return null;
+  }
+
+  if (!navigator.gpu) {
+    appendConsole("WebGPU unavailable: navigator.gpu is missing.");
+    return null;
+  }
 
   try {
-    return await ort.InferenceSession.create(
-      modelFiles.modelBytes,
-      makeSessionOptions(providers, modelFiles.dataBytes),
-    );
-  } catch (error) {
-    if (!canUseWebGpu) {
-      throw error;
+    const adapter = await navigator.gpu.requestAdapter({
+      powerPreference: "high-performance",
+    });
+    if (!adapter) {
+      appendConsole("WebGPU unavailable: requestAdapter() returned null.");
+      return null;
     }
+    appendConsole("WebGPU adapter available.");
+    return adapter;
+  } catch (error) {
+    appendConsole(`WebGPU unavailable: ${error.message || String(error)}`);
+    return null;
+  }
+}
 
-    appendConsole(`WebGPU session failed, retrying WASM: ${error.message || String(error)}`);
+async function createOnnxSession(modelFiles) {
+  const backendPreference = getBackendPreference();
+
+  if (backendPreference === "wasm") {
+    appendConsole("ONNX execution provider: wasm");
     return await ort.InferenceSession.create(
       modelFiles.modelBytes,
       makeSessionOptions(["wasm"], modelFiles.dataBytes),
     );
   }
+
+  const webGpuAdapter = await getWebGpuAdapter();
+  if (webGpuAdapter) {
+    appendConsole("ONNX execution provider: webgpu");
+    try {
+      return await ort.InferenceSession.create(
+        modelFiles.modelBytes,
+        makeSessionOptions(["webgpu"], modelFiles.dataBytes),
+      );
+    } catch (error) {
+      appendConsole(`WebGPU session failed: ${error.message || String(error)}`);
+      if (backendPreference === "webgpu") {
+        throw error;
+      }
+    }
+  } else if (backendPreference === "webgpu") {
+    throw new Error("WebGPU was requested with ?backend=webgpu, but no adapter is available.");
+  }
+
+  appendConsole("ONNX execution provider: wasm");
+  return await ort.InferenceSession.create(
+    modelFiles.modelBytes,
+    makeSessionOptions(["wasm"], modelFiles.dataBytes),
+  );
 }
 
 
