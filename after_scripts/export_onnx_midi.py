@@ -11,6 +11,7 @@ The existing training/runtime classes are not modified.
 """
 
 import argparse
+import json
 import os
 import pathlib
 import sys
@@ -386,6 +387,34 @@ def structure_dynamic_axes(structure_name: str):
     }
 
 
+def build_model_card(args, structure_name: str, structure_type: Optional[str],
+                     time_cond_ratio: int, midi_frames: int) -> dict:
+    return {
+        "format": "after-midi-onnx-v1",
+        "structure_name": structure_name,
+        "structure_type": structure_type or "unknown",
+        "n_signal": int(args.n_signal),
+        "in_size": int(args.in_size),
+        "zs_channels": int(args.zs_channels),
+        "zt_channels": int(args.zt_channels),
+        "time_cond_ratio": int(time_cond_ratio),
+        "base_noise_frames": int(args.n_signal),
+        "base_piano_roll_frames": int(midi_frames),
+        "model_file": "midi_full_audio.onnx",
+        "model_data_file": "midi_full_audio.onnx.data",
+        "map_image_file": "map.png",
+    }
+
+
+def write_model_card(output_dir: str, card: dict) -> str:
+    path = os.path.join(output_dir, "model.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(card, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"  -> wrote model card to {path}")
+    return path
+
+
 def validate(path, inputs, reference, atol):
     import onnxruntime as ort
 
@@ -646,6 +675,8 @@ def main():
     has_encoder_time = blender.encoder_time is not None
     uses_piano_roll = structure_type == "midi"
     structure_name = "piano_roll" if uses_piano_roll else "time_cond"
+    model_card = build_model_card(args, structure_name, structure_type,
+                                  time_cond_ratio, midi_frames)
 
     print(f"Loaded diffusion checkpoint: {checkpoint}")
     print(f"Structure type: {structure_type or 'unknown'}")
@@ -656,6 +687,8 @@ def main():
     else:
         print(f"Shapes: map_pos=[1,2], time_cond=[1,{args.zs_channels},"
               f"{args.n_signal}], noise=[1,{args.in_size},{args.n_signal}]")
+
+    write_model_card(args.output_dir, model_card)
 
     project_model = train_or_load_projector(args, blender)
     map2latent = Map2LatentONNX(project_model).eval()

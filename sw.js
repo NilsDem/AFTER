@@ -1,4 +1,4 @@
-const CACHE_NAME = "after-midi-onnx-v4";
+const CACHE_NAME = "after-midi-onnx-v6";
 
 self.addEventListener("install", (event) => {
   self.skipWaiting();

@@ -6,9 +6,11 @@ const MODEL_ROOT_URLS = [
   // "/web_onnx_app/export_onnx"  // Fallback
 ];
 const MODEL_FILE = "midi_full_audio.onnx";
+const MODEL_DATA_FILE = "midi_full_audio.onnx.data";
 const MAP_IMAGE_FILE = "map.png";
+const MODEL_CARD_FILE = "model.json";
 const DEFAULT_MAP_IMAGE_URL = "../docs/background_transparent.png"
-const MODEL_CACHE_PREFIX = "after-midi-onnx-v5";
+const MODEL_CACHE_PREFIX = "after-midi-onnx-v6";
 const SAMPLE_RATE = 44100;
 const CHUNK_SAMPLES = 262144;
 const CHUNK_SECONDS = CHUNK_SAMPLES / SAMPLE_RATE;
@@ -35,6 +37,7 @@ const state = {
   noiseDims: null,
   pianoRollDims: null,
   pianoRollInputName: null,
+  modelCard: null,
   _drawMapCallCount: 0,
   _defaultMapLoadAbort: null,
 };
@@ -78,10 +81,16 @@ const el = {
 ort.env.wasm.numThreads = 1;
 
 
-function makeSessionOptions(executionProviders) {
+function makeSessionOptions(executionProviders, dataBytes) {
   return {
     executionProviders,
     graphOptimizationLevel: "all",
+    externalData: [
+      {
+        path: MODEL_DATA_FILE,
+        data: dataBytes,
+      },
+    ],
   };
 }
 
@@ -91,6 +100,11 @@ function getBackendPreference() {
     return value;
   }
   return "auto";
+}
+
+function isMobileDevice() {
+  const ua = navigator.userAgent || navigator.vendor || "";
+  return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
 }
 
 async function getWebGpuAdapter() {
@@ -127,7 +141,15 @@ async function createOnnxSession(modelFiles) {
     appendConsole("ONNX execution provider: wasm");
     return await ort.InferenceSession.create(
       modelFiles.modelBytes,
-      makeSessionOptions(["wasm"]),
+      makeSessionOptions(["wasm"], modelFiles.dataBytes),
+    );
+  }
+
+  if (backendPreference === "auto" && isMobileDevice()) {
+    appendConsole("Mobile device detected, forcing ONNX execution provider: wasm");
+    return await ort.InferenceSession.create(
+      modelFiles.modelBytes,
+      makeSessionOptions(["wasm"], modelFiles.dataBytes),
     );
   }
 
@@ -137,7 +159,7 @@ async function createOnnxSession(modelFiles) {
     try {
       return await ort.InferenceSession.create(
         modelFiles.modelBytes,
-        makeSessionOptions(["webgpu"]),
+        makeSessionOptions(["webgpu"], modelFiles.dataBytes),
       );
     } catch (error) {
       appendConsole(`WebGPU session failed: ${error.message || String(error)}`);
@@ -152,7 +174,7 @@ async function createOnnxSession(modelFiles) {
   appendConsole("ONNX execution provider: wasm");
   return await ort.InferenceSession.create(
     modelFiles.modelBytes,
-    makeSessionOptions(["wasm"]),
+    makeSessionOptions(["wasm"], modelFiles.dataBytes),
   );
 }
 
@@ -238,7 +260,7 @@ async function handleDroppedFiles(items) {
   setModelControlsBusy(true);
   setStatus("Importing dropped files...");
 
-  const requiredFiles = [MODEL_FILE, MAP_IMAGE_FILE];
+  const requiredFiles = [MODEL_FILE, MODEL_DATA_FILE, MAP_IMAGE_FILE, MODEL_CARD_FILE];
   const fileMap = new Map();
   let folderName = "";
 
@@ -352,6 +374,11 @@ function releaseCurrentModel() {
   state.session = null;
   state.loadedModelName = "";
   state.mapImage = null;
+  state.modelCard = null;
+  state.inputDimsByName = {};
+  state.noiseDims = null;
+  state.pianoRollDims = null;
+  state.pianoRollInputName = null;
   if (state.mapObjectUrl) {
     appendConsole(`Revoking mapObjectUrl: ${state.mapObjectUrl}`);
     URL.revokeObjectURL(state.mapObjectUrl);
@@ -365,7 +392,7 @@ function releaseCurrentModel() {
   }
 }
 async function hasModelFiles(baseUrl) {
-  const required = [MODEL_FILE, MAP_IMAGE_FILE];
+  const required = [MODEL_FILE, MODEL_DATA_FILE, MAP_IMAGE_FILE, MODEL_CARD_FILE];
 
   for (const file of required) {
     try {
@@ -533,7 +560,7 @@ async function importLocalModel() {
   setModelControlsBusy(true);
   setStatus("Importing model from local folder...");
 
-  const requiredFiles = [MODEL_FILE, MAP_IMAGE_FILE];
+  const requiredFiles = [MODEL_FILE, MODEL_DATA_FILE, MAP_IMAGE_FILE, MODEL_CARD_FILE];
   let fileMap = new Map();
   let folderName = "";
 
@@ -703,7 +730,7 @@ async function isModelFullyCached(model) {
   }
 
   const cache = await caches.open(modelCacheName(model.name));
-  const urls = [MODEL_FILE, MAP_IMAGE_FILE].map((file) => `${model.baseUrl}/${file}`);
+  const urls = [MODEL_FILE, MODEL_DATA_FILE, MAP_IMAGE_FILE, MODEL_CARD_FILE].map((file) => `${model.baseUrl}/${file}`);
   const matches = await Promise.all(urls.map((url) => cache.match(new Request(url))));
   return matches.every(Boolean);
 }
@@ -732,6 +759,7 @@ async function loadModel(model, forceReload = false) {
   try {
     await registerServiceWorker();
     const modelFiles = await warmModelCache(model, forceReload);
+    state.modelCard = modelFiles.modelCard || null;
     await loadMapImage(model, forceReload);
     appendConsole("Creating ONNX session...");
     state.session = await createOnnxSession(modelFiles);
@@ -743,6 +771,11 @@ async function loadModel(model, forceReload = false) {
     state.noiseDims = null;
     state.pianoRollDims = null;
     state.pianoRollInputName = null;
+    if (state.modelCard) {
+      appendConsole(`Model card: ${JSON.stringify(state.modelCard)}`);
+    } else {
+      appendConsole("Model card unavailable.");
+    }
 
     // for (const inputName of state.session.inputNames) {
     //   try {
@@ -782,20 +815,26 @@ async function registerServiceWorker() {
 }
 async function warmModelCache(model, forceReload = false) {
   const modelUrl = `${model.baseUrl}/${MODEL_FILE}`;
+  const dataUrl = `${model.baseUrl}/${MODEL_DATA_FILE}`;
   const mapUrl = `${model.baseUrl}/${MAP_IMAGE_FILE}`;
+  const cardUrl = `${model.baseUrl}/${MODEL_CARD_FILE}`;
 
   const importedData = state.importedModelData.get(model.name);
   if (importedData) {
     appendConsole("Using imported model from memory");
     return {
       modelBytes: new Uint8Array(importedData[MODEL_FILE]),
+      dataBytes: new Uint8Array(importedData[MODEL_DATA_FILE]),
+      modelCard: parseModelCardBytes(importedData[MODEL_CARD_FILE]),
     };
   }
 
   if (!("caches" in window)) {
     appendConsole("Cache API unavailable, downloading model...");
     const modelBytes = await fetchBytes(modelUrl, forceReload);
-    return { modelBytes };
+    const dataBytes = await fetchBytes(dataUrl, forceReload);
+    const modelCardBytes = await fetchBytes(cardUrl, forceReload);
+    return { modelBytes, dataBytes, modelCard: parseModelCardBytes(modelCardBytes) };
   }
 
   const cacheName = modelCacheName(model.name);
@@ -804,9 +843,11 @@ async function warmModelCache(model, forceReload = false) {
   appendConsole(`Using cache: ${cacheName}`);
 
   const modelBytes = await cacheWithProgress(cache, modelUrl, "model graph", forceReload);
+  const dataBytes = await cacheWithProgress(cache, dataUrl, "model weights", forceReload);
   await cacheWithProgress(cache, mapUrl, "map image", forceReload);
+  const modelCardBytes = await cacheWithProgress(cache, cardUrl, "model card", forceReload);
 
-  return { modelBytes };
+  return { modelBytes, dataBytes, modelCard: parseModelCardBytes(modelCardBytes) };
 }
 async function cacheWithProgress(cache, url, label, forceReload = false) {
   const cacheKey = new Request(url);
@@ -849,6 +890,17 @@ async function fetchBytes(url, forceReload = false) {
     throw new Error(`Could not download ${url}: HTTP ${response.status}`);
   }
   return new Uint8Array(await response.arrayBuffer());
+}
+
+function parseModelCardBytes(bytes) {
+  try {
+    const text = new TextDecoder("utf-8").decode(bytes);
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch (error) {
+    appendConsole(`Invalid model card: ${error.message || String(error)}`);
+    return null;
+  }
 }
 async function loadMapImage(model, forceReload = false) {
   const mapUrl = `${model.baseUrl}/${MAP_IMAGE_FILE}`;
@@ -1340,7 +1392,8 @@ function getNoiseDims() {
     return state.noiseDims;
   }
 
-  state.noiseDims = getInputDims("noise", [1, 64, BASE_NOISE_FRAMES]);
+  const baseNoiseFrames = getModelCardInt("base_noise_frames", BASE_NOISE_FRAMES);
+  state.noiseDims = getInputDims("noise", [1, 64, baseNoiseFrames]);
   appendConsole(`noise base dims: [${state.noiseDims.join(", ")}]`);
 
   return state.noiseDims;
@@ -1352,7 +1405,8 @@ function getPianoRollDims() {
   }
 
   const inputName = getPianoRollInputName();
-  state.pianoRollDims = getInputDims(inputName, [1, 128, BASE_PIANO_ROLL_FRAMES]);
+  const basePianoRollFrames = getModelCardInt("base_piano_roll_frames", BASE_PIANO_ROLL_FRAMES);
+  state.pianoRollDims = getInputDims(inputName, [1, 128, basePianoRollFrames]);
   const noiseFrames = getNoiseDims()[2];
   const pianoRollFrames = state.pianoRollDims[2];
   appendConsole(`${inputName} frames from ONNX metadata: ${pianoRollFrames} (${pianoRollFrames / noiseFrames}x noise frames)`);
@@ -1402,6 +1456,12 @@ function getInputMeta(name) {
   }
 
   return null;
+}
+
+function getModelCardInt(key, fallback = null) {
+  const value = state.modelCard?.[key];
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function normalizeDims(dims, fallbackDims = null) {

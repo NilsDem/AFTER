@@ -20,6 +20,7 @@ Each selectable model is a subdirectory containing:
 midi_full_audio.onnx
 midi_full_audio.onnx.data
 map.png
+model.json
 ```
 
 ## Run
@@ -36,6 +37,8 @@ http://localhost:8080/web_onnx_app/
 
 The server must serve the repository root because the app scans `/export_onnx/`.
 Each ONNX model uses an external `.onnx.data` file next to the `.onnx` file.
+The app also reads `model.json` for base frame counts and model-specific metadata
+when ONNX input shapes are dynamic.
 The app registers `/sw.js`, downloads model files into browser Cache Storage,
 then passes the external data bytes explicitly to ONNX Runtime Web.
 
