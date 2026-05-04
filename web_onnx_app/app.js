@@ -14,6 +14,8 @@ const DEFAULT_MODEL_NAME = "orchestral_simdino";
 const SAMPLE_RATE = 44100;
 const CHUNK_SAMPLES = 262144;
 const CHUNK_SECONDS = CHUNK_SAMPLES / SAMPLE_RATE;
+const BASE_NOISE_FRAMES = 64;
+const BASE_PIANO_ROLL_FRAMES = 256;
 const MAP_RANGE = 1.25;
 
 const state = {
@@ -52,7 +54,6 @@ const el = {
   progressionSelect: document.getElementById("progressionSelect"),
   customProgression: document.getElementById("customProgression"),
   chordsPerChunk: document.getElementById("chordsPerChunk"),
-  arpEnabled: document.getElementById("arpEnabled"),
   arpMode: document.getElementById("arpMode"),
   notesPerChord: document.getElementById("notesPerChord"),
   notesArpeggiated: document.getElementById("notesArpeggiated"),
@@ -988,7 +989,6 @@ function snapshotGenerationSettings() {
       progressionSelect: el.progressionSelect.value,
       customProgression: el.customProgression.value,
       chordsPerChunk: el.chordsPerChunk.value,
-      arpEnabled: el.arpEnabled.checked,
       arpMode: el.arpMode.value,
       notesPerChord: el.notesPerChord.value,
       notesArpeggiated: el.notesArpeggiated.value,
@@ -1001,10 +1001,14 @@ function snapshotGenerationSettings() {
 
 function getActiveNotes() {
   if (state.noteSource === "sequencer") {
-    const chunks = Number(el.durationSelect.value) || 1;
+    const chunks = getDurationScale();
     return buildSequencerNotes(chunks * CHUNK_SECONDS);
   }
   return state.notes;
+}
+
+function getDurationScale() {
+  return Math.max(1, Math.floor(Number(el.durationSelect.value) || 1));
 }
 
 function shuffleArray(arr) {
@@ -1036,13 +1040,13 @@ function buildSequencerNotes(totalEndSeconds, forPreview = false) {
   const octave = Number(el.sequenceOctave.value) || 3;
   const base = (octave + 1) * 12 + noteNum;
 
-  const chunks = Number(el.durationSelect.value) || 1;
+  const chunks = getDurationScale();
   const chordsPerChunk = Math.max(1, Math.floor(Number(el.chordsPerChunk.value) || 1));
   const chordDuration = CHUNK_SECONDS / chordsPerChunk;
   const totalChords = chunks * chordsPerChunk;
   const progression = getProgressionTokens();
 
-  const arpMode = el.arpEnabled.checked ? el.arpMode.value : "off";
+  const arpMode = el.arpMode.value || "none";
   const notesPerChordVal = el.notesPerChord.value;
   const velMin = numberOrDefault(el.velocityMin.value, 64);
   const velMax = numberOrDefault(el.velocityMax.value, 115);
@@ -1078,7 +1082,7 @@ function buildSequencerNotes(totalEndSeconds, forPreview = false) {
       chord = [...up, ...down];
     }
 
-    if (arpMode !== "off") {
+    if (arpMode !== "none") {
       const m = Number(el.notesArpeggiated.value) || 2;
       chord = repeatToLength(chord, m);
       const step = chordDuration / Math.max(1, chord.length);
@@ -1130,7 +1134,7 @@ function chordForToken(base, token) {
 }
 
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-const ROLL_LEFT = 36;
+const ROLL_LEFT = 52;
 
 function drawMidiPreview() {
   const canvas = el.midiCanvas;
@@ -1141,7 +1145,7 @@ function drawMidiPreview() {
   ctx.fillRect(0, 0, width, height);
 
   const start = state.noteSource === "sequencer" ? 0 : Number(el.startTime.value) || 0;
-  const chunks = Number(el.durationSelect.value) || 1;
+  const chunks = getDurationScale();
   const duration = chunks * CHUNK_SECONDS;
   const end = start + duration;
 
@@ -1182,9 +1186,12 @@ function drawMidiPreview() {
 
   // Horizontal note grid lines + C-note labels
   ctx.font = "10px ui-monospace, Menlo, Consolas, monospace";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
   for (let p = minPitch; p <= maxPitch; p++) {
     const i = p - minPitch;
     const yTop = height - (i + 1) * rowH;
+    const labelY = height - (i + 0.5) * rowH;
     if (p % 12 === 0) {
       ctx.strokeStyle = "rgba(0,0,0,0.15)";
       ctx.lineWidth = 1;
@@ -1194,7 +1201,7 @@ function drawMidiPreview() {
       ctx.stroke();
       const octNum = Math.floor(p / 12) - 1;
       ctx.fillStyle = "rgba(0,0,0,0.75)";
-      ctx.fillText(`C${octNum}`, 2, height - (i + 0.5) * rowH + 3);
+      ctx.fillText(`C${octNum}`, ROLL_LEFT - 8, labelY);
     } else if (N <= 24) {
       // show all note names when zoomed in
       ctx.strokeStyle = "rgba(0,0,0,0.06)";
@@ -1204,9 +1211,11 @@ function drawMidiPreview() {
       ctx.lineTo(width, yTop);
       ctx.stroke();
       ctx.fillStyle = "rgba(0,0,0,0.65)";
-      ctx.fillText(NOTE_NAMES[p % 12], 2, height - (i + 0.5) * rowH + 3);
+      ctx.fillText(NOTE_NAMES[p % 12], ROLL_LEFT - 8, labelY);
     }
   }
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
 
   // Vertical time grid (one line per second)
   ctx.strokeStyle = "rgba(0,0,0,0.08)";
@@ -1251,8 +1260,8 @@ function drawMidiPreview() {
   ctx.fillText(`${end.toFixed(2)}s`, width - 56, height - 4);
 }
 
-function buildPianoRoll(windowStartSeconds) {
-  const dims = getPianoRollDims();
+function buildPianoRoll(windowStartSeconds, durationSeconds) {
+  const dims = scaledTemporalDims(getPianoRollDims(), getDurationScale());
   const channels = dims[1];
   const frames = dims[2];
   if (channels !== 128) {
@@ -1260,8 +1269,8 @@ function buildPianoRoll(windowStartSeconds) {
   }
 
   const roll = new Float32Array(channels * frames);
-  const frameSeconds = CHUNK_SECONDS / frames;
-  const windowEnd = windowStartSeconds + CHUNK_SECONDS;
+  const frameSeconds = durationSeconds / frames;
+  const windowEnd = windowStartSeconds + durationSeconds;
   for (const note of getActiveNotes()) {
     const noteStart = note.time;
     const noteEnd = note.time + note.duration;
@@ -1309,7 +1318,7 @@ function getInputDims(name, fallbackDims = null) {
   throw new Error(`Could not infer input dims for "${name}".`);
 }
 function makeNoiseTensor() {
-  const dims = getNoiseDims();
+  const dims = scaledTemporalDims(getNoiseDims(), getDurationScale());
   const size = dims.reduce((acc, value) => acc * value, 1);
   const data = new Float32Array(size);
 
@@ -1327,12 +1336,18 @@ function makeNoiseTensor() {
   return new ort.Tensor("float32", data, dims);
 }
 
+function scaledTemporalDims(baseDims, scale) {
+  const dims = [...baseDims];
+  dims[dims.length - 1] *= scale;
+  return dims;
+}
+
 function getNoiseDims() {
   if (state.noiseDims) {
     return state.noiseDims;
   }
 
-  state.noiseDims = getInputDims("noise", null);
+  state.noiseDims = getInputDims("noise", [1, 16, BASE_NOISE_FRAMES]);
   // appendConsole(`noise dims from ONNX metadata: [${state.noiseDims.join(", ")}]`);
 
   return state.noiseDims;
@@ -1344,7 +1359,7 @@ function getPianoRollDims() {
   }
 
   const inputName = getPianoRollInputName();
-  state.pianoRollDims = getInputDims(inputName, null);
+  state.pianoRollDims = getInputDims(inputName, [1, 128, BASE_PIANO_ROLL_FRAMES]);
   const noiseFrames = getNoiseDims()[2];
   const pianoRollFrames = state.pianoRollDims[2];
   appendConsole(`${inputName} frames from ONNX metadata: ${pianoRollFrames} (${pianoRollFrames / noiseFrames}x noise frames)`);
@@ -1665,9 +1680,8 @@ function restoreGeneration(generation) {
   el.progressionSelect.value = seq.progressionSelect;
   el.customProgression.value = seq.customProgression;
   el.chordsPerChunk.value = seq.chordsPerChunk;
-  const restoredArpMode = seq.arpMode ?? "off";
-  el.arpEnabled.checked = Boolean(seq.arpEnabled ?? restoredArpMode !== "off");
-  el.arpMode.value = restoredArpMode === "off" ? "up" : restoredArpMode;
+  const restoredArpMode = seq.arpMode ?? (seq.arpEnabled ? "up" : "none");
+  el.arpMode.value = restoredArpMode === "off" ? "none" : restoredArpMode;
   el.notesPerChord.value = seq.notesPerChord ?? "3";
   el.notesArpeggiated.value = seq.notesArpeggiated ?? "2";
   el.velocityMin.value = seq.velocityMin ?? "64";
@@ -1691,6 +1705,7 @@ function restoreGeneration(generation) {
   }
 
   updateSourceUi();
+  updateCustomProgressionUi();
   updateArpUi();
   updateCrosshair();
   drawMidiPreview();
@@ -1715,43 +1730,37 @@ async function generateAudio() {
   await waitForPaint();
   try {
     const start = state.noteSource === "sequencer" ? 0 : Number(el.startTime.value) || 0;
-    const chunks = Number(el.durationSelect.value) || 1;
-    const duration = chunks * CHUNK_SECONDS;
-    const output = new Float32Array(chunks * CHUNK_SAMPLES);
+    const durationScale = getDurationScale();
+    const duration = durationScale * CHUNK_SECONDS;
     const mapTensor = makeMapTensor();
     const settings = snapshotGenerationSettings();
 
     const started = performance.now();
-    for (let chunk = 0; chunk < chunks; chunk++) {
-      setStatus(`Generating chunk ${chunk + 1} / ${chunks}...`);
-      const feeds = {
-        map_pos: mapTensor,
-        noise: makeNoiseTensor(),
-      };
-      feeds[getPianoRollInputName()] = buildPianoRoll(start + chunk * CHUNK_SECONDS);
-      const result = await state.session.run(feeds);
-      const resultKeys = Object.keys(result);
-      // appendConsole(`chunk ${chunk + 1}: outputs ${resultKeys.join(", ")}`);
-      // for (const key of resultKeys) {
-      //   const preview = Array.from(result[key].data.slice(0, 8))
-      //     .map((value) => Number(value).toFixed(5))
-      //     .join(", ");
-      //   appendConsole(`${key}: dims [${result[key].dims.join(", ")}], ${preview}`);
-      // }
-      if (!result.audio) {
-        throw new Error(`Model did not return an audio output. Outputs: ${resultKeys.join(", ")}`);
-      }
-      output.set(result.audio.data, chunk * CHUNK_SAMPLES);
-      if (result.cond) {
-        appendConsole(`cond vector: ${Array.from(result.cond.data).map((value) => Number(value).toFixed(5)).join(", ")}`);
-      }
+    setStatus(`Generating ${duration.toFixed(2)}s...`);
+    const feeds = {
+      map_pos: mapTensor,
+      noise: makeNoiseTensor(),
+    };
+    feeds[getPianoRollInputName()] = buildPianoRoll(start, duration);
 
-      await new Promise((resolve) => setTimeout(resolve, 0));
+    appendConsole(`input noise dims: [${feeds.noise.dims.join(", ")}]`);
+    appendConsole(`input ${getPianoRollInputName()} dims: [${feeds[getPianoRollInputName()].dims.join(", ")}]`);
+
+    const result = await state.session.run(feeds);
+    const resultKeys = Object.keys(result);
+    if (!result.audio) {
+      throw new Error(`Model did not return an audio output. Outputs: ${resultKeys.join(", ")}`);
+    }
+    const output = new Float32Array(result.audio.data);
+    const outputDuration = output.length / SAMPLE_RATE;
+    appendConsole(`output audio dims: [${result.audio.dims.join(", ")}]`);
+    if (result.cond) {
+      appendConsole(`cond vector: ${Array.from(result.cond.data).map((value) => Number(value).toFixed(5)).join(", ")}`);
     }
 
     const blob = floatToWavBlob(output, SAMPLE_RATE);
-    addGenerationToHistory(output, blob, settings, duration);
-    setStatus(`Generated ${duration}s in ${((performance.now() - started) / 1000).toFixed(2)}s.`);
+    addGenerationToHistory(output, blob, settings, outputDuration);
+    setStatus(`Generated ${outputDuration.toFixed(2)}s in ${((performance.now() - started) / 1000).toFixed(2)}s.`);
   } catch (error) {
     console.error(error);
     appendConsole(`error: ${error.message || String(error)}`);
@@ -1960,10 +1969,15 @@ el.rerollVelocityButton.addEventListener("click", rerollVelocities);
 el.rerollArpButton.addEventListener("click", rerollArpPattern);
 
 function updateArpUi() {
-  const enabled = el.arpEnabled.checked;
-  el.arpMode.disabled = !enabled;
+  const enabled = el.arpMode.value !== "none";
   el.notesArpeggiated.disabled = !enabled;
-  el.rerollArpButton.disabled = !(enabled && el.arpMode.value === "random");
+  el.rerollArpButton.disabled = el.arpMode.value !== "random";
+}
+
+function updateCustomProgressionUi() {
+  const enabled = el.progressionSelect.value === "custom";
+  el.customProgression.disabled = !enabled;
+  document.getElementById("customProgressionLabel")?.classList.toggle("is-disabled", !enabled);
 }
 
 [
@@ -1972,13 +1986,13 @@ function updateArpUi() {
   el.progressionSelect,
   el.customProgression,
   el.chordsPerChunk,
-  el.arpEnabled,
   el.arpMode,
   el.notesPerChord,
   el.notesArpeggiated,
 ].forEach((control) => {
   const updateHandler = () => {
     updateSourceUi();
+    updateCustomProgressionUi();
     updateArpUi();
     drawMidiPreview();
     refreshGenerateState();
@@ -1989,8 +2003,8 @@ function updateArpUi() {
 
 function updateSourceUi() {
   if (state.noteSource === "sequencer") {
-    const chunks = Number(el.durationSelect.value) || 1;
-    const chords = chunks * Math.max(1, Math.floor(Number(el.chordsPerChunk.value) || 1));
+    const durationScale = getDurationScale();
+    const chords = durationScale * Math.max(1, Math.floor(Number(el.chordsPerChunk.value) || 1));
     el.midiMeta.textContent = `Sequencer | ${chords} chords | ${getProgressionTokens().join(" ")}`;
   } else if (!state.midi) {
     el.midiMeta.textContent = "No MIDI loaded";
@@ -2066,11 +2080,12 @@ initTabs();
 initVelocitySliders();
 setIconButton(el.rerollVelocityButton, "refresh", "Reroll velocities");
 setIconButton(el.rerollArpButton, "refresh", "Reroll arpegiation");
+updateCustomProgressionUi();
 updateArpUi();
 drawMap();
 for (const option of el.durationSelect.options) {
-  const chunks = Number(option.value);
-  option.textContent = `${chunks} chunk${chunks > 1 ? "s" : ""} (${(chunks * CHUNK_SECONDS).toFixed(2)} s)`;
+  const durationScale = Math.max(1, Math.floor(Number(option.value) || 1));
+  option.textContent = `${(durationScale * CHUNK_SECONDS).toFixed(2)} s`;
 }
 updateSourceUi();
 drawMidiPreview();

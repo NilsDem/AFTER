@@ -271,7 +271,13 @@ class MidiFullAudioONNX(nn.Module):
         return self.decoder(latent), cond
 
 
-def export_onnx(wrapper, dummy, out_path, input_names, output_names, opset):
+def export_onnx(wrapper,
+                dummy,
+                out_path,
+                input_names,
+                output_names,
+                opset,
+                dynamic_axes=None):
     with torch.no_grad():
         ref = wrapper(*dummy)
         if type(ref) is list or type(ref) is tuple:
@@ -296,9 +302,33 @@ def export_onnx(wrapper, dummy, out_path, input_names, output_names, opset):
         output_names=output_names,
         opset_version=opset,
         do_constant_folding=True,
+        dynamic_axes=dynamic_axes,
     )
     print(f"  -> {out_path} ({os.path.getsize(out_path) / 1e6:.2f} MB)")
     return ref
+
+
+def temporal_dynamic_axes(structure_name: str, output_names):
+    axes = {
+        "map_pos": {0: "batch"},
+        structure_name: {0: "batch", 2: "structure_frames"},
+        "noise": {0: "batch", 2: "latent_frames"},
+        "cond": {0: "batch"},
+    }
+    if "latent" in output_names:
+        axes["latent"] = {0: "batch", 2: "latent_frames"}
+    if "audio" in output_names:
+        axes["audio"] = {0: "batch", 2: "audio_samples"}
+    if "time_cond" in output_names:
+        axes["time_cond"] = {0: "batch", 2: "latent_frames"}
+    return axes
+
+
+def structure_dynamic_axes(structure_name: str):
+    return {
+        structure_name: {0: "batch", 2: "structure_frames"},
+        "time_cond": {0: "batch", 2: "latent_frames"},
+    }
 
 
 def validate(path, inputs, reference, atol):
@@ -576,7 +606,8 @@ def main():
             path,
             (structure_input, ),
             export_onnx(structure, (structure_input, ), path, [structure_name],
-                        ["time_cond"], args.opset),
+                        ["time_cond"], args.opset,
+                        dynamic_axes=structure_dynamic_axes(structure_name)),
         )
 
     if "diffuse_latent" in targets:
@@ -591,6 +622,8 @@ def main():
                 ["map_pos", structure_name, "noise"],
                 ["latent", "cond"],
                 args.opset,
+                dynamic_axes=temporal_dynamic_axes(
+                    structure_name, ["latent", "cond"]),
             ),
         )
 
@@ -606,6 +639,8 @@ def main():
                 ["map_pos", structure_name, "noise"],
                 ["audio", "cond"],
                 args.opset,
+                dynamic_axes=temporal_dynamic_axes(
+                    structure_name, ["audio", "cond"]),
             ),
         )
 

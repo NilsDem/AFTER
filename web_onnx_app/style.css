@@ -246,30 +246,10 @@ button.is-generating:disabled {
 
 .arp-row {
   display: flex;
-  gap: 10px;
+  gap: 12px;
   align-items: flex-end;
   margin-bottom: 12px;
-  padding-top: 2px;
   flex-wrap: wrap;
-}
-
-.arp-row label:not(.toggle-label) {
-  flex: 1 1 150px;
-}
-
-.toggle-label {
-  min-height: 38px;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--text);
-  font-weight: 600;
-  flex: 0 0 auto;
-}
-
-.toggle-label input {
-  margin: 0;
-  accent-color: var(--accent);
 }
 
 .icon-button {
@@ -302,11 +282,16 @@ button.is-generating:disabled {
   flex-wrap: wrap;
 }
 
-.vel-label {
+.control-row-label {
+  display: inline-flex;
+  align-items: center;
   font-size: 13px;
   color: var(--muted);
   align-self: center;
   white-space: nowrap;
+  width: 72px;
+  flex: 0 0 72px;
+  min-height: 38px;
 }
 
 .slider-label {
@@ -315,6 +300,14 @@ button.is-generating:disabled {
   font-size: 12px;
   color: var(--muted);
   flex: 1 1 100px;
+}
+
+.select-label {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  flex: 1 1 150px;
 }
 
 .slider-label input[type="range"] {
@@ -365,6 +358,17 @@ select {
   background: #fff;
   color: var(--text);
   font: inherit;
+}
+
+label.is-disabled {
+  opacity: 0.55;
+}
+
+input:disabled,
+select:disabled {
+  background: rgba(255, 255, 255, 0.45);
+  color: var(--muted);
+  cursor: not-allowed;
 }
 
 input[type="radio"],
@@ -655,10 +659,6 @@ audio {
   .arp-row {
     flex-direction: column;
     align-items: stretch;
-  }
-
-  .toggle-label {
-    width: fit-content;
   }
 
   .history-controls {

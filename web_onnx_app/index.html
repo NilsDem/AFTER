@@ -41,10 +41,10 @@
               <label class="inline-label">
                 <span>Duration</span>
                 <select id="durationSelect">
-                  <option value="1">1 chunk</option>
-                  <option value="2">2 chunks</option>
-                  <option value="3">3 chunks</option>
-                  <option value="4">4 chunks</option>
+                  <option value="1">5.94 s</option>
+                  <option value="2">11.89 s</option>
+                  <option value="3">17.83 s</option>
+                  <option value="4">23.78 s</option>
                 </select>
               </label>
             </div>
@@ -97,7 +97,7 @@
                   <option value="custom">Custom</option>
                 </select>
               </label>
-              <label>
+              <label id="customProgressionLabel">
                 Custom
                 <input id="customProgression" type="text" value="I V vi IV">
               </label>
@@ -116,20 +116,18 @@
             </div>
 
             <div class="arp-row">
-              <label class="toggle-label">
-                <input id="arpEnabled" type="checkbox">
-                <span>Arpeggiate</span>
-              </label>
-              <label>
+              <span class="control-row-label">Arpeggiate</span>
+              <label class="select-label">
                 Mode
                 <select id="arpMode">
+                  <option value="none" selected>None</option>
                   <option value="up">Up</option>
                   <option value="down">Down</option>
                   <option value="random">Random</option>
                   <option value="alt">Alternate</option>
                 </select>
               </label>
-              <label>
+              <label class="select-label">
                 Notes arpeggiated
                 <select id="notesArpeggiated">
                   <option value="1">1</option>
@@ -144,7 +142,7 @@
             </div>
 
             <div class="velocity-row">
-              <span class="vel-label">Velocity</span>
+              <span class="control-row-label">Velocity</span>
               <label class="slider-label">
                 Min&nbsp;<span id="velocityMinVal">64</span>
                 <input id="velocityMin" type="range" min="0" max="127" step="1" value="64">
