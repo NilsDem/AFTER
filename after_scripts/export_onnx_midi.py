@@ -119,10 +119,42 @@ def patch_rotary_for_onnx(module: nn.Module) -> None:
             m.get_seq_pos = types.MethodType(_dyn_get_seq_pos, m)
 
 
+def patch_attention_masks_for_onnx(module: nn.Module) -> None:
+
+    def _dyn_get_attn_mask(self, Tq: int, Tk: int, device: torch.device,
+                           dtype: torch.dtype) -> torch.Tensor:
+        q = torch.arange(Tk - Tq, Tk, device=device)[:, None]
+        k = torch.arange(Tk, device=device)[None, :]
+
+        chunk_size = self.min_chunk_size
+        window_size = (-1 if self.local_attention_size is None else
+                       self.local_attention_size)
+
+        cq = q // chunk_size
+        ck = k // chunk_size
+        same_chunk = cq.eq(ck)
+
+        if window_size < 0:
+            past_allowed = ck.lt(cq)
+        else:
+            chunk_start = cq * chunk_size
+            sliding_start = torch.clamp(q - (window_size - 1), min=0)
+            past_allowed = (k < chunk_start) & (k >= sliding_start)
+
+        masked = ~(same_chunk | past_allowed)
+        attn = torch.zeros((Tq, Tk), device=device, dtype=dtype)
+        return attn.masked_fill(masked, float("-inf"))
+
+    for m in module.modules():
+        if hasattr(m, "_get_attn_mask") and hasattr(m, "min_chunk_size"):
+            m._get_attn_mask = types.MethodType(_dyn_get_attn_mask, m)
+
+
 def prepare_for_onnx(module: nn.Module) -> nn.Module:
     module.eval()
     remove_weight_norm_all(module)
     patch_rotary_for_onnx(module)
+    patch_attention_masks_for_onnx(module)
     return module
 
 
@@ -294,26 +326,43 @@ def export_onnx(wrapper,
             preview = np.array2string(flat[:8], precision=5, separator=", ")
             print(f"  ref {name}: shape={value.shape}, preview={preview}")
 
-    torch.onnx.export(
-        wrapper,
-        dummy,
-        out_path,
+    export_kwargs = dict(
         input_names=input_names,
         output_names=output_names,
         opset_version=opset,
         do_constant_folding=True,
         dynamic_axes=dynamic_axes,
     )
+    try:
+        torch.onnx.export(wrapper,
+                          dummy,
+                          out_path,
+                          dynamo=True,
+                          **export_kwargs)
+    except TypeError as exc:
+        if "dynamo" not in str(exc):
+            raise
+        torch.onnx.export(wrapper, dummy, out_path, **export_kwargs)
     print(f"  -> {out_path} ({os.path.getsize(out_path) / 1e6:.2f} MB)")
     return ref
 
 
 def temporal_dynamic_axes(structure_name: str, output_names):
     axes = {
-        "map_pos": {0: "batch"},
-        structure_name: {0: "batch", 2: "structure_frames"},
-        "noise": {0: "batch", 2: "latent_frames"},
-        "cond": {0: "batch"},
+        "map_pos": {
+            0: "batch"
+        },
+        structure_name: {
+            0: "batch",
+            2: "structure_frames"
+        },
+        "noise": {
+            0: "batch",
+            2: "latent_frames"
+        },
+        "cond": {
+            0: "batch"
+        },
     }
     if "latent" in output_names:
         axes["latent"] = {0: "batch", 2: "latent_frames"}
@@ -326,8 +375,14 @@ def temporal_dynamic_axes(structure_name: str, output_names):
 
 def structure_dynamic_axes(structure_name: str):
     return {
-        structure_name: {0: "batch", 2: "structure_frames"},
-        "time_cond": {0: "batch", 2: "latent_frames"},
+        structure_name: {
+            0: "batch",
+            2: "structure_frames"
+        },
+        "time_cond": {
+            0: "batch",
+            2: "latent_frames"
+        },
     }
 
 
@@ -348,6 +403,54 @@ def validate(path, inputs, reference, atol):
         print(f"    {name}: [{'OK' if ok else 'FAIL'}] "
               f"max |diff| = {max_diff:.3e} (atol={atol})")
     return ok
+
+
+def _shape_for_dynamic_test(name, tensor, structure_name, scale):
+    shape = list(tensor.shape)
+    if name in (structure_name, "noise", "time_cond", "latent", "audio"):
+        shape[2] *= scale
+    return shape
+
+
+def _dummy_for_dynamic_test(name, shape):
+    if name == "map_pos":
+        return np.zeros(shape, dtype=np.float32)
+    if name == "piano_roll":
+        value = np.zeros(shape, dtype=np.float32)
+        value[:, 60, ::4] = 1.0
+        return value
+    return np.random.randn(*shape).astype(np.float32)
+
+
+def validate_dynamic_shape(path, inputs, input_names, structure_name, scale):
+    import onnxruntime as ort
+
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    print("    ONNX input metadata:")
+    for meta in sess.get_inputs():
+        print(f"      {meta.name}: {meta.shape}")
+
+    feeds = {}
+    for name, tensor in zip(input_names, inputs):
+        shape = _shape_for_dynamic_test(name, tensor, structure_name, scale)
+        feeds[name] = _dummy_for_dynamic_test(name, shape)
+
+    print("    dynamic test feeds:")
+    for name, value in feeds.items():
+        print(f"      {name}: {list(value.shape)}")
+
+    try:
+        outs = sess.run(None, feeds)
+    except Exception as exc:
+        print(f"    dynamic shape test: FAIL ({type(exc).__name__}: {exc})")
+        return False
+
+    output_names = [o.name for o in sess.get_outputs()]
+    print("    dynamic test outputs:")
+    for name, value in zip(output_names, outs):
+        print(f"      {name}: {list(value.shape)}")
+    print("    dynamic shape test: OK")
+    return True
 
 
 def get_dataset_path_dict() -> dict:
@@ -518,6 +621,8 @@ def main():
     parser.add_argument("--opset", type=int, default=18)
     parser.add_argument("--nb_steps", type=int, default=4)
     parser.add_argument("--no_validate", action="store_true")
+    parser.add_argument("--test_dynamic_shapes", action="store_true")
+    parser.add_argument("--dynamic_shape_scale", type=int, default=3)
     parser.add_argument("--atol", type=float, default=1e-3)
     parser.add_argument("--only",
                         nargs="*",
@@ -586,14 +691,14 @@ def main():
 
     if "map2latent" in targets:
         path = os.path.join(args.output_dir, "map2latent.onnx")
-        results["map2latent"] = (path, (map_pos, ),
+        results["map2latent"] = (path, (map_pos, ), ["map_pos"],
                                  export_onnx(map2latent, (map_pos, ), path,
                                              ["map_pos"], ["timbre"],
                                              args.opset))
 
     if "latent2map" in targets:
         path = os.path.join(args.output_dir, "latent2map.onnx")
-        results["latent2map"] = (path, (timbre, ),
+        results["latent2map"] = (path, (timbre, ), ["timbre"],
                                  export_onnx(latent2map, (timbre, ), path,
                                              ["timbre"], ["map_pos"],
                                              args.opset))
@@ -605,8 +710,10 @@ def main():
         results["structure"] = (
             path,
             (structure_input, ),
-            export_onnx(structure, (structure_input, ), path, [structure_name],
-                        ["time_cond"], args.opset,
+            [structure_name],
+            export_onnx(structure, (structure_input, ),
+                        path, [structure_name], ["time_cond"],
+                        args.opset,
                         dynamic_axes=structure_dynamic_axes(structure_name)),
         )
 
@@ -615,6 +722,7 @@ def main():
         results["diffuse_latent"] = (
             path,
             (map_pos, structure_input, noise),
+            ["map_pos", structure_name, "noise"],
             export_onnx(
                 diffuse,
                 (map_pos, structure_input, noise),
@@ -622,8 +730,8 @@ def main():
                 ["map_pos", structure_name, "noise"],
                 ["latent", "cond"],
                 args.opset,
-                dynamic_axes=temporal_dynamic_axes(
-                    structure_name, ["latent", "cond"]),
+                dynamic_axes=temporal_dynamic_axes(structure_name,
+                                                   ["latent", "cond"]),
             ),
         )
 
@@ -632,6 +740,7 @@ def main():
         results["full_audio"] = (
             path,
             (map_pos, structure_input, noise),
+            ["map_pos", structure_name, "noise"],
             export_onnx(
                 full_audio,
                 (map_pos, structure_input, noise),
@@ -639,16 +748,29 @@ def main():
                 ["map_pos", structure_name, "noise"],
                 ["audio", "cond"],
                 args.opset,
-                dynamic_axes=temporal_dynamic_axes(
-                    structure_name, ["audio", "cond"]),
+                dynamic_axes=temporal_dynamic_axes(structure_name,
+                                                   ["audio", "cond"]),
             ),
         )
 
     if not args.no_validate:
         print("\nValidation")
-        for name, (path, inputs, ref) in results.items():
+        for name, (path, inputs, _input_names, ref) in results.items():
             print(f"  {name}:")
             validate(path, inputs, ref, args.atol)
+
+    if args.test_dynamic_shapes:
+        if args.dynamic_shape_scale <= 0:
+            raise ValueError("--dynamic_shape_scale must be positive")
+        print(f"\nDynamic Shape Tests (scale={args.dynamic_shape_scale})")
+        for name, (path, inputs, input_names, _ref) in results.items():
+            temporal_inputs = {structure_name, "noise"}
+            if not any(input_name in temporal_inputs
+                       for input_name in input_names):
+                continue
+            print(f"  {name}:")
+            validate_dynamic_shape(path, inputs, input_names, structure_name,
+                                   args.dynamic_shape_scale)
 
 
 if __name__ == "__main__":

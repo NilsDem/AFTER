@@ -1,16 +1,14 @@
 const MODEL_ROOT_URLS = [
   // "/AFTER/export_onnx",        // GitHub Pages
   // "/after",
-  // "../export_onnx",  
+  "../export_onnx",  
   "/export_onnx",             // Local development
   // "/web_onnx_app/export_onnx"  // Fallback
 ];
 const MODEL_FILE = "midi_full_audio.onnx";
-const MODEL_DATA_FILE = "midi_full_audio.onnx.data";
 const MAP_IMAGE_FILE = "map.png";
 const DEFAULT_MAP_IMAGE_URL = "../docs/background_transparent.png"
-const MODEL_CACHE_PREFIX = "after-midi-onnx-v4";
-const DEFAULT_MODEL_NAME = "orchestral_simdino";
+const MODEL_CACHE_PREFIX = "after-midi-onnx-v5";
 const SAMPLE_RATE = 44100;
 const CHUNK_SAMPLES = 262144;
 const CHUNK_SECONDS = CHUNK_SAMPLES / SAMPLE_RATE;
@@ -80,16 +78,10 @@ const el = {
 ort.env.wasm.numThreads = 1;
 
 
-function makeSessionOptions(executionProviders, dataBytes) {
+function makeSessionOptions(executionProviders) {
   return {
     executionProviders,
     graphOptimizationLevel: "all",
-    externalData: [
-      {
-        path: "midi_full_audio.onnx.data",
-        data: dataBytes,
-      },
-    ],
   };
 }
 
@@ -135,7 +127,7 @@ async function createOnnxSession(modelFiles) {
     appendConsole("ONNX execution provider: wasm");
     return await ort.InferenceSession.create(
       modelFiles.modelBytes,
-      makeSessionOptions(["wasm"], modelFiles.dataBytes),
+      makeSessionOptions(["wasm"]),
     );
   }
 
@@ -145,7 +137,7 @@ async function createOnnxSession(modelFiles) {
     try {
       return await ort.InferenceSession.create(
         modelFiles.modelBytes,
-        makeSessionOptions(["webgpu"], modelFiles.dataBytes),
+        makeSessionOptions(["webgpu"]),
       );
     } catch (error) {
       appendConsole(`WebGPU session failed: ${error.message || String(error)}`);
@@ -160,7 +152,7 @@ async function createOnnxSession(modelFiles) {
   appendConsole("ONNX execution provider: wasm");
   return await ort.InferenceSession.create(
     modelFiles.modelBytes,
-    makeSessionOptions(["wasm"], modelFiles.dataBytes),
+    makeSessionOptions(["wasm"]),
   );
 }
 
@@ -246,7 +238,7 @@ async function handleDroppedFiles(items) {
   setModelControlsBusy(true);
   setStatus("Importing dropped files...");
 
-  const requiredFiles = [MODEL_FILE, MODEL_DATA_FILE, MAP_IMAGE_FILE];
+  const requiredFiles = [MODEL_FILE, MAP_IMAGE_FILE];
   const fileMap = new Map();
   let folderName = "";
 
@@ -373,7 +365,7 @@ function releaseCurrentModel() {
   }
 }
 async function hasModelFiles(baseUrl) {
-  const required = [MODEL_FILE, MODEL_DATA_FILE, MAP_IMAGE_FILE];
+  const required = [MODEL_FILE, MAP_IMAGE_FILE];
 
   for (const file of required) {
     try {
@@ -401,7 +393,7 @@ async function logDirectoryFiles(baseUrl) {
   try {
     const response = await fetch(`${baseUrl}/`, { cache: "no-store" });
     if (!response.ok) {
-      appendConsole(`Could not list ${baseUrl}/: HTTP ${response.status}`);
+      appendConsole(`Skipping ${baseUrl}: directory listing HTTP ${response.status}`);
       return;
     }
 
@@ -471,14 +463,20 @@ async function scanModels() {
 
         const baseUrl = pathname;
 
+        if (byName.has(name)) {
+          continue;
+        }
+
         appendConsole(`Checking model candidate: ${name} at ${baseUrl}`);
         await logDirectoryFiles(baseUrl);
 
-        if (!byName.has(name) && await hasModelFiles(baseUrl)) {
+        if (await hasModelFiles(baseUrl)) {
           byName.set(name, { name, baseUrl });
           appendConsole(`Found model: ${name}`);
         }
       }
+
+
     } catch (error) {
       failures.push(`${rootUrl}: ${error.message || String(error)}`);
       appendConsole(`${rootUrl}: ${error.message || String(error)}`);
@@ -498,7 +496,6 @@ async function scanModels() {
   }
 
   const defaultModel =
-    state.availableModels.find((model) => model.name === DEFAULT_MODEL_NAME) ||
     state.availableModels[0];
 
   state.selectedModelName = defaultModel.name;
@@ -536,7 +533,7 @@ async function importLocalModel() {
   setModelControlsBusy(true);
   setStatus("Importing model from local folder...");
 
-  const requiredFiles = [MODEL_FILE, MODEL_DATA_FILE, MAP_IMAGE_FILE];
+  const requiredFiles = [MODEL_FILE, MAP_IMAGE_FILE];
   let fileMap = new Map();
   let folderName = "";
 
@@ -706,7 +703,7 @@ async function isModelFullyCached(model) {
   }
 
   const cache = await caches.open(modelCacheName(model.name));
-  const urls = [MODEL_FILE, MODEL_DATA_FILE, MAP_IMAGE_FILE].map((file) => `${model.baseUrl}/${file}`);
+  const urls = [MODEL_FILE, MAP_IMAGE_FILE].map((file) => `${model.baseUrl}/${file}`);
   const matches = await Promise.all(urls.map((url) => cache.match(new Request(url))));
   return matches.every(Boolean);
 }
@@ -785,7 +782,6 @@ async function registerServiceWorker() {
 }
 async function warmModelCache(model, forceReload = false) {
   const modelUrl = `${model.baseUrl}/${MODEL_FILE}`;
-  const dataUrl = `${model.baseUrl}/${MODEL_DATA_FILE}`;
   const mapUrl = `${model.baseUrl}/${MAP_IMAGE_FILE}`;
 
   const importedData = state.importedModelData.get(model.name);
@@ -793,15 +789,13 @@ async function warmModelCache(model, forceReload = false) {
     appendConsole("Using imported model from memory");
     return {
       modelBytes: new Uint8Array(importedData[MODEL_FILE]),
-      dataBytes: new Uint8Array(importedData[MODEL_DATA_FILE]),
     };
   }
 
   if (!("caches" in window)) {
     appendConsole("Cache API unavailable, downloading model...");
     const modelBytes = await fetchBytes(modelUrl, forceReload);
-    const dataBytes = await fetchBytes(dataUrl, forceReload);
-    return { modelBytes, dataBytes };
+    return { modelBytes };
   }
 
   const cacheName = modelCacheName(model.name);
@@ -810,10 +804,9 @@ async function warmModelCache(model, forceReload = false) {
   appendConsole(`Using cache: ${cacheName}`);
 
   const modelBytes = await cacheWithProgress(cache, modelUrl, "model graph", forceReload);
-  const dataBytes = await cacheWithProgress(cache, dataUrl, "model weights", forceReload);
   await cacheWithProgress(cache, mapUrl, "map image", forceReload);
 
-  return { modelBytes, dataBytes };
+  return { modelBytes };
 }
 async function cacheWithProgress(cache, url, label, forceReload = false) {
   const cacheKey = new Request(url);
@@ -1300,9 +1293,9 @@ function getInputDims(name, fallbackDims = null) {
   const meta = getInputMeta(name);
 
   const dims =
-    normalizeDims(meta?.dimensions) ||
-    normalizeDims(meta?.dims) ||
-    normalizeDims(meta?.shape);
+    normalizeDims(meta?.dimensions, fallbackDims) ||
+    normalizeDims(meta?.dims, fallbackDims) ||
+    normalizeDims(meta?.shape, fallbackDims);
 
   if (dims) {
     state.inputDimsByName[name] = dims;
@@ -1347,8 +1340,8 @@ function getNoiseDims() {
     return state.noiseDims;
   }
 
-  state.noiseDims = getInputDims("noise", [1, 16, BASE_NOISE_FRAMES]);
-  // appendConsole(`noise dims from ONNX metadata: [${state.noiseDims.join(", ")}]`);
+  state.noiseDims = getInputDims("noise", [1, 64, BASE_NOISE_FRAMES]);
+  appendConsole(`noise base dims: [${state.noiseDims.join(", ")}]`);
 
   return state.noiseDims;
 }
@@ -1411,12 +1404,12 @@ function getInputMeta(name) {
   return null;
 }
 
-function normalizeDims(dims) {
+function normalizeDims(dims, fallbackDims = null) {
   if (!Array.isArray(dims)) {
     return null;
   }
 
-  const normalized = dims.map((dim) => {
+  const normalized = dims.map((dim, index) => {
     if (typeof dim === "number" && Number.isInteger(dim) && dim > 0) {
       return dim;
     }
@@ -1427,7 +1420,7 @@ function normalizeDims(dims) {
       return parsed;
     }
 
-    return null;
+    return fallbackDims?.[index] ?? null;
   });
 
   if (normalized.some((dim) => dim === null)) {
