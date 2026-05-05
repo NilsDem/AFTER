@@ -38,6 +38,8 @@ const state = {
   pianoRollDims: null,
   pianoRollInputName: null,
   modelCard: null,
+  sessionBackend: null,
+  modelFiles: null,
   _drawMapCallCount: 0,
   _defaultMapLoadAbort: null,
 };
@@ -139,43 +141,45 @@ async function createOnnxSession(modelFiles) {
 
   if (backendPreference === "wasm") {
     appendConsole("ONNX execution provider: wasm");
-    return await ort.InferenceSession.create(
+    return { session: await ort.InferenceSession.create(
       modelFiles.modelBytes,
       makeSessionOptions(["wasm"], modelFiles.dataBytes),
-    );
+    ), backend: "wasm" };
   }
 
   if (backendPreference === "auto" && isMobileDevice()) {
     appendConsole("Mobile device detected, forcing ONNX execution provider: wasm");
-    return await ort.InferenceSession.create(
+    return { session: await ort.InferenceSession.create(
       modelFiles.modelBytes,
       makeSessionOptions(["wasm"], modelFiles.dataBytes),
-    );
+    ), backend: "wasm" };
   }
 
+  appendConsole("Trying WebGPU... (will fall back to wasm if unavailable)");
   const webGpuAdapter = await getWebGpuAdapter();
   if (webGpuAdapter) {
     appendConsole("ONNX execution provider: webgpu");
     try {
-      return await ort.InferenceSession.create(
+      return { session: await ort.InferenceSession.create(
         modelFiles.modelBytes,
         makeSessionOptions(["webgpu"], modelFiles.dataBytes),
-      );
+      ), backend: "webgpu" };
     } catch (error) {
       appendConsole(`WebGPU session failed: ${error.message || String(error)}`);
       if (backendPreference === "webgpu") {
         throw error;
       }
+      appendConsole("Falling back to wasm.");
     }
   } else if (backendPreference === "webgpu") {
     throw new Error("WebGPU was requested with ?backend=webgpu, but no adapter is available.");
   }
 
   appendConsole("ONNX execution provider: wasm");
-  return await ort.InferenceSession.create(
+  return { session: await ort.InferenceSession.create(
     modelFiles.modelBytes,
     makeSessionOptions(["wasm"], modelFiles.dataBytes),
-  );
+  ), backend: "wasm" };
 }
 
 
@@ -372,6 +376,8 @@ function releaseCurrentModel() {
   appendConsole("releaseCurrentModel called - clearing map");
   const oldSession = state.session;
   state.session = null;
+  state.sessionBackend = null;
+  state.modelFiles = null;
   state.loadedModelName = "";
   state.mapImage = null;
   state.modelCard = null;
@@ -760,9 +766,12 @@ async function loadModel(model, forceReload = false) {
     await registerServiceWorker();
     const modelFiles = await warmModelCache(model, forceReload);
     state.modelCard = modelFiles.modelCard || null;
+    state.modelFiles = modelFiles;
     await loadMapImage(model, forceReload);
     appendConsole("Creating ONNX session...");
-    state.session = await createOnnxSession(modelFiles);
+    const { session, backend } = await createOnnxSession(modelFiles);
+    state.session = session;
+    state.sessionBackend = backend;
 
     console.log("inputNames:", state.session.inputNames);
     console.log("inputMetadata:", state.session.inputMetadata);
@@ -1799,7 +1808,26 @@ async function generateAudio() {
     appendConsole(`input noise dims: [${feeds.noise.dims.join(", ")}]`);
     appendConsole(`input ${getPianoRollInputName()} dims: [${feeds[getPianoRollInputName()].dims.join(", ")}]`);
 
-    const result = await state.session.run(feeds);
+    let result;
+    try {
+      result = await state.session.run(feeds);
+    } catch (runError) {
+      if (state.sessionBackend === "webgpu") {
+        appendConsole(`WebGPU inference failed: ${runError.message || String(runError)}`);
+        appendConsole("Falling back to wasm for inference...");
+        setStatus("WebGPU failed, retrying with wasm...");
+        try { state.session.release?.(); } catch (_) {}
+        state.session = await ort.InferenceSession.create(
+          state.modelFiles.modelBytes,
+          makeSessionOptions(["wasm"], state.modelFiles.dataBytes),
+        );
+        state.sessionBackend = "wasm";
+        appendConsole("ONNX execution provider: wasm (inference fallback)");
+        result = await state.session.run(feeds);
+      } else {
+        throw runError;
+      }
+    }
     const resultKeys = Object.keys(result);
     if (!result.audio) {
       throw new Error(`Model did not return an audio output. Outputs: ${resultKeys.join(", ")}`);
