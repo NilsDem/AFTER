@@ -421,32 +421,6 @@ async function hasModelFiles(baseUrl) {
   return true;
 }
 
-async function logDirectoryFiles(baseUrl) {
-  appendConsole("Trying to list the files");
-  try {
-    const response = await fetch(`${baseUrl}/`, { cache: "no-store" });
-    if (!response.ok) {
-      appendConsole(`Skipping ${baseUrl}: directory listing HTTP ${response.status}`);
-      return;
-    }
-
-    const html = await response.text();
-    const doc = new DOMParser().parseFromString(html, "text/html");
-    const folderPath = new URL(`${baseUrl}/`, location.origin).pathname.replace(/\/$/, "");
-    const entries = [...doc.querySelectorAll("a[href]")]
-      .map((link) => link.getAttribute("href"))
-      .filter(Boolean)
-      .map((href) => new URL(href, response.url).pathname)
-      .filter((pathname) => pathname.startsWith(`${folderPath}/`))
-      .map((pathname) => pathname.slice(folderPath.length + 1).replace(/\/$/, ""))
-      .filter((name) => name && !name.includes("/"));
-
-    appendConsole(`Files in ${baseUrl}: ${entries.length ? entries.join(", ") : "(none)"}`);
-  } catch (error) {
-    appendConsole(`Could not list ${baseUrl}/: ${error.message || String(error)}`);
-  }
-}
-
 async function scanModels() {
   console.log("SCAN MODELS CALLED");
   appendConsole("Scanning models...");
@@ -501,7 +475,6 @@ async function scanModels() {
         }
 
         appendConsole(`Checking model candidate: ${name} at ${baseUrl}`);
-        await logDirectoryFiles(baseUrl);
 
         if (await hasModelFiles(baseUrl)) {
           byName.set(name, { name, baseUrl });
@@ -1813,9 +1786,9 @@ async function generateAudio() {
       result = await state.session.run(feeds);
     } catch (runError) {
       if (state.sessionBackend === "webgpu") {
-        appendConsole(`WebGPU inference failed: ${runError.message || String(runError)}`);
-        appendConsole("Falling back to wasm for inference...");
-        setStatus("WebGPU failed, retrying with wasm...");
+        console.error("WebGPU inference failed; falling back to wasm.", runError);
+        appendConsole("WebGPU inference failed. Retrying with wasm.");
+        setStatus("WebGPU inference failed. Retrying with wasm...", true);
         try { state.session.release?.(); } catch (_) {}
         state.session = await ort.InferenceSession.create(
           state.modelFiles.modelBytes,
