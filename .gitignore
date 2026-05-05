@@ -1,3 +1,5 @@
+.vscode
+.agents
 .codex
 tests/
 .claude/
