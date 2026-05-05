@@ -10,7 +10,6 @@ If you use AFTER as a part of a music performance or installation, be sure to ci
 
 If you want to share / discuss / ask things about AFTER and other research from ACIDS, you can do so in our [discord server](https://discord.gg/r9umPrGEWv) !
 
-
 You can find pretrained models and max patches for realtime inference in the last section of this page.
 
 ### Installation
@@ -89,7 +88,7 @@ after prepare_dataset \
 
 ### Step 2 — Neural Audio Codec (Autoencoder)
 
-If you already have a streamable audio codec (e.g. a pretrained [RAVE](https://github.com/acids-ircam/RAVE) model) you can skip this step. Pretrained codecs are also available [here](https://nubo.ircam.fr/index.php/s/8NFD5gWwbkT4G5P).
+If you already have a streamable audio codec, such as a pretrained [RAVE](https://github.com/acids-ircam/RAVE) model, you can skip this step. See the [training guide](docs/training_guide.md) for more information. Pretrained codecs are also available [here](https://nubo.ircam.fr/index.php/s/8NFD5gWwbkT4G5P).
 
 #### Training
 
@@ -129,9 +128,11 @@ CUDA_VISIBLE_DEVICES=0,1,2 torchrun --nproc_per_node=3  after_scripts/train_auto
 
 | Config | Description |
 |---|---|
-| `AE_4096` | Spectral (STFT-based) codec, 16-dim latent, compression ratio 4096 |
+| `AE_4096` | Spectral (STFT-based) codec, 32-dim latent, compression ratio 4096 |
 
 #### Export
+
+After training, the model has to be exported to a torchscript file 
 
 ```bash
 after export_autoencoder --model_path autoencoder_runs/AE_model_name
@@ -144,6 +145,7 @@ This exports two TorchScript files into the run folder:
 ---
 
 ### Step 3 — AFTER Diffusion Model
+Make sure to prepare the latent dataset with the trained autoencoder before starting the diffusion model training. 
 
 #### Training
 
@@ -231,7 +233,7 @@ Always use the **streaming** codec (`export_stream.ts`) for export.
 
 | Attribute | Default | Description |
 |---|---|---|
-| `guidance_structure` | `1.0` | Classifier-free guidance strength on structure (0 = no influence of structure)|
+| `guidance_structure` | `1.0` | Classifier-free guidance strength on structure (0 = prior like ~ no influence of structure, >1. increase conditioning)|
 | `nb_steps` | `2` | Number of diffusion steps |
 
 <!-- 
