@@ -152,8 +152,8 @@ function create(model_name, buffer_size, prior)
 	var snapl2m1= p.getnamed("snapl2m1");
 	var snapl2m2 = p.getnamed("snapl2m2");
 
-	var max_m2l =  p.newdefault(2048, 1750, "nn~", model_name, "map2latent");
-	var max_l2m =  p.newdefault(2400, 2250, "nn~", model_name, "latent2map");
+	var max_m2l =  p.newdefault(2567, 1639, "nn~", model_name, "map2latent");
+	var max_l2m =  p.newdefault(3750, 2300, "nn~", model_name, "latent2map");
 
 
 	p.connect(sigm2l1, 0 ,max_m2l,  0);
