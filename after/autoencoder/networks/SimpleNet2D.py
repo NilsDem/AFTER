@@ -356,9 +356,13 @@ class AutoEncoder2D(nn.Module):
             x = self.pack_audio(x)
         x_multiband = self.time_transform(x)
         h = self._encode_features(x_multiband.clone())
-        h, regloss = self.bottleneck(h)
+        h, mean, regloss = self.bottleneck(h, return_mean=True)
         if with_multi:
             return h, x_multiband
+    
+        if return_mean:
+            return h, mean, regloss
+        
         return h, regloss
 
     @torch.jit.ignore

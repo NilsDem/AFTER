@@ -25,11 +25,16 @@ class TanhBottleneck(nn.Module):
         self.scale = scale
 
     def forward(self, x: Tensor,
-                apply_noise: bool = True) -> Tuple[Tensor, Tensor]:
+                apply_noise: bool = True,
+                return_mean:bool = False) -> Tuple[Tensor, Tensor]:
         if apply_noise:
             x = self.scale * torch.tanh(x) + self.sigma * torch.randn_like(x)
         else:
             x = self.scale * torch.tanh(x)
+        
+        if return_mean:
+            return x, torch.tensor(0.), x
+
         return x, torch.tensor(0.)
 
     def forward_stream(self, x: Tensor) -> Tensor:
@@ -72,10 +77,10 @@ class VAEBottleneck(nn.Module):
         var = std * std
         logvar = torch.log(var)
         z = torch.randn_like(mean) * std + mean
-        kl = (mean * mean + var - logvar - 1).sum(1).mean()
+        kl = (mean * mean + var - logvar - 1)
         if return_mean:
             return z, kl, mean
-        return z, kl
+        return z, kl.sum(1).mean()
 
     def forward_stream(self, z: Tensor) -> Tensor:
         mean, scale = z.chunk(2, 1)
