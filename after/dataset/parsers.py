@@ -32,7 +32,11 @@ def simple_midi(audio_folder, midi_folder, extensions, exclude, include):
     """
     audio_files, _, _ = simple_audio(audio_folder, midi_folder, extensions, exclude, include)
     midi_func = lambda x: os.path.splitext(x)[0] + ".mid"  # adapt as needed
+    
+    
+    
     midi_files = [midi_func(f) for f in audio_files]
+    midi_files = [os.path.join(midi_folder, f.split("/")[-1]) for f in midi_files]
     metadatas = [{"path": a, "midi_path": m} for a, m in zip(audio_files, midi_files)]
     return audio_files, midi_files, metadatas
 

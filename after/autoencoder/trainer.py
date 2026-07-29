@@ -204,7 +204,8 @@ class Trainer(nn.Module):
             self.opt_dis = None
 
     def load_model(self, path, step, load_discrim=False):
-        d = torch.load(path + "/checkpoint" + str(step) + ".pt")
+        checkpoint_path = os.path.join(path, "checkpoint" + str(step) + ".pt")
+        d = torch.load(checkpoint_path, map_location=self.device)
         self.model.load_state_dict(d["model_state"], strict=True)
 
         try:
@@ -220,6 +221,7 @@ class Trainer(nn.Module):
                 print("could not load discriminator optimizer state")
 
         self.step = step + 1
+        self.warmup = self.step > self.warmup_steps
 
     def update_waveform_losses(self, rec_loss_decay):
         if self.step < self.warmup_steps:
@@ -388,9 +390,10 @@ class Trainer(nn.Module):
 
         all_losses_sum = {}
         all_losses_count = {}
-        self.weight_waveform_losses = 1.
         self.weight_regularisation_loss = weight_regularisation_loss
         self.warmup_regularisation_loss = warmup_regularisation_loss
+        self.warmup = self.step > self.warmup_steps
+        self.update_waveform_losses(rec_loss_decay)
 
         self.look_ahead_steps = look_ahead_steps
 
@@ -405,6 +408,9 @@ class Trainer(nn.Module):
                     trainloader.sampler, "set_epoch"):
                 trainloader.sampler.set_epoch(epoch_idx)
             for x in trainloader:
+                if self.step >= self.max_steps:
+                    break
+
                 x = x.to(self.device)
 
                 all_losses = self.training_step(x)
@@ -430,8 +436,7 @@ class Trainer(nn.Module):
                         all_losses_sum[k] = 0.
                         all_losses_count[k] = 0
 
-                if (not (self.step % steps_valid) -
-                        5) and self.is_main_process:
+                if (self.step % steps_valid == 1) and self.is_main_process:
                     print("Validation Step")
 
                     if validloader is not None:

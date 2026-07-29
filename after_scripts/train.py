@@ -105,9 +105,18 @@ def main(argv):
         map(add_gin_extension, FLAGS.config),
         [],
     )
+    try:
+        ssl_steps = gin.query_parameter("%SSL_STEPS")
+    except:
+        ssl_steps = None
+        
+    print(ssl_steps)
 
     if FLAGS.restart is not None:
-        config_path = os.path.join(FLAGS.out_path, FLAGS.name, "config.gin")
+        if ssl_steps is not None and FLAGS.restart <= ssl_steps:
+            config_path = os.path.join(FLAGS.out_path, FLAGS.name, "encoder", "config.gin")
+        else:
+            config_path = os.path.join(FLAGS.out_path, FLAGS.name, "config.gin")
         with gin.unlock_config():
             gin.parse_config_files_and_bindings([config_path], [])
 
@@ -268,10 +277,6 @@ def main(argv):
         print("Number of parameters - classifier : ", num_el / 1e6, "M")
 
     # Train the SimDino Model  #########
-    try:
-        ssl_steps = gin.query_parameter("%SSL_STEPS")
-    except:
-        ssl_steps = None
 
     logger = None
     if ssl_steps is not None and (FLAGS.restart is None
@@ -359,11 +364,18 @@ def main(argv):
         valid_loader = None
 
     ######### TRAINING #########
+    
+    restart_step = FLAGS.restart
+    if ssl_steps is not None:
+        if FLAGS.restart is not None and FLAGS.restart < ssl_steps:
+            restart_step = None
+        
+    
     d = {
         "model_dir": model_dir,
         "dataloader": train_loader,
         "validloader": valid_loader,
-        "restart_step": FLAGS.restart,
+        "restart_step": restart_step,
         "init_step": ssl_steps if ssl_steps is not None else 0,
         "logger": logger
     }

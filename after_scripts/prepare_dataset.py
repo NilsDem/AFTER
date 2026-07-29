@@ -60,7 +60,7 @@ flags.DEFINE_bool(
 # --- Embedding model ---
 flags.DEFINE_string('emb_model_path', None,
                     'TorchScript (.pt) embedding model')
-flags.DEFINE_integer('batch_size', 4, 'Chunk batch size for embedding')
+flags.DEFINE_integer('batch_size', 8, 'Chunk batch size for embedding')
 flags.DEFINE_integer('gpu',
                      "-1",
                      help='Legacy CUDA gpu index. Use -1 for cpu. '
@@ -83,6 +83,8 @@ flags.DEFINE_float(
     'Fraction of structure augmentations that are fully silenced (audio zeroed, MIDI emptied)'
 )
 flags.DEFINE_bool('midi', False, 'Extract MIDI with BasicPitch')
+flags.DEFINE_string('midi_folder', None,
+                    "Folder to look for midi files when using simple_midi parser")
 flags.DEFINE_integer(
     'basic_pitch_batch_size', 64,
     'Number of audio windows processed at once by BasicPitch. Reduce if OOM on large files.'
@@ -145,15 +147,29 @@ def get_midi_chunk(midi_data, chunk_idx, num_signal, sr):
     length = num_signal / sr
     tstart = chunk_idx * length
     tend = tstart + length
-    midi_out = copy.deepcopy(midi_data)
-    for inst in midi_out.instruments:
-        inst.notes = [
-            n for n in inst.notes if n.end > tstart and n.start < tend
-        ]
-        for n in inst.notes:
-            n.start = max(0.0, n.start - tstart)
-            n.end = min(n.end - tstart, length)
-        inst.pitch_bends = []
+    # Avoid deepcopying the full PrettyMIDI object. Loaded PrettyMIDI instances
+    # cache a private full-file tick-to-time array, which can add >1 MB to every
+    # serialized chunk even after the notes have been filtered.
+    midi_out = pretty_midi.PrettyMIDI(resolution=midi_data.resolution)
+    for inst in midi_data.instruments:
+        notes = []
+        for note in inst.notes:
+            if note.end <= tstart or note.start >= tend:
+                continue
+            notes.append(
+                pretty_midi.Note(
+                    velocity=note.velocity,
+                    pitch=note.pitch,
+                    start=max(0.0, note.start - tstart),
+                    end=min(note.end - tstart, length),
+                ))
+
+        if notes:
+            out_inst = pretty_midi.Instrument(program=inst.program,
+                                             is_drum=inst.is_drum,
+                                             name=inst.name)
+            out_inst.notes = notes
+            midi_out.instruments.append(out_inst)
     return midi_out
 
 
@@ -337,10 +353,10 @@ def process_db(input_path, output_path, device, emb_model, z_length,
     env = lmdb.open(output_path,
                     map_size=FLAGS.db_size * 1024**3,
                     map_async=True,
-                    writemap=True,
+                    writemap=False,
                     readahead=False)
 
-    audio_files, midi_files, _ = get_parser(FLAGS.parser)(input_path, None,
+    audio_files, midi_files, _ = get_parser(FLAGS.parser)(input_path, FLAGS.midi_folder,
                                                           FLAGS.ext,
                                                           FLAGS.exclude,
                                                           FLAGS.include)
@@ -376,7 +392,7 @@ def process_db(input_path, output_path, device, emb_model, z_length,
                 continue
 
             if audio.shape[
-                    -1] == 0 or audio.shape[-1] < 0.25 * FLAGS.num_signal:
+                    -1] == 0 or audio.shape[-1] < 0.5 * FLAGS.num_signal:
                 print(f"Too short, skipping: {file}")
                 continue
 
@@ -524,8 +540,8 @@ def main(_):
         )
         timbre_aug = AudioAugment(
             sr=FLAGS.sample_rate,
-            pitch_min=-3,
-            pitch_max=3,
+            pitch_min=-2,
+            pitch_max=2,
             ts_min=0.9,
             ts_max=1.1,
             mode="chunk",
