@@ -12,6 +12,340 @@ from torchaudio.transforms import Spectrogram, InverseSpectrogram
 import torch
 
 
+def _periodic_hann(length: int,
+                   device=None,
+                   dtype=torch.float32) -> torch.Tensor:
+    n = torch.arange(length, device=device, dtype=dtype)
+    return 0.5 * (1.0 - torch.cos(2.0 * np.pi * n / length))
+
+
+def _mauer_windows(analysis_length: int,
+                   synthesis_length: int,
+                   zero_length: int,
+                   hop_length: int,
+                   dtype=torch.float32):
+    if synthesis_length % 2 != 0:
+        raise ValueError("synthesis_length must be even.")
+    if zero_length < 0:
+        raise ValueError("zero_length must be non-negative.")
+    if zero_length > analysis_length - synthesis_length:
+        raise ValueError("zero_length is too large.")
+
+    half_synthesis = synthesis_length // 2
+    long_half = analysis_length - half_synthesis - zero_length
+    short_hann = _periodic_hann(synthesis_length, dtype=dtype)
+    long_hann = _periodic_hann(2 * long_half, dtype=dtype)
+
+    h2_len = analysis_length - synthesis_length - zero_length
+    h1 = torch.zeros(zero_length, dtype=dtype)
+    h2 = torch.sqrt(long_hann[:h2_len].clamp_min(0.0))
+    h3 = torch.sqrt(long_hann[h2_len:h2_len + half_synthesis].clamp_min(0.0))
+    h4 = torch.sqrt(short_hann[half_synthesis:].clamp_min(0.0))
+    analysis_window = torch.cat((h1, h2, h3, h4))
+
+    f1_f2 = torch.zeros(analysis_length - synthesis_length, dtype=dtype)
+    eps = torch.finfo(dtype).eps
+    f3 = short_hann[:half_synthesis] / h3.clamp_min(eps)
+    f4 = torch.sqrt(short_hann[half_synthesis:].clamp_min(0.0))
+    synthesis_window = torch.cat((f1_f2, f3, f4))
+    synthesis_window *= hop_length / half_synthesis
+    return analysis_window, synthesis_window
+
+
+@gin.configurable
+class CausalMauerSTFT(torch.nn.Module):
+
+    def __init__(self,
+                 nfft: int = 1024,
+                 hop_size: int = 256,
+                 synthesis_length: int = None,
+                 zero_length: int = None,
+                 skip_features=None,
+                 normalize: bool = True,
+                 log1p: bool = False,
+                 alpha_rescale: float = 0.65,
+                 beta_rescale: float = 0.34,
+                 max_batch_size: int = 8):
+        super().__init__()
+        synthesis_length = 2 * hop_size if synthesis_length is None else synthesis_length
+        zero_length = hop_size if zero_length is None else zero_length
+
+        self.nfft = nfft
+        self.hop_size = hop_size
+        self.synthesis_length = synthesis_length
+        self.zero_length = zero_length
+        self.left_padding = nfft - hop_size
+        self.skip_features = skip_features
+        self.normalize = normalize
+        self.log1p = log1p
+        self.alpha_rescale = alpha_rescale
+        self.beta_rescale = beta_rescale
+
+        analysis_window, synthesis_window = _mauer_windows(
+            nfft, synthesis_length, zero_length, hop_size)
+        self.register_buffer("analysis_window", analysis_window)
+        self.register_buffer("synthesis_window", synthesis_window)
+        self.register_buffer(
+            "audio_buffer",
+            torch.zeros(max_batch_size, 1, nfft),
+            persistent=False)
+        self.register_buffer(
+            "output_buffer",
+            torch.zeros(max_batch_size, 1, hop_size),
+            persistent=False)
+
+    @torch.jit.export
+    def reset_stream(self):
+        self.audio_buffer.zero_()
+        self.output_buffer.zero_()
+
+    def normalize_complex(self, x):
+        mag = x.abs().clamp_min(1e-8)
+        scale = self.beta_rescale * mag.pow(self.alpha_rescale - 1.0)
+        return x * scale
+
+    def denormalize_complex(self, x):
+        mag = x.abs().clamp_min(1e-8)
+        target_mag = (mag / self.beta_rescale).pow(1.0 / self.alpha_rescale)
+        return x * (target_mag / mag)
+
+    def _pack_spec(self, spec):
+        if self.normalize:
+            spec = self.normalize_complex(spec)
+
+        if self.skip_features is not None:
+            if self.skip_features > 0:
+                spec = spec[:, :, self.skip_features:]
+            elif self.skip_features < 0:
+                spec = spec[:, :, :self.skip_features]
+
+        batch_size, channels, frequencies, frames = spec.shape
+
+        spec = torch.view_as_real(spec)
+        spec = spec.permute(0, 1, 4, 2, 3)
+        spec = spec.reshape(
+            batch_size,
+            channels * 2,
+            frequencies,
+            frames,
+        )
+
+        return spec
+
+    def _unpack_spec(self, spec):
+        if spec.dim() == 3:
+            spec = spec.unsqueeze(-1)
+
+        batch_size, packed_channels, frequencies, frames = spec.shape
+        channels = packed_channels // 2
+
+        spec = spec.reshape(
+            batch_size,
+            channels,
+            2,
+            frequencies,
+            frames,
+        )
+
+        spec = spec.permute(0, 1, 3, 4, 2).contiguous()
+        spec = torch.view_as_complex(spec)
+
+        if self.normalize:
+            spec = self.denormalize_complex(spec)
+
+        if self.skip_features is not None:
+            if self.skip_features > 0:
+                full = spec.new_zeros(
+                    batch_size,
+                    channels,
+                    frequencies + self.skip_features,
+                    frames,
+                )
+                full[:, :, self.skip_features:] = spec
+                spec = full
+
+            elif self.skip_features < 0:
+                skipped = -self.skip_features
+                full = spec.new_zeros(
+                    batch_size,
+                    channels,
+                    frequencies + skipped,
+                    frames,
+                )
+                full[:, :, :frequencies] = spec
+                spec = full
+
+        return spec
+    
+    def forward(self, x):
+        original_length = x.shape[-1]
+        right_padding = (-original_length) % self.hop_size
+        x = F.pad(x, (self.left_padding, right_padding))
+        frames = x.unfold(-1, self.nfft, self.hop_size)
+        frames = frames * self.analysis_window[None, None, None]
+        spec = torch.fft.rfft(frames, n=self.nfft, dim=-1).transpose(-1, -2)
+        return self._pack_spec(spec)
+
+    @torch.jit.export
+    def forward_stream(self, x):
+        batch_size = x.shape[0]
+        channels = x.shape[1]
+        chunk_size = x.shape[-1]
+
+        if chunk_size == 0 or chunk_size % self.hop_size != 0:
+            raise ValueError(
+                "forward_stream expects a positive multiple of hop_size."
+            )
+
+        if (
+            self.audio_buffer.shape[0] != batch_size
+            or self.audio_buffer.shape[1] != channels
+            or self.audio_buffer.device != x.device
+            or self.audio_buffer.dtype != x.dtype
+        ):
+            self.audio_buffer = torch.zeros(
+                batch_size,
+                channels,
+                self.nfft,
+                device=x.device,
+                dtype=x.dtype,
+            )
+
+        if chunk_size == self.hop_size:
+            self.audio_buffer[..., :-self.hop_size].copy_(
+                self.audio_buffer[..., self.hop_size:].clone()
+            )
+            self.audio_buffer[..., -self.hop_size:].copy_(x)
+
+            frame = self.audio_buffer * self.analysis_window
+            spec = torch.fft.rfft(frame, n=self.nfft, dim=-1)
+            spec = spec.unsqueeze(-1)
+
+            return self._pack_spec(spec)
+
+        history_and_chunk = torch.cat((self.audio_buffer, x), dim=-1)
+
+        frames = history_and_chunk[..., self.hop_size:].unfold(
+            dimension=-1,
+            size=self.nfft,
+            step=self.hop_size,
+        )
+
+        self.audio_buffer.copy_(history_and_chunk[..., -self.nfft:])
+
+        frames = frames * self.analysis_window
+        spec = torch.fft.rfft(frames, n=self.nfft, dim=-1)
+        spec = spec.transpose(-1, -2)
+
+        return self._pack_spec(spec)
+
+
+    def inverse(self, spec):
+        spec = self._unpack_spec(spec)
+        frames = torch.fft.irfft(spec.transpose(-1, -2),
+                                 n=self.nfft,
+                                 dim=-1)
+        frames = frames * self.synthesis_window[None, None, None]
+        batch_size, channels, n_frames, _ = frames.shape
+        frames = frames.reshape(batch_size * channels, n_frames,
+                                self.nfft).transpose(1, 2)
+        y = F.fold(frames,
+                   output_size=(1,
+                                self.nfft +
+                                (n_frames - 1) * self.hop_size),
+                   kernel_size=(1, self.nfft),
+                   stride=(1, self.hop_size))[:, :, 0]
+        return y.reshape(batch_size, channels, -1)[..., self.left_padding:]
+
+    @torch.jit.export
+    def inverse_stream(self, spec):
+        spec = self._unpack_spec(spec)
+
+        batch_size = spec.shape[0]
+        channels = spec.shape[1]
+        n_frames = spec.shape[-1]
+        dtype = spec.real.dtype
+
+        if n_frames < 1:
+            raise ValueError(
+                "inverse_stream expects at least one frame."
+            )
+
+        if self.synthesis_length != 2 * self.hop_size:
+            raise ValueError(
+                "The optimized streaming inverse requires "
+                "synthesis_length == 2 * hop_size."
+            )
+
+        if (
+            self.output_buffer.shape[0] != batch_size
+            or self.output_buffer.shape[1] != channels
+            or self.output_buffer.device != spec.device
+            or self.output_buffer.dtype != dtype
+        ):
+            self.output_buffer = torch.zeros(
+                batch_size,
+                channels,
+                self.hop_size,
+                device=spec.device,
+                dtype=dtype,
+            )
+
+        # Single-frame fast path.
+        if n_frames == 1:
+            frame = torch.fft.irfft(
+                spec[..., 0],
+                n=self.nfft,
+                dim=-1,
+            )
+
+            support = (
+                frame[..., -self.synthesis_length:]
+                * self.synthesis_window[-self.synthesis_length:]
+            )
+
+            y = self.output_buffer + support[..., :self.hop_size]
+            self.output_buffer.copy_(support[..., self.hop_size:])
+
+            return y
+
+        # Multi-frame path:
+        # [B, C, F, T] -> [B, C, T, nfft]
+        frames = torch.fft.irfft(
+            spec.transpose(-1, -2),
+            n=self.nfft,
+            dim=-1,
+        )
+
+        support = (
+            frames[..., -self.synthesis_length:]
+            * self.synthesis_window[-self.synthesis_length:]
+        )
+
+        # Each synthesis frame consists of:
+        #
+        #   [current output contribution | next-hop contribution]
+        #
+        first = support[..., :self.hop_size]
+        second = support[..., self.hop_size:]
+
+        # Add state left by the previous invocation.
+        first[..., 0, :].add_(self.output_buffer)
+
+        # Frame t's second half overlaps frame t+1's first half.
+        first[..., 1:, :].add_(second[..., :-1, :])
+
+        # Preserve the final pending half for the next invocation.
+        self.output_buffer.copy_(second[..., -1, :])
+
+        # [B, C, T, H] -> [B, C, T * H]
+        return first.reshape(
+            batch_size,
+            channels,
+            n_frames * self.hop_size,
+        )
+
+
 class ISTFT(torch.nn.Module):
     """
     Custom implementation of ISTFT since torch.istft doesn't allow custom padding (other than `center=True`) with
@@ -230,7 +564,9 @@ class StreamableSTFT(torch.nn.Module):
         real, imag = torch.chunk(spec, 2, -3)
 
         spec = torch.complex(real.squeeze(-3), imag.squeeze(-3))
-        spec = self.denormalize_complex(spec)
+        
+        if self.normalize:
+            spec = self.denormalize_complex(spec)
 
         spec = spec.unsqueeze(1)
 
