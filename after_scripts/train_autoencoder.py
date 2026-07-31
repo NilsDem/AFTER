@@ -231,6 +231,7 @@ def main(argv):
     if ddp_enabled and train_sampler is None:
         train_sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        
     if ddp_enabled and valset is not None and val_sampler is None:
         val_sampler = torch.utils.data.distributed.DistributedSampler(
             valset, num_replicas=world_size, rank=rank, shuffle=False)

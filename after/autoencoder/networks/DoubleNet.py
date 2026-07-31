@@ -265,7 +265,8 @@ class DoubleAE(nn.Module):
                  slow_encoder: nn.Module,
                  decoder: nn.Module,
                  slow_shift_steps: int = 1,
-                 regularisation_ratio: float = 1.):
+                 regularisation_ratio: float = 1.,
+                 freeze_mode: str = "both"):
         super().__init__()
         self.fast_encoder = fast_encoder
         self.slow_encoder = slow_encoder
@@ -273,6 +274,7 @@ class DoubleAE(nn.Module):
         self.slow_shift_steps = slow_shift_steps
         
         self.regloss_ratio = regularisation_ratio
+        self.freeze_mode = freeze_mode
 
         self.encoder = nn.ModuleList([self.fast_encoder, self.slow_encoder])
 
@@ -305,10 +307,23 @@ class DoubleAE(nn.Module):
         fast_size = self.fast_encoder.bottleneck_size
         return z[:, :fast_size], z[:, fast_size:]
 
-    def _encode_combined(self, x, with_multi: bool = False):
-        z_fast, fast_regloss, fast_multiband = self.fast_encoder._encode_with_multi(
-            x)
-        z_slow, slow_regloss, _ = self.slow_encoder._encode_with_multi(x)
+    def _encode_combined(self, x, with_multi: bool = False, freeze_encoder: bool=False):
+        
+        if freeze_encoder and self.freeze_mode in ["both", "fast"]:
+            with torch.no_grad():
+                z_fast, fast_regloss, fast_multiband = self.fast_encoder._encode_with_multi(
+                    x)
+        else:
+             z_fast, fast_regloss, fast_multiband = self.fast_encoder._encode_with_multi(
+                    x)
+             
+        if freeze_encoder and self.freeze_mode in ["both", "slow"]:
+            with torch.no_grad():   
+                z_slow, slow_regloss, _ = self.slow_encoder._encode_with_multi(x)
+        else:
+            z_slow, slow_regloss, _ = self.slow_encoder._encode_with_multi(x)
+            
+            
         z = self._combine_latents(z_fast, z_slow)
         
         fast_regloss *= self.regloss_ratio
@@ -363,13 +378,8 @@ class DoubleAE(nn.Module):
                 return_all: bool = True,
                 freeze_encoder: bool = False,
                 look_ahead_steps: int = 0):
-        if freeze_encoder:
-            with torch.no_grad():
-                z, regloss, x_multiband = self._encode_combined(
-                    x, with_multi=True)
-        else:
-            z, regloss, x_multiband = self._encode_combined(x,
-                                                            with_multi=True)
+        z, regloss, x_multiband = self._encode_combined(x,
+                                                            with_multi=True,freeze_encoder=freeze_encoder)
 
         if look_ahead_steps > 0:
             z = z[..., look_ahead_steps:]

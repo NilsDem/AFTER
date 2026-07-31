@@ -110,21 +110,36 @@ class Trainer(nn.Module):
         if self.encoder_frozen:
             return
         if self.step > self.freeze_encoder_step:
-            for p in self.model.encoder.parameters():
-                p.requires_grad = False
+            freeze_mode = getattr(self.model, "freeze_mode", "both")
+
+            if freeze_mode == "both":
+                encoders = [self.model.encoder]
+            elif freeze_mode == "fast":
+                encoders = [self.model.fast_encoder]
+            elif freeze_mode == "slow":
+                encoders = [self.model.slow_encoder]
+            elif freeze_mode in ("none", None):
+                encoders = []
+            else:
+                raise ValueError(
+                    f"Unknown encoder freeze mode: {freeze_mode!r}")
+
+            for encoder in encoders:
+                for p in encoder.parameters():
+                    p.requires_grad = False
             self.encoder_frozen = True
 
-    def _model_forward(self, *args, **kwargs):
-        if self.model_ddp is not None:
+    def _model_forward(self, *args, use_wrapped=True, **kwargs):
+        if use_wrapped and self.model_ddp is not None:
             return self.model_ddp(*args, **kwargs)
-        if self.model_dp is not None:
+        if use_wrapped and self.model_dp is not None:
             return self.model_dp(*args, **kwargs)
         return self.model(*args, **kwargs)
 
-    def _discriminator_forward(self, *args, **kwargs):
-        if self.discriminator_ddp is not None:
+    def _discriminator_forward(self, *args, use_wrapped=True, **kwargs):
+        if use_wrapped and self.discriminator_ddp is not None:
             return self.discriminator_ddp(*args, **kwargs)
-        if self.discriminator_dp is not None:
+        if use_wrapped and self.discriminator_dp is not None:
             return self.discriminator_dp(*args, **kwargs)
         return self.discriminator(*args, **kwargs)
 
@@ -244,12 +259,13 @@ class Trainer(nn.Module):
         return loss_gen, loss_dis, loss_dis_dict
 
     # @torch.compile(mode='max-autotune', disable=False)
-    def ae_forward(self, x):
+    def ae_forward(self, x, use_wrapped=True):
         y, y_multiband, z, regloss, x_multiband = self._model_forward(
             x,
             return_all=True,
             freeze_encoder=self.step > self.freeze_encoder_step,
-            look_ahead_steps=self.look_ahead_steps)
+            look_ahead_steps=self.look_ahead_steps,
+            use_wrapped=use_wrapped)
 
         if self.look_ahead_steps == 0:
             loss_ae, loss_out = self.compute_loss(x,
@@ -270,7 +286,7 @@ class Trainer(nn.Module):
 
         if self.warmup:
             loss_gen, loss_dis, loss_dis_dict = self._discriminator_forward(
-                x, y)
+                x, y, use_wrapped=use_wrapped)
         else:
             loss_gen = torch.tensor(0.).to(x)
             loss_dis_dict = {}
@@ -333,7 +349,8 @@ class Trainer(nn.Module):
         with torch.no_grad():
             for i, x in enumerate(validloader):
                 x = x.to(self.device)
-                losses, _, _, _, _, y = self.ae_forward(x)
+                losses, _, _, _, _, y = self.ae_forward(
+                    x, use_wrapped=not self.distributed)
 
                 for k, v in losses.items():
                     all_losses[k] = v + all_losses.get(k, 0.)

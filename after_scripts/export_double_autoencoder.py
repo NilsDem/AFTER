@@ -81,14 +81,9 @@ class DoubleAE_Spectral(nn_tilde.Module):
         self.slow_hop = model.slow_encoder.time_transform.hop_size
         self.fast_ratio = self._audio_to_code_ratio(model.fast_encoder)
         self.slow_ratio = self._audio_to_code_ratio(model.slow_encoder)
-        self.slow_fast_delay = self._slow_fast_alignment_delay(
-            model.fast_encoder, model.slow_encoder, self.fast_ratio)
 
         self.register_buffer("slow_memory",
                              torch.zeros(8, self.slow_size, 1))
-        self.register_buffer(
-            "slow_fast_memory",
-            torch.zeros(8, self.slow_size, max(1, self.slow_fast_delay)))
 
         in_labels = [
             f"(signal) Input {i + 1}" for i in range(self.audio_channels)
@@ -142,7 +137,6 @@ class DoubleAE_Spectral(nn_tilde.Module):
                                  output_labels=out_labels,
                                  test_buffer_size=self.slow_ratio)
         self.slow_memory.zero_()
-        self.slow_fast_memory.zero_()
 
     @staticmethod
     def _audio_to_code_ratio(encoder: nn.Module) -> int:
@@ -151,34 +145,20 @@ class DoubleAE_Spectral(nn_tilde.Module):
             ratio *= layer.proj_pool.stride[1]
         return ratio
 
-    @staticmethod
-    def _stream_stft_delay(transform: nn.Module) -> int:
-        return transform.nfft // 2 - transform.hop_size
-
-    @classmethod
-    def _slow_fast_alignment_delay(cls, fast_encoder: nn.Module,
-                                   slow_encoder: nn.Module,
-                                   fast_ratio: int) -> int:
-        fast_delay = cls._stream_stft_delay(fast_encoder.time_transform)
-        slow_delay = cls._stream_stft_delay(slow_encoder.time_transform)
-        relative_delay = fast_delay - slow_delay
-        if relative_delay <= 0:
-            return 0
-        return int(round(relative_delay / fast_ratio))
-
     @torch.jit.export
     def encode_fast(self, x: torch.Tensor) -> torch.Tensor:
         x = self.model.fast_encoder.pack_audio(x)
-        x = self.model.fast_encoder.time_transform(x)
+        x = self.model.fast_encoder.time_transform.forward_stream(x)
         z = self.model.fast_encoder._encode_features(x)
         return self.model.fast_encoder.bottleneck.forward_stream(z)
 
     @torch.jit.export
     def encode_slow(self, x: torch.Tensor) -> torch.Tensor:
         x = self.model.slow_encoder.pack_audio(x)
-        x = self.model.slow_encoder.time_transform(x)
-        z = self.model.slow_encoder._encode_features(x)
-        return self.model.slow_encoder.bottleneck.forward_stream(z)
+        x = self.model.slow_encoder.time_transform.forward_stream(x)
+        z = self.model.slow_encoder._encode_features(x)   
+        z = self.model.slow_encoder.bottleneck.forward_stream(z)
+        return z
 
     @torch.jit.export
     def encode_fast_from_transform(self,
@@ -197,35 +177,25 @@ class DoubleAE_Spectral(nn_tilde.Module):
         slow_steps = z_slow.shape[-1]
         repeat = (fast_steps + slow_steps - 1) // slow_steps
         z_slow = z_slow.repeat_interleave(repeat, dim=-1)
-        return z_slow[..., :fast_steps]
+        return z_slow
 
     def _shift_slow_to_checkpoint_layout(self,
                                          z_slow: torch.Tensor) -> torch.Tensor:
-        shift = self.model.slow_shift_steps
+        shift = 1
         if shift <= 0:
             return z_slow
-        if shift >= z_slow.shape[-1]:
-            return torch.zeros_like(z_slow)
-        pad = torch.zeros_like(z_slow[..., :shift])
-        return torch.cat((z_slow[..., shift:], pad), dim=-1)
-
-    def _delay_slow_to_fast_alignment(self,
-                                      z_slow: torch.Tensor) -> torch.Tensor:
-        delay = self.slow_fast_delay
-        if delay <= 0:
+        if shift == z_slow.shape[-1]:
+            temp_last = z_slow.clone()
+            z_slow = self.slow_memory[:z_slow.shape[0]].clone()
+            self.slow_memory[:z_slow.shape[0]] = temp_last.clone()
             return z_slow
-
-        n = z_slow.shape[0]
-        steps = z_slow.shape[-1]
-        history = self.slow_fast_memory[:n].to(z_slow)
-        if delay >= steps:
-            delayed = history[..., -steps:]
-        else:
-            delayed = torch.cat((history, z_slow[..., :-delay]), dim=-1)
-
-        self.slow_fast_memory[:n].copy_(
-            torch.cat((history, z_slow), dim=-1)[..., -delay:].detach())
-        return delayed
+        
+        temp_last = z_slow[...,-shift:].clone()
+        z_slow =  torch.cat((self.slow_memory[:z_slow.shape[0]].clone(), z_slow[..., :-shift]), dim=-1)
+        
+        self.slow_memory[:z_slow.shape[0]] = temp_last.clone()
+        
+        return z_slow
 
     @torch.jit.export
     def encode_from_transforms(self, fast_multiband: torch.Tensor,
@@ -257,7 +227,7 @@ class DoubleAE_Spectral(nn_tilde.Module):
         z_slow = self._shift_slow_to_checkpoint_layout(z_slow)
         z_slow = self._repeat_slow_to_fast(z_slow, z_fast.shape[-1])
         
-        z = torch.cat((z_fast, delayed_slow), dim=1)
+        z = torch.cat((z_fast, z_slow), dim=1)
         return self._decode_combined(z)
 
 
@@ -313,7 +283,7 @@ class DoubleAE_Fast(nn_tilde.Module):
     @torch.jit.export
     def encode_fast(self, x: torch.Tensor) -> torch.Tensor:
         x = self.fast_encoder.pack_audio(x)
-        x = self.fast_encoder.time_transform(x)
+        x = self.fast_encoder.time_transform.forward_stream(x)
         z = self.fast_encoder._encode_features(x)
         return self.fast_encoder.bottleneck.forward_stream(z)
 

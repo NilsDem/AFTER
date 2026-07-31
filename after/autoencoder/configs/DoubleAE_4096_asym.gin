@@ -17,7 +17,7 @@ LATENT_SIZE = 36
 TIME_SIZE = 131072
 
 ## TRAINING
-FREEZE_ENCODER_STEPS = %MAX_STEPS
+FREEZE_ENCODER_STEPS = %WARMUP_STEPS
 WARMUP_STEPS = 100000
 MAX_STEPS = 500000
 REGULARISATION_WEIGHT = 0.0001
@@ -104,6 +104,7 @@ DoubleNet.DoubleAE:
     decoder = @decoder/DoubleNet.Decoder2D()
     slow_shift_steps = 1
     regularisation_ratio = %REGULARISATION_RATIO
+    freeze_mode = "fast"
 
 autoencoder.core.SpectralDistance:
     scales = [64, 128, 256, 512, 1024, 2048]
