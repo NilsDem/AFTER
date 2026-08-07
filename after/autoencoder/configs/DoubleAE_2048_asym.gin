@@ -13,26 +13,26 @@ SR = 44100
 AUDIO_CHANNELS = None
 FAST_LATENT_SIZE = 2
 SLOW_LATENT_SIZE = 32
-LATENT_SIZE = 36
+LATENT_SIZE = 34
 TIME_SIZE = 131072
 
 ## TRAINING
 FREEZE_ENCODER_STEPS = %WARMUP_STEPS
 WARMUP_STEPS = 100000
-MAX_STEPS = 500000
+MAX_STEPS = 1000000
 REGULARISATION_WEIGHT = 0.0001
-REGULARISATION_RATIO = 100
+REGULARISATION_RATIO = 500
 REGULARISATION_WARMUP = 5000
 
 ## FAST ENCODER
-FAST_CHANNELS = [2, 4, 8, 16]
-FAST_TIME_RATIOS = [1, 1, 1, 1]
-FAST_FREQ_RATIOS = [2, 2, 2, 2]
-FAST_NFFT = 512
+FAST_CHANNELS = [4, 8, 16]
+FAST_TIME_RATIOS = [1, 1, 1]
+FAST_FREQ_RATIOS = [2, 2, 2]
+FAST_NFFT = 256
 FAST_HOP = 64
 
 ## SLOW ENCODER
-SLOW_CHANNELS = [16, 32, 64, 64, 64, 64, 64, 128]
+SLOW_CHANNELS = [64, 64, 128, 128, 128, 128, 128, 256]
 SLOW_TIME_RATIOS = [1, 2, 2, 1, 1, 1, 1, 1]
 SLOW_FREQ_RATIOS = [2, 2, 2, 2, 2, 2, 2, 2]
 SLOW_NFFT = 1024
@@ -115,7 +115,7 @@ discriminators.SpectroDiscriminator:
     n_ffts = [128, 256, 512, 1024, 2048, 4096]
     hop_lengths = [64, 128, 256, 512, 1024, 2048]
     normalize_losses = True
-    capacity = 16
+    capacity = 12
     channels = [1, 2, 4, 4, 4, 8]
     time_size = %TIME_SIZE
     weights = {
@@ -133,7 +133,7 @@ autoencoder.trainer.Trainer:
     waveform_losses = [(1.0, @autoencoder.core.SpectralDistance())]
     multiband_distances = []
     reg_losses = []
-    update_discriminator_every = 4
+    update_discriminator_every = 6
 
 autoencoder.trainer.Trainer.fit:
     steps_display = 100

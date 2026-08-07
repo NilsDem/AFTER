@@ -37,7 +37,8 @@ flags.DEFINE_string("device", None,
                     "Torch device: 'cpu', 'cuda', 'cuda:N', 'mps', or 'auto'. "
                     "Overrides --gpu when set.")
 flags.DEFINE_bool("ddp", False, "Use DistributedDataParallel")
-flags.DEFINE_integer("num_workers", 0, "Number of workers")
+flags.DEFINE_bool("amp", False, "Use CUDA automatic mixed precision")
+flags.DEFINE_integer("num_workers", 4, "Number of data-loading workers")
 flags.DEFINE_bool("use_cache", False, "Wether to load the dataset in cache")
 flags.DEFINE_bool("use_validation", True, "Use a train/validation split")
 flags.DEFINE_bool("use_psts", True,
@@ -79,6 +80,12 @@ def main(argv):
         device = resolve_device(FLAGS.device, FLAGS.gpu)
         device_ids=None
 
+    if str(device).startswith("cuda"):
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+
     ## GIN CONFIG
     if FLAGS.restart is not None:
         config_path = os.path.join(output_root, model_name, "config.gin")
@@ -99,7 +106,8 @@ def main(argv):
     trainer = Trainer(device=device,
                       device_ids=device_ids,
                       distributed=ddp_enabled,
-                      is_main_process=rank == 0)
+                      is_main_process=rank == 0,
+                      use_amp=FLAGS.amp)
 
     ### TEST NETWORK (shape depends on audio_channels)
     x = torch.randn(1, audio_channels, 4096 * 16).to(trainer.device)
@@ -115,6 +123,11 @@ def main(argv):
     if trainer.discriminator is not None:
         num_el = sum(p.numel() for p in trainer.discriminator.parameters())
         print("Number of parameters - Discriminator : ", num_el / 1e6, "M")
+
+    slow_decoder = getattr(trainer.model, "slow_decoder", None)
+    if slow_decoder is not None:
+        num_el = sum(p.numel() for p in slow_decoder.parameters())
+        print("Number of parameters - Slow Decoder : ", num_el / 1e6, "M")
 
     ## TRANSFORMS
     transforms = [
@@ -231,10 +244,17 @@ def main(argv):
     if ddp_enabled and train_sampler is None:
         train_sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, num_replicas=world_size, rank=rank, shuffle=True)
-        
-    if ddp_enabled and valset is not None and val_sampler is None:
-        val_sampler = torch.utils.data.distributed.DistributedSampler(
-            valset, num_replicas=world_size, rank=rank, shuffle=False)
+
+    # Validation runs only on rank zero, so it must see the complete split.
+    if ddp_enabled:
+        val_sampler = None
+
+    worker_kwargs = {
+        "num_workers": FLAGS.num_workers,
+        "persistent_workers": FLAGS.num_workers > 0,
+    }
+    if FLAGS.num_workers > 0:
+        worker_kwargs["prefetch_factor"] = 2
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -242,19 +262,19 @@ def main(argv):
         shuffle=True if train_sampler is None else False,
         collate_fn=collate_fn,
         drop_last=True,
-        num_workers=FLAGS.num_workers,
         sampler=train_sampler,
-        pin_memory=True)
+        pin_memory=True,
+        **worker_kwargs)
 
-    if use_validation:
+    if use_validation and (not ddp_enabled or rank == 0):
         validloader = torch.utils.data.DataLoader(valset,
                                                   batch_size=batch_size,
                                                   shuffle=False,
                                                   collate_fn=collate_fn,
                                                   drop_last=True,
-                                                  num_workers=0,
                                                   sampler=val_sampler,
-                                                  pin_memory=True)
+                                                  pin_memory=True,
+                                                  **worker_kwargs)
     else:
         validloader = None
 

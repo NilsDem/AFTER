@@ -13,7 +13,7 @@ SR = 44100
 AUDIO_CHANNELS = None
 FAST_LATENT_SIZE = 2
 SLOW_LATENT_SIZE = 32
-LATENT_SIZE = 36
+LATENT_SIZE = %FAST_LATENT_SIZE
 TIME_SIZE = 131072
 
 ## TRAINING
@@ -21,34 +21,41 @@ FREEZE_ENCODER_STEPS = %WARMUP_STEPS
 WARMUP_STEPS = 100000
 MAX_STEPS = 500000
 REGULARISATION_WEIGHT = 0.0001
-REGULARISATION_RATIO = 100
+REGULARISATION_RATIO = 200
 REGULARISATION_WARMUP = 5000
 
 ## FAST ENCODER
-FAST_CHANNELS = [2, 4, 8, 16]
+FAST_CHANNELS = [16, 32, 32, 64]
 FAST_TIME_RATIOS = [1, 1, 1, 1]
 FAST_FREQ_RATIOS = [2, 2, 2, 2]
 FAST_NFFT = 512
 FAST_HOP = 64
 
-## SLOW ENCODER
-SLOW_CHANNELS = [16, 32, 64, 64, 64, 64, 64, 128]
+## SLOW ENCODER / MAP DECODER
+SLOW_CHANNELS = [32, 64, 64, 64, 128, 128, 128, 256]
 SLOW_TIME_RATIOS = [1, 2, 2, 1, 1, 1, 1, 1]
 SLOW_FREQ_RATIOS = [2, 2, 2, 2, 2, 2, 2, 2]
 SLOW_NFFT = 1024
 SLOW_HOP = 512
 
-## DECODER
-DECODER_CHANNELS = [4, 8, 16, 64, 64, 32, 32]
-DECODER_TIME_RATIOS = [1, 1, 1, 1, 1, 1, 1]
-DECODER_FREQ_RATIOS = [2, 2, 2, 2, 2, 2, 1]
+SLOW_DECODER_CHANNELS = [32, 64, 64, 64, 128, 128, 256, 256]
+SLOW_DECODER_TIME_RATIOS = [2, 2, 2, 2, 2]
+SLOW_DECODER_FREQ_RATIOS = [2, 2, 2, 2, 1]
+FUSION_CHANNELS = 32
+FUSION_AFTER_LAYERS = 4
+DROP_FAST_PROBABILITY = 0.1
+
+## FAST DECODER
+DECODER_CHANNELS = [16, 16, 16, 16, 16, 16]
+DECODER_TIME_RATIOS = [1, 1, 1, 1, 1, 1]
+DECODER_FREQ_RATIOS = [2, 2, 2, 2, 2, 4]
 KERNEL_SIZE = 3
 
 fast_transform/audio.CausalMauerSTFT:
     nfft = %FAST_NFFT
     hop_size = %FAST_HOP
     synthesis_length = 128
-    zero_length=64
+    zero_length = 64
     skip_features = -1
     normalize = True
 
@@ -56,7 +63,7 @@ slow_transform/audio.CausalMauerSTFT:
     nfft = %SLOW_NFFT
     hop_size = %SLOW_HOP
     synthesis_length = 128
-    zero_length=64
+    zero_length = 64
     skip_features = -1
     normalize = True
 
@@ -86,6 +93,18 @@ slow_encoder/DoubleNet.Encoder2D:
     time_transform = @slow_transform/audio.CausalMauerSTFT()
     use_vae = True
 
+slow_decoder/DoubleNet.SlowMapDecoder:
+    bottleneck_size = %SLOW_LATENT_SIZE
+    audio_channels = %AUDIO_CHANNELS
+    channels = %SLOW_DECODER_CHANNELS
+    time_ratios = %SLOW_TIME_RATIOS
+    freq_ratios = %SLOW_FREQ_RATIOS
+    freq_size = %SLOW_NFFT
+    output_channels = %FUSION_CHANNELS
+    decoder_time_ratios = %SLOW_DECODER_TIME_RATIOS
+    decoder_freq_ratios = %SLOW_DECODER_FREQ_RATIOS
+    kernel_size = %KERNEL_SIZE
+
 decoder/DoubleNet.Decoder2D:
     in_size = 2
     out_size = None
@@ -97,14 +116,18 @@ decoder/DoubleNet.Decoder2D:
     freq_size = %FAST_NFFT
     kernel_size = %KERNEL_SIZE
     time_transform = @fast_transform/audio.CausalMauerSTFT()
+    side_channels = %FUSION_CHANNELS
+    fusion_after_layers = 3#%FUSION_AFTER_LAYERS
 
 DoubleNet.DoubleAE:
     fast_encoder = @fast_encoder/DoubleNet.Encoder2D()
     slow_encoder = @slow_encoder/DoubleNet.Encoder2D()
     decoder = @decoder/DoubleNet.Decoder2D()
+    slow_decoder = @slow_decoder/DoubleNet.SlowMapDecoder()
     slow_shift_steps = 2
     regularisation_ratio = %REGULARISATION_RATIO
     freeze_mode = "fast"
+    drop_fast_probability = %DROP_FAST_PROBABILITY
 
 autoencoder.core.SpectralDistance:
     scales = [64, 128, 256, 512, 1024, 2048]
@@ -142,4 +165,4 @@ autoencoder.trainer.Trainer.fit:
     rec_loss_decay = 1.0
     weight_regularisation_loss = %REGULARISATION_WEIGHT
     warmup_regularisation_loss = %REGULARISATION_WARMUP
-    look_ahead_steps = 1
+    look_ahead_steps = 0

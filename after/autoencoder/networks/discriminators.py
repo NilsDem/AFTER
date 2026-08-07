@@ -260,8 +260,8 @@ class SpectroDiscriminator(nn.Module):
         logits_true, feature_true = self.discriminators(x)
         logits_fake, feature_fake = self.discriminators(y)
 
-        dis_loss = torch.tensor(0.)
-        adv_loss = torch.tensor(0.)
+        dis_loss = x.new_zeros(())
+        adv_loss = x.new_zeros(())
         fm_distance = 0.
         pred_fake, pred_true = 0., 0.
 
@@ -283,19 +283,15 @@ class SpectroDiscriminator(nn.Module):
         fm_distance = fm_distance / n
 
         loss_dict = {
-            "discriminator":
-            dis_loss.item(),
-            "adversarial":
-            adv_loss.item(),
-            "feature_matching":
-            fm_distance.item()
-            if torch.is_tensor(fm_distance) else fm_distance,
-            "pred_real":
-            pred_true.mean().item()
-            if torch.is_tensor(pred_true) else pred_true,
-            "pred_fake":
-            pred_fake.mean().item()
-            if torch.is_tensor(pred_fake) else pred_fake,
+            "discriminator": dis_loss.detach(),
+            "adversarial": adv_loss.detach(),
+            "feature_matching": (fm_distance.detach()
+                                 if torch.is_tensor(fm_distance) else
+                                 fm_distance),
+            "pred_real": (pred_true.mean().detach()
+                          if torch.is_tensor(pred_true) else pred_true),
+            "pred_fake": (pred_fake.mean().detach()
+                          if torch.is_tensor(pred_fake) else pred_fake),
         }
 
         loss_gen = (adv_loss * self.weights["adversarial"] +
