@@ -1,0 +1,80 @@
+from __gin__ import dynamic_registration
+
+import after
+from after import diffusion
+from after import prior
+
+IN_SIZE = None
+N_SIGNAL = None
+N_CONDITION = None
+ZS_CHANNELS = 6
+OUT_TRANSFORMER_DIM = 16
+SR = 44100
+
+prior.data.collate_fn:
+    n_signal = %N_SIGNAL
+    n_condition = %N_CONDITION
+
+prior.networks.cam_transformer.MHAttention.local_attention_size = 32
+
+conditioner/diffusion.networks.ecapa_encoder.ECAPATDNN:
+    attention_channels = 128
+    channels = [512, 512, 512, 1024]
+    dilations = [1, 1, 1, 1]
+    global_context = True
+    groups = [1, 1, 1, 1]
+    in_size = %IN_SIZE
+    kernel_sizes = [3, 3, 3, 3]
+    out_dim = %ZS_CHANNELS
+    pooling = True
+    res2net_scale = 8
+    se_channels = 128
+    spherical_normalisation = False
+    use_tanh = False
+    regularisation = "vae"
+
+prior.networks.cam_transformer.Denoiser:
+    n_channels = %IN_SIZE
+    out_dim = %OUT_TRANSFORMER_DIM
+    seq_len = %N_SIGNAL
+    embed_dim = 384
+    cond_dim = %ZS_CHANNELS
+    n_layers = 6
+    mlp_multiplier = 3
+    dropout = 0.1
+    causal = True
+    pos_emb_type = "rotary"
+    max_cache_size = 0
+    min_chunk_size = 1
+
+prior.networks.predictor.SimpleMLPAdaLN:
+    in_channels = %IN_SIZE
+    out_channels = %IN_SIZE
+    z_channels = %OUT_TRANSFORMER_DIM
+    cond_channels = %ZS_CHANNELS
+    model_channels = 256
+    num_res_blocks = 6
+
+prior.networks.cam_transformer.SOSReplacer:
+    dim = %OUT_TRANSFORMER_DIM
+    xavier_init = True
+
+prior.model.Prior:
+    net = @prior.networks.cam_transformer.Denoiser()
+    predictor = @prior.networks.predictor.SimpleMLPAdaLN()
+    sos_token = @prior.networks.cam_transformer.SOSReplacer()
+    conditioner = @conditioner/diffusion.networks.ecapa_encoder.ECAPATDNN()
+    rf_batch_mul = 2
+    p_drop_sos = 0.1
+    add_train_noise = "convex"
+
+prior.trainer.Trainer:
+    model = @prior.model.Prior()
+    max_steps = 1000000
+    lr = 1e-4
+    regularization_weight = 5e-4
+    regularization_warmup = 100000
+    lr_warmup = 20000
+    steps_display = 100
+    steps_valid = 5000
+    steps_save = 50000

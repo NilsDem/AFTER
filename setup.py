@@ -23,6 +23,7 @@ setuptools.setup(
     package_data={
         'after/diffusion/configs': ['*.gin'],
         'after/autoencoder/configs': ['*.gin'],
+        'after/prior/configs': ['*.gin'],
     },
     classifiers=[
         "Programming Language :: Python :: 3",

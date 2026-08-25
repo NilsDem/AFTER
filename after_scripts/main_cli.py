@@ -4,7 +4,8 @@ from absl import app
 
 AVAILABLE_SCRIPTS = [
     'train', 'prepare_dataset', 'update_dataset', 'train_autoencoder',
-    'export_autoencoder', 'export', 'export_midi', "export_clock"
+    'export_autoencoder', 'export', 'export_midi', "export_clock",
+    'train_prior', 'export_prior'
 ]
 
 
@@ -57,5 +58,13 @@ def main():
         from after_scripts import export_clock
         sys.argv[0] = export_clock.__name__
         app.run(export_clock.main)
+    elif command == 'train_prior':
+        from after_scripts import train_prior
+        sys.argv[0] = train_prior.__name__
+        app.run(train_prior.main)
+    elif command == 'export_prior':
+        from after_scripts import export_prior
+        sys.argv[0] = export_prior.__name__
+        app.run(export_prior.main)
     else:
         raise Exception(f'Command {command} not found')

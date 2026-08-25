@@ -217,6 +217,35 @@ Logs and checkpoints are saved to `<out_path>/<name>/`.
 
 Config files live in `after/diffusion/configs/`. We recommend using the SimDino configs by default. 
 
+### Optional CAM Prior
+
+The prior learns an autoregressive model directly on the codec latents stored in
+the LMDB dataset. Its default CAM configuration uses an independent crop (or a
+detected timbre augmentation) as global conditioning.
+
+```bash
+after train_prior \
+  --name prior_model_name \
+  --db_path /dataset/path_latent \
+  --config cam
+```
+
+Resume and export use the same run folder conventions as the other models:
+
+```bash
+after train_prior --name prior_model_name --db_path /dataset/path_latent --restart 50000
+after export_prior \
+  --model_path prior_runs/prior_model_name \
+  --emb_model_path AE_model_run/export_stream.ts
+```
+
+Use `--config cam_uncond` (or `--noconditioned` with the regular CAM config) to
+train an unconditional prior. The exported
+`nn_tilde.Module` provides `diffuse`, `decode`, and `generate`, with a rolling
+CAM attention cache. A conditioned prior takes `ZS_CHANNELS` timbre-control
+signals; an unconditional prior takes one trigger signal whose value is
+ignored.
+
 <!-- 
 Key global parameters (overridable via gin bindings):
 
