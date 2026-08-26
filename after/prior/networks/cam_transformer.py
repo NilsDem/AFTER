@@ -60,8 +60,9 @@ class MHAttention(nn.Module):
         self.min_chunk_size = min_chunk_size
         self.rotary_emb = rotary_emb
 
-        self.register_buffer("last_k", None)
-        self.register_buffer("last_v", None)
+        last_shape = (1, n_heads, 0, embed_dim // n_heads)
+        self.register_buffer("last_k", torch.zeros(last_shape))
+        self.register_buffer("last_v", torch.zeros(last_shape))
         cache_shape = (max_batch_size, max_num_cache, n_heads,
                        max_cache_size, embed_dim // n_heads)
         self.register_buffer("k_cache", torch.zeros(cache_shape))
@@ -81,8 +82,6 @@ class MHAttention(nn.Module):
         self.v_cache[:v.shape[0], cache_index] = v
 
     def roll_cache(self, roll_size: int, cache_index: int):
-        if self.last_k is None or self.last_v is None:
-            return
         k_cache, v_cache = self.get_buffers(cache_index)
         k_cache = torch.cat(
             (k_cache[:self.last_k.shape[0]], self.last_k[:, :, :roll_size]),

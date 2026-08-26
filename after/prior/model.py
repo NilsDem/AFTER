@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Optional
 
 import gin
 import torch
@@ -105,12 +105,16 @@ class Prior(nn.Module):
                cond: torch.Tensor,
                target_len: int,
                steps: int = 20,
-               temperature: float = 1.0):
-        z = self.sos_token.sos.repeat(cond.shape[0], 1)
-        x = self.sample_token(z, cond, steps, temperature).unsqueeze(-1)
-        for _ in range(target_len - 1):
+               temperature: float = 1.0,
+               initial: Optional[torch.Tensor] = None):
+        if initial is None:
+            z = self.sos_token.sos.repeat(cond.shape[0], 1)
+            x = self.sample_token(z, cond, steps, temperature).unsqueeze(-1)
+        else:
+            x = initial.clone()
+
+        while x.shape[-1] < target_len:
             z = self.net(x, cond=cond)[..., -1]
             x_next = self.sample_token(z, cond, steps, temperature)
             x = torch.cat((x, x_next.unsqueeze(-1)), dim=-1)
-        return x
-
+        return x[..., :target_len]

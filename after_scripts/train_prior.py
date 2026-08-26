@@ -4,6 +4,7 @@ import pathlib
 
 import gin
 import numpy as np
+import torch
 from absl import app, flags
 from torch.utils.data import DataLoader
 
@@ -24,6 +25,8 @@ flags.DEFINE_integer("batch_size", 64, "Batch size.")
 flags.DEFINE_integer("n_signal", 64, "Number of target latent frames.")
 flags.DEFINE_integer("n_condition", 64,
                      "Number of conditioning latent frames.")
+flags.DEFINE_string("emb_model_path", None,
+                    "Codec used to define the latent space and validation audio.")
 flags.DEFINE_bool("conditioned", True,
                   "Train with the global timbre conditioner.")
 flags.DEFINE_multi_string("db_path", [], "LMDB dataset path(s).")
@@ -85,6 +88,18 @@ def get_latent_channels(path):
     return np.asarray(item["z"]).shape[0]
 
 
+def get_codec_info(path):
+    codec = torch.jit.load(path, map_location="cpu").eval()
+    try:
+        audio_channels = codec.model.audio_channels
+    except Exception:
+        audio_channels = 1
+    dummy = torch.zeros(1, audio_channels, 16384)
+    with torch.no_grad():
+        latent = codec.encode(dummy)
+    return latent.shape[1], dummy.shape[-1] // latent.shape[-1]
+
+
 def make_dataset(paths, keys, split, filter_values):
     path_dict = {path: {"path": path, "name": path} for path in paths}
     return CombinedDataset(path_dict=path_dict,
@@ -101,15 +116,29 @@ def main(argv):
     model_dir = os.path.join(FLAGS.out_path, FLAGS.name)
 
     if FLAGS.restart is None:
+        if FLAGS.emb_model_path is None:
+            raise ValueError("--emb_model_path is required for prior training.")
+        latent_size, ae_ratio = get_codec_info(FLAGS.emb_model_path)
+        print("Codec latent size:", latent_size,
+              "- compression ratio:", ae_ratio)
+        dataset_latent_size = get_latent_channels(paths[0])
+        if latent_size != dataset_latent_size:
+            raise ValueError(
+                "Codec and dataset latent sizes differ: "
+                f"codec={latent_size}, dataset={dataset_latent_size}.")
+
         gin.parse_config_files_and_bindings(
             map(add_gin_extension, FLAGS.config), [])
         conditioned = FLAGS.conditioned and gin.query_parameter(
             "%ZS_CHANNELS") > 0
         condition_keys = (get_condition_keys(paths[0]) if conditioned else [])
         with gin.unlock_config():
-            gin.bind_parameter("%IN_SIZE", get_latent_channels(paths[0]))
+            gin.bind_parameter("%IN_SIZE", latent_size)
+            gin.bind_parameter("%AE_RATIO", ae_ratio)
             gin.bind_parameter("%N_SIGNAL", FLAGS.n_signal)
             gin.bind_parameter("%N_CONDITION", FLAGS.n_condition)
+            gin.bind_parameter("prior.trainer.Trainer.emb_model_path",
+                               FLAGS.emb_model_path)
             if not conditioned:
                 gin.bind_parameter("%ZS_CHANNELS", 0)
                 gin.bind_parameter("prior.model.Prior.conditioner", None)
@@ -117,6 +146,10 @@ def main(argv):
                                condition_keys)
     else:
         gin.parse_config_file(os.path.join(model_dir, "config.gin"))
+        if FLAGS.emb_model_path is not None:
+            with gin.unlock_config():
+                gin.bind_parameter("prior.trainer.Trainer.emb_model_path",
+                                   FLAGS.emb_model_path)
         conditioned = gin.query_parameter("%ZS_CHANNELS") > 0
         condition_keys = list(
             gin.query_parameter("prior.data.collate_fn.condition_keys"))

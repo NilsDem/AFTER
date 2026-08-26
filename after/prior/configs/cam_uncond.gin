@@ -4,6 +4,7 @@ import after
 from after import prior
 
 IN_SIZE = None
+AE_RATIO = None
 N_SIGNAL = None
 N_CONDITION = None
 ZS_CHANNELS = 0
@@ -53,6 +54,9 @@ prior.model.Prior:
 
 prior.trainer.Trainer:
     model = @prior.model.Prior()
+    emb_model_path = None
+    ae_ratio = %AE_RATIO
+    sr = %SR
     max_steps = 1000000
     lr = 1e-4
     regularization_weight = 0.
@@ -61,3 +65,5 @@ prior.trainer.Trainer:
     steps_display = 100
     steps_valid = 5000
     steps_save = 50000
+    validation_samples = 4
+    validation_sampling_steps = 10

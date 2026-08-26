@@ -227,6 +227,7 @@ detected timbre augmentation) as global conditioning.
 after train_prior \
   --name prior_model_name \
   --db_path /dataset/path_latent \
+  --emb_model_path AE_model_run/export.ts \
   --config cam
 ```
 
@@ -234,17 +235,21 @@ Resume and export use the same run folder conventions as the other models:
 
 ```bash
 after train_prior --name prior_model_name --db_path /dataset/path_latent --restart 50000
-after export_prior \
-  --model_path prior_runs/prior_model_name \
-  --emb_model_path AE_model_run/export_stream.ts
+after export_prior --model_path prior_runs/prior_model_name
 ```
 
 Use `--config cam_uncond` (or `--noconditioned` with the regular CAM config) to
-train an unconditional prior. The exported
-`nn_tilde.Module` provides `diffuse`, `decode`, and `generate`, with a rolling
-CAM attention cache. A conditioned prior takes `ZS_CHANNELS` timbre-control
-signals; an unconditional prior takes one trigger signal whose value is
-ignored.
+train an unconditional prior. The codec is used only during training to infer
+the latent size/compression ratio and to log prior/continuation validation
+audio. The exported `nn_tilde.Module` outputs latent codes directly and keeps a
+rolling CAM attention cache. `forward` runs the prior alone and takes only the
+`ZS_CHANNELS` timbre controls (or one ignored trigger channel for an
+unconditional prior). `forward_listen` takes `IN_SIZE` listening-latent channels
+followed by the timbre controls. Its `interpolation` attribute moves from the
+autonomous prior (`0`) to the listened stream (`1`). `interpolation_type=0`
+interpolates the two flow predictions, while `interpolation_type=1` interpolates
+their CAM codes. Both methods support parallel batches up to the export-time
+`--max_batch_size`.
 
 <!-- 
 Key global parameters (overridable via gin bindings):
