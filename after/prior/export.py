@@ -6,22 +6,18 @@ class PriorStreamer(nn_tilde.Module):
 
     def __init__(self,
                  model,
-                 codec,
                  latent_channels: int,
                  cond_channels: int,
                  ae_ratio: int,
                  audio_channels: int,
-                 sr: int,
                  chunk_size: int = 1):
         super().__init__()
         self.net = model.net
         self.predictor = model.predictor
-        self.codec = codec
         self.latent_channels = latent_channels
         self.cond_channels = cond_channels
         self.ae_ratio = ae_ratio
         self.audio_channels = audio_channels
-        self.sr = sr
         self.chunk_size = chunk_size
 
         self.register_attribute("nb_steps", 10)
@@ -40,38 +36,15 @@ class PriorStreamer(nn_tilde.Module):
         latent_labels = [
             f"(signal) Codec latent {i}" for i in range(latent_channels)
         ]
-        audio_labels = [
-            f"(signal) Audio output {i}" for i in range(audio_channels)
-        ]
 
         self.register_method(
-            "diffuse",
+            "forward",
             in_channels=prior_channels,
             in_ratio=1,
             out_channels=latent_channels,
             out_ratio=ae_ratio,
             input_labels=prior_labels,
             output_labels=latent_labels,
-            test_buffer_size=chunk_size * ae_ratio,
-        )
-        self.register_method(
-            "decode",
-            in_channels=latent_channels,
-            in_ratio=ae_ratio,
-            out_channels=audio_channels,
-            out_ratio=1,
-            input_labels=latent_labels,
-            output_labels=audio_labels,
-            test_buffer_size=chunk_size * ae_ratio,
-        )
-        self.register_method(
-            "generate",
-            in_channels=prior_channels,
-            in_ratio=1,
-            out_channels=audio_channels,
-            out_ratio=1,
-            input_labels=prior_labels,
-            output_labels=audio_labels,
             test_buffer_size=chunk_size * ae_ratio,
         )
 
@@ -131,14 +104,3 @@ class PriorStreamer(nn_tilde.Module):
         if batch_size > 1:
             latents = latents.repeat(batch_size, 1, 1)
         return latents
-
-    @torch.jit.export
-    def decode(self, x: torch.Tensor) -> torch.Tensor:
-        return self.codec.decode(x)
-
-    @torch.jit.export
-    def generate(self, x: torch.Tensor) -> torch.Tensor:
-        return self.decode(self.diffuse(x))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.generate(x)

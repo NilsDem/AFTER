@@ -94,7 +94,6 @@ def main(argv):
         cond_channels=gin.query_parameter("%ZS_CHANNELS"),
         ae_ratio=ae_ratio,
         audio_channels=audio_channels,
-        sr=gin.query_parameter("%SR"),
         chunk_size=FLAGS.chunk_size,
     ).eval()
 
