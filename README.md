@@ -96,6 +96,7 @@ after prepare_dataset \
 | `--exclude` | `[]` | Filename substrings to exclude (repeatable) |
 | `--include` | `None` | Filename substrings to include — any match (repeatable) |
 | `--num_signal` | `524288` | Samples per chunk (~12 s at 44100 Hz) |
+| `--chunk_overlap_pct` | `0.2` | Fraction of adjacent chunk edges that overlap (20% by default) |
 | `--sample_rate` | `44100` | Target sample rate |
 | `--normalize` | `True` | Peak-normalize each file |
 | `--save_waveform` | `False` | Store raw waveform in the database |

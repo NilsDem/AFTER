@@ -48,6 +48,13 @@ flags.DEFINE_string('pad_mode', 'pad',
 # --- Audio ---
 flags.DEFINE_integer('num_signal', 524288,
                      'Samples per chunk (default is~12 s at 44100)')
+flags.DEFINE_float(
+    'chunk_overlap_pct', 0.2,
+    'Fraction of each chunk overlapped by the next chunk (must be in [0, 1))')
+flags.register_validator(
+    'chunk_overlap_pct',
+    lambda value: 0 <= value < 1,
+    message='--chunk_overlap_pct must be in [0, 1)')
 flags.DEFINE_integer('sample_rate', 44100, 'Sample rate')
 flags.DEFINE_bool('normalize', True, 'Peak-normalize each file')
 flags.DEFINE_bool('cut_silences', False, 'Skip silent chunks')
@@ -143,9 +150,35 @@ def pad_or_tile(audio, num_signal, pad_mode):
     return audio[:, :total]
 
 
-def get_midi_chunk(midi_data, chunk_idx, num_signal, sr):
+def get_chunk_starts(num_samples, num_signal, overlap_pct):
+    """Return sample offsets for fixed-size chunks with overlap.
+
+    The final chunk is aligned with the end of the audio when the regular hop
+    does not land there, ensuring the tail is not discarded. Consequently,
+    the last pair of chunks can overlap by more than ``overlap_pct``.
+    """
+    if num_signal <= 0:
+        raise ValueError(f"num_signal must be positive, got {num_signal}")
+    if not 0 <= overlap_pct < 1:
+        raise ValueError(
+            f"chunk_overlap_pct must be in [0, 1), got {overlap_pct}")
+    if num_samples < num_signal:
+        raise ValueError(
+            f"Audio has {num_samples} samples, fewer than chunk size {num_signal}"
+        )
+
+    overlap_samples = int(round(num_signal * overlap_pct))
+    hop_length = max(1, num_signal - overlap_samples)
+    final_start = num_samples - num_signal
+    starts = list(range(0, final_start + 1, hop_length))
+    if starts[-1] != final_start:
+        starts.append(final_start)
+    return starts
+
+
+def get_midi_chunk(midi_data, start_sample, num_signal, sr):
     length = num_signal / sr
-    tstart = chunk_idx * length
+    tstart = start_sample / sr
     tend = tstart + length
     # Avoid deepcopying the full PrettyMIDI object. Loaded PrettyMIDI instances
     # cache a private full-file tick-to-time array, which can add >1 MB to every
@@ -400,8 +433,8 @@ def process_db(input_path, output_path, device, emb_model, z_length,
                 audio = normalize_signal(audio)
 
             audio = pad_or_tile(audio, FLAGS.num_signal, FLAGS.pad_mode)
-            chunks = audio.reshape(audio.shape[0], -1,
-                                   FLAGS.num_signal).transpose(1, 0, 2)
+            chunk_starts = get_chunk_starts(audio.shape[-1], FLAGS.num_signal,
+                                            FLAGS.chunk_overlap_pct)
 
             # --- Full-file feature extraction (only when embedding model is present) ---
             full_midi = None
@@ -419,20 +452,22 @@ def process_db(input_path, output_path, device, emb_model, z_length,
                     except Exception as e:
                         print(f"BasicPitch error ({file}): {e}")
 
-            total_chunks = len(chunks)
-            for chunk_idx, chunk in enumerate(chunks):
+            total_chunks = len(chunk_starts)
+            for chunk_idx, chunk_start in enumerate(chunk_starts):
+                chunk = audio[:, chunk_start:chunk_start + FLAGS.num_signal]
                 if FLAGS.cut_silences and np.max(np.abs(chunk)) < 0.05:
                     continue
 
                 midi = None
                 if full_midi is not None:
-                    midi = get_midi_chunk(full_midi, chunk_idx,
+                    midi = get_midi_chunk(full_midi, chunk_start,
                                           FLAGS.num_signal, FLAGS.sample_rate)
 
                 base_entry = {
                     "chunk": chunk,
                     "metadata": {
                         "chunk_index": chunk_idx,
+                        "chunk_start_sample": chunk_start,
                         "path": str(file)
                     },
                     "midi": midi,
