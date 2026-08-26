@@ -108,6 +108,10 @@ class Trainer(nn.Module):
         self.use_amp = use_amp and self.device_type == "cuda"
         self.fused_optimizer = self.device_type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        self.weight_waveform_losses = 1.
+        self.weight_regularisation_loss = 1.
+        self.regularisation_weights = None
+        self.warmup_regularisation_loss = 100000
 
         self.init_opt()
 
@@ -158,7 +162,13 @@ class Trainer(nn.Module):
                      y,
                      x_multiband=None,
                      y_multiband=None,
-                     regloss=None):
+                     regloss=None,
+                     regularisations=None):
+
+        if regularisations is not None and regloss is not None:
+            raise ValueError("Pass either regloss or regularisations, not both")
+        if regularisations is None:
+            regularisations = regloss
 
         total_loss = 0.
 
@@ -169,12 +179,35 @@ class Trainer(nn.Module):
             total_loss += loss_value * dist.scale
 
         total_loss = total_loss * self.weight_waveform_losses
-        if regloss is not None:
-            if regloss.ndim > 0:
-                regloss = regloss.mean()
-            cur_weight = min(self.step / self.warmup_regularisation_loss,
-                             1.) * self.weight_regularisation_loss
-            total_loss += cur_weight * regloss
+        if regularisations is not None:
+            warmup = (1. if self.warmup_regularisation_loss <= 0 else min(
+                self.step / self.warmup_regularisation_loss, 1.))
+            if isinstance(regularisations, dict):
+                for name, regularisation in regularisations.items():
+                    if regularisation.ndim > 0:
+                        regularisation = regularisation.mean()
+                    if self.regularisation_weights is None:
+                        weight = self.weight_regularisation_loss
+                        if name == "fast_kl":
+                            weight *= getattr(self.model, "regloss_ratio", 1.)
+                    else:
+                        if name not in self.regularisation_weights:
+                            raise KeyError(
+                                f"No weight configured for regularisation "
+                                f"{name!r}")
+                        weight = self.regularisation_weights[name]
+                    weighted = warmup * weight * regularisation
+                    total_loss += weighted
+                    losses[f"regularisation_{name}"] = regularisation.detach()
+                    losses[f"weighted_regularisation_{name}"] = weighted.detach()
+            else:
+                regularisation = regularisations
+                if regularisation.ndim > 0:
+                    regularisation = regularisation.mean()
+                weighted = (warmup * self.weight_regularisation_loss *
+                            regularisation)
+                total_loss += weighted
+                losses["regularisation_loss"] = regularisation.detach()
 
         if x_multiband is not None and y_multiband is not None:
             for dist in self.multiband_distances:
@@ -186,9 +219,6 @@ class Trainer(nn.Module):
             losses["total_loss"] = total_loss.detach()
         else:
             losses["total_loss"] = float(total_loss)
-        if regloss is not None:
-            losses["regularisation_loss"] = regloss.detach()
-
         return total_loss, losses
 
     def get_losses_names(self):
@@ -198,6 +228,12 @@ class Trainer(nn.Module):
             names.append(loss.name + "_regul")
         names.extend(["total_loss"])
         names.extend(["regularisation_loss"])
+        regularisation_names = ["fast_kl", "slow_kl"]
+        if getattr(self.model, "predictive_fast_codes", False):
+            regularisation_names.append("prediction")
+        for name in regularisation_names:
+            names.append(f"regularisation_{name}")
+            names.append(f"weighted_regularisation_{name}")
 
         if True:  #self.model.pqmf_bands > 1:
             for loss in self.multiband_distances:
@@ -299,7 +335,7 @@ class Trainer(nn.Module):
     def discrim_forward(self, x):
 
         with torch.no_grad():
-            y, y_multiband, z, regloss, x_multiband = self._model_forward(
+            y, y_multiband, z, regularisations, x_multiband = self._model_forward(
                 x,
                 return_all=True,
                 freeze_encoder=self.step > self.freeze_encoder_step,
@@ -321,7 +357,7 @@ class Trainer(nn.Module):
         if hasattr(self.model, "drop_fast_probability"):
             forward_kwargs["apply_branch_dropout"] = apply_branch_dropout
 
-        y, y_multiband, z, regloss, x_multiband = self._model_forward(
+        y, y_multiband, z, regularisations, x_multiband = self._model_forward(
             x,
             use_wrapped=use_wrapped,
             **forward_kwargs)
@@ -331,7 +367,7 @@ class Trainer(nn.Module):
                                                   y,
                                                   x_multiband=None,
                                                   y_multiband=None,
-                                                  regloss=regloss)
+                                                  regularisations=regularisations)
         else:
             ae_ratio = y.shape[-1] // z.shape[-1]
             loss_ae, loss_out = self.compute_loss(
@@ -341,7 +377,7 @@ class Trainer(nn.Module):
                   ae_ratio:-self.look_ahead_steps * ae_ratio],
                 x_multiband=None,
                 y_multiband=None,
-                regloss=regloss)
+                regularisations=regularisations)
 
         if self.warmup and self.discriminator is not None:
             # Generator updates need gradients through the discriminator input,
@@ -456,6 +492,7 @@ class Trainer(nn.Module):
             steps_valid=5000,
             rec_loss_decay=0.999996,
             weight_regularisation_loss=1.,
+            regularisation_weights=None,
             warmup_regularisation_loss=100000,
             look_ahead_steps=0):
 
@@ -472,6 +509,7 @@ class Trainer(nn.Module):
         all_losses_sum = {}
         all_losses_count = {}
         self.weight_regularisation_loss = weight_regularisation_loss
+        self.regularisation_weights = regularisation_weights
         self.warmup_regularisation_loss = warmup_regularisation_loss
         self.warmup = self.step > self.warmup_steps
         self.update_waveform_losses(rec_loss_decay)

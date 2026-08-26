@@ -64,14 +64,23 @@ class DoubleAE_Spectral(nn_tilde.Module):
 
     def __init__(self, ckpt: str, methods=None) -> None:
         super().__init__()
-        if methods is None:
-            methods = ("encode_fast", "encode_slow", "decode", "forward")
 
         model = DoubleAE()
         d = torch.load(ckpt, map_location="cpu")
         state_dict = d.get("model_state", d)
         model.load_state_dict(state_dict, strict=False)
         self.model = model.eval()
+        self.predictive_fast_codes = model.predictive_fast_codes
+        if methods is None:
+            # A predictive fast code requires synchronized slow information;
+            # it cannot be produced by the legacy fast-only export method.
+            methods = (("forward",) if self.predictive_fast_codes else
+                       ("encode_fast", "encode_slow", "decode", "forward"))
+        if self.predictive_fast_codes and "encode_fast" in methods:
+            raise ValueError(
+                "Predictive DoubleAE fast codes require slow codes. Export "
+                "the synchronized combined forward method instead of the "
+                "legacy fast-only encoder.")
 
         self.audio_channels = model.fast_encoder.audio_channels
         self.fast_size = model.fast_encoder.bottleneck_size
@@ -81,9 +90,20 @@ class DoubleAE_Spectral(nn_tilde.Module):
         self.slow_hop = model.slow_encoder.time_transform.hop_size
         self.fast_ratio = self._audio_to_code_ratio(model.fast_encoder)
         self.slow_ratio = self._audio_to_code_ratio(model.slow_encoder)
+        if self.slow_ratio % self.fast_ratio != 0:
+            raise ValueError("Slow and fast codec rates must have an integer ratio")
+        self.slow_to_fast_ratio = self.slow_ratio // self.fast_ratio
+        self.slow_shift_steps = model.slow_shift_steps
+        fast_transform_delay = (model.fast_encoder.time_transform.nfft // 2 -
+                                model.fast_encoder.time_transform.hop_size)
+        slow_transform_delay = (model.slow_encoder.time_transform.nfft // 2 -
+                                model.slow_encoder.time_transform.hop_size)
+        self.slow_fast_delay = ((fast_transform_delay - slow_transform_delay)
+                                // self.fast_ratio)
 
         self.register_buffer("slow_memory",
-                             torch.zeros(8, self.slow_size, 1))
+                             torch.zeros(8, self.slow_size,
+                                         max(self.slow_shift_steps, 1)))
 
         in_labels = [
             f"(signal) Input {i + 1}" for i in range(self.audio_channels)
@@ -181,37 +201,51 @@ class DoubleAE_Spectral(nn_tilde.Module):
 
     def _shift_slow_to_checkpoint_layout(self,
                                          z_slow: torch.Tensor) -> torch.Tensor:
-        shift = 1
+        shift = self.slow_shift_steps
         if shift <= 0:
             return z_slow
-        if shift == z_slow.shape[-1]:
-            temp_last = z_slow.clone()
-            z_slow = self.slow_memory[:z_slow.shape[0]].clone()
-            self.slow_memory[:z_slow.shape[0]] = temp_last.clone()
-            return z_slow
-        
-        temp_last = z_slow[...,-shift:].clone()
-        z_slow =  torch.cat((self.slow_memory[:z_slow.shape[0]].clone(), z_slow[..., :-shift]), dim=-1)
-        
-        self.slow_memory[:z_slow.shape[0]] = temp_last.clone()
-        
-        return z_slow
+        history = torch.cat(
+            (self.slow_memory[:z_slow.shape[0]].clone(), z_slow), dim=-1)
+        shifted = history[..., :z_slow.shape[-1]]
+        self.slow_memory[:z_slow.shape[0]].copy_(history[..., -shift:])
+        return shifted
+
+    def _predictive_decoder_features(
+            self, z_fast_residual: torch.Tensor,
+            z_slow_past: torch.Tensor) -> torch.Tensor:
+        prediction = self.model.predictor(z_slow_past)
+        prediction = prediction[..., :z_fast_residual.shape[-1]]
+        z_fast = self.model.synthesizer(z_fast_residual, prediction)
+        return self.model.decoder._decode_features(z_fast)
 
     @torch.jit.export
     def encode_from_transforms(self, fast_multiband: torch.Tensor,
                                slow_multiband: torch.Tensor) -> torch.Tensor:
         z_fast = self.encode_fast_from_transform(fast_multiband)
         z_slow = self.encode_slow_from_transform(slow_multiband)
+        if self.predictive_fast_codes:
+            z_slow_past = self._shift_slow_to_checkpoint_layout(z_slow)
+            prediction = self.model.predictor(z_slow_past)
+            prediction = prediction[..., :z_fast.shape[-1]]
+            z_fast = self.model.residual_extractor(z_fast, prediction)
+            z_slow = self._repeat_slow_to_fast(z_slow, z_fast.shape[-1])
+            return torch.cat((z_fast, z_slow), dim=1)
         z_slow = self._shift_slow_to_checkpoint_layout(z_slow)
         z_slow = self._repeat_slow_to_fast(z_slow, z_fast.shape[-1])
         return torch.cat((z_fast, z_slow), dim=1)
 
     @torch.jit.export
     def decode_to_transform(self, z: torch.Tensor) -> torch.Tensor:
+        if self.predictive_fast_codes:
+            z_fast = z[:, :self.fast_size]
+            z_slow = z[:, self.fast_size:]
+            z_slow = z_slow[..., ::self.slow_to_fast_ratio]
+            z_slow = self._shift_slow_to_checkpoint_layout(z_slow)
+            return self._predictive_decoder_features(z_fast, z_slow)
         return self.model.decoder._decode_features(z)
 
     def _decode_combined(self, z: torch.Tensor) -> torch.Tensor:
-        h = self.model.decoder._decode_features(z)
+        h = self.decode_to_transform(z)
         y = self.model.decoder.time_transform.inverse_stream(h)
         return self.model.decoder.unpack_audio(y)
 
@@ -223,7 +257,17 @@ class DoubleAE_Spectral(nn_tilde.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         z_fast = self.encode_fast(x)
         z_slow = self.encode_slow(x)
-        
+
+        if self.predictive_fast_codes:
+            z_slow_past = self._shift_slow_to_checkpoint_layout(z_slow)
+            prediction = self.model.predictor(z_slow_past)
+            prediction = prediction[..., :z_fast.shape[-1]]
+            z_fast_residual = self.model.residual_extractor(z_fast, prediction)
+            h = self._predictive_decoder_features(z_fast_residual,
+                                                  z_slow_past)
+            y = self.model.decoder.time_transform.inverse_stream(h)
+            return self.model.decoder.unpack_audio(y)
+
         z_slow = self._shift_slow_to_checkpoint_layout(z_slow)
         z_slow = self._repeat_slow_to_fast(z_slow, z_fast.shape[-1])
         
@@ -242,6 +286,11 @@ class DoubleAE_Fast(nn_tilde.Module):
         state_dict = d.get("model_state", d)
         model.load_state_dict(state_dict, strict=False)
         model.eval()
+        if model.predictive_fast_codes:
+            raise ValueError(
+                "A predictive DoubleAE cannot be split into an independent "
+                "fast encoder: residual extraction also requires the slow "
+                "code. Use the combined synchronized export.")
 
         self.fast_encoder = model.fast_encoder
         self.decoder = model.decoder

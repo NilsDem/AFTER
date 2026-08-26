@@ -124,13 +124,19 @@ class Encoder2D(nn.Module):
             z, regloss, mean = out
             return z, _regloss_like(regloss, z), mean
         z, regloss = out
+        if return_mean:
+            return z, _regloss_like(regloss, z), z
         return z, _regloss_like(regloss, z)
 
-    def _encode_with_multi(self, x):
+    def _encode_with_multi(self, x, return_mean: bool = False):
         x = self.pack_audio(x)
         x_multiband = self.time_transform(x)
         h = self._encode_features(x_multiband.clone())
-        z, regloss = self._apply_bottleneck(h)
+        out = self._apply_bottleneck(h, return_mean=return_mean)
+        if return_mean:
+            z, regloss, mean = out
+            return z, regloss, x_multiband, mean
+        z, regloss = out
         return z, regloss, x_multiband
 
     @torch.jit.ignore
@@ -444,6 +450,105 @@ class SlowMapDecoder(nn.Module):
 
 
 @gin.configurable
+class SlowToFastPredictor(nn.Module):
+    """Causal cached-convolution predictor from slow to fast latent rate."""
+
+    def __init__(self,
+                 slow_channels: int,
+                 fast_channels: int,
+                 hidden_channels: int = 32,
+                 upsample_ratios=None,
+                 kernel_size: int = 3):
+        super().__init__()
+        if upsample_ratios is None:
+            upsample_ratios = [2, 2, 2, 2, 2]
+        if not upsample_ratios or any(ratio < 1
+                                     for ratio in upsample_ratios):
+            raise ValueError("upsample_ratios must contain positive integers")
+
+        layers = []
+        cumulative_delay = 0
+        projection = cc.Conv1d(
+            slow_channels,
+            hidden_channels,
+            kernel_size=kernel_size,
+            padding=cc.get_padding(kernel_size, mode="causal"),
+            cumulative_delay=cumulative_delay)
+        layers.extend((projection, nn.PReLU(hidden_channels)))
+        cumulative_delay = projection.cumulative_delay
+
+        for ratio in upsample_ratios:
+            # kernel_size = ratio + 2 * padding gives exactly ratio-times
+            # temporal expansion in both cached and non-cached modes.
+            padding = ratio // 2
+            upsample = cc.ConvTranspose1d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=ratio + 2 * padding,
+                stride=ratio,
+                padding=padding,
+                cumulative_delay=cumulative_delay)
+            layers.extend((upsample, nn.PReLU(hidden_channels)))
+            cumulative_delay = upsample.cumulative_delay
+
+        output = cc.Conv1d(hidden_channels,
+                           fast_channels,
+                           kernel_size=1,
+                           padding=cc.get_padding(1),
+                           cumulative_delay=cumulative_delay)
+        layers.append(output)
+        self.net = cc.CachedSequential(*layers)
+        self.upsample_ratio = math.prod(upsample_ratios)
+        self.cumulative_delay = output.cumulative_delay
+
+    def forward(self, z_slow):
+        return self.net(z_slow)
+
+
+class _FastPredictionMixer(nn.Module):
+    """Trainable 1x1 mixing of a fast latent and its prediction."""
+
+    def __init__(self, fast_channels: int, prediction_sign: float):
+        super().__init__()
+        self.fast_channels = fast_channels
+        self.projection = cc.Conv1d(2 * fast_channels,
+                                    fast_channels,
+                                    kernel_size=1,
+                                    padding=cc.get_padding(1))
+        with torch.no_grad():
+            self.projection.weight.zero_()
+            identity = torch.eye(fast_channels,
+                                 device=self.projection.weight.device,
+                                 dtype=self.projection.weight.dtype)
+            self.projection.weight[:, :fast_channels, 0].copy_(identity)
+            self.projection.weight[:, fast_channels:, 0].copy_(
+                prediction_sign * identity)
+            if self.projection.bias is not None:
+                self.projection.bias.zero_()
+
+    def forward(self, fast, prediction):
+        if fast.shape != prediction.shape:
+            raise ValueError("Fast latent and prediction shapes must match")
+        return self.projection(torch.cat((fast, prediction), dim=1))
+
+
+@gin.configurable
+class FastResidualExtractor(_FastPredictionMixer):
+    """Extract a learned residual, initialized as ``fast - prediction``."""
+
+    def __init__(self, fast_channels: int):
+        super().__init__(fast_channels, prediction_sign=-1.)
+
+
+@gin.configurable
+class FastLatentSynthesizer(_FastPredictionMixer):
+    """Synthesize a fast latent, initialized as ``residual + prediction``."""
+
+    def __init__(self, fast_channels: int):
+        super().__init__(fast_channels, prediction_sign=1.)
+
+
+@gin.configurable
 class DoubleAE(nn.Module):
     """Autoencoder with fast and slow encoders feeding one decoder."""
 
@@ -452,6 +557,9 @@ class DoubleAE(nn.Module):
                  slow_encoder: nn.Module,
                  decoder: nn.Module,
                  slow_decoder: nn.Module = None,
+                 predictor: nn.Module = None,
+                 residual_extractor: nn.Module = None,
+                 synthesizer: nn.Module = None,
                  slow_shift_steps: int = 1,
                  regularisation_ratio: float = 1.,
                  freeze_mode: str = "both",
@@ -463,6 +571,15 @@ class DoubleAE(nn.Module):
         self.slow_encoder = slow_encoder
         self.decoder = decoder
         self.slow_decoder = slow_decoder
+        predictive_modules = (predictor, residual_extractor, synthesizer)
+        if any(module is not None for module in predictive_modules) and not all(
+                module is not None for module in predictive_modules):
+            raise ValueError("predictor, residual_extractor and synthesizer "
+                             "must be configured together")
+        self.predictor = predictor
+        self.residual_extractor = residual_extractor
+        self.synthesizer = synthesizer
+        self.predictive_fast_codes = predictor is not None
         self.slow_shift_steps = slow_shift_steps
         
         self.regloss_ratio = regularisation_ratio
@@ -484,16 +601,29 @@ class DoubleAE(nn.Module):
         z_slow = z_slow.repeat_interleave(repeat, dim=-1)
         return z_slow[..., :fast_steps]
 
-    def _decode_slow_map(self, z_slow, fast_steps: int):
+    def _decode_slow_map_from_past(self, z_slow_past, fast_steps: int):
         if self.slow_decoder is None:
             raise ValueError("No slow map decoder is configured")
-        z_slow = self._shift_slow_to_past(z_slow)
-        slow_map = self.slow_decoder(z_slow)
+        slow_map = self.slow_decoder(z_slow_past)
         if slow_map.shape[-1] < fast_steps:
             raise ValueError(
                 "Slow decoder map is shorter than the fast code: "
                 f"{slow_map.shape[-1]} < {fast_steps}")
         return slow_map[..., :fast_steps]
+
+    def _decode_slow_map(self, z_slow, fast_steps: int):
+        return self._decode_slow_map_from_past(
+            self._shift_slow_to_past(z_slow), fast_steps)
+
+    def _predict_from_past(self, z_slow_past, fast_steps: int):
+        if self.predictor is None:
+            raise ValueError("No slow-to-fast predictor is configured")
+        prediction = self.predictor(z_slow_past)
+        if prediction.shape[-1] < fast_steps:
+            raise ValueError(
+                "Fast prediction is shorter than the fast code: "
+                f"{prediction.shape[-1]} < {fast_steps}")
+        return prediction[..., :fast_steps]
 
     def _combine_latents(self, z_fast, z_slow):
         z_slow = self._shift_slow_to_past(z_slow)
@@ -502,8 +632,8 @@ class DoubleAE(nn.Module):
 
     @torch.jit.ignore
     def combine_codes(self, z_fast, z_slow):
-        """Pack raw fast and slow codes for the configured decoder layout."""
-        if self.slow_decoder is not None:
+        """Pack fast (residual when predictive) and raw slow codec codes."""
+        if self.slow_decoder is not None or self.predictive_fast_codes:
             return z_fast, z_slow
         return self._combine_latents(z_fast, z_slow)
 
@@ -516,36 +646,55 @@ class DoubleAE(nn.Module):
         return z[:, :fast_size], z[:, fast_size:]
 
     def _encode_branches(self, x, freeze_encoder: bool = False):
+        need_fast_mean = self.predictive_fast_codes
         if freeze_encoder and self.freeze_mode in ["both", "fast"]:
             with torch.no_grad():
-                z_fast, fast_regloss, fast_multiband = self.fast_encoder._encode_with_multi(
-                    x)
+                fast_out = self.fast_encoder._encode_with_multi(
+                    x, return_mean=need_fast_mean)
         else:
-             z_fast, fast_regloss, fast_multiband = self.fast_encoder._encode_with_multi(
-                    x)
+            fast_out = self.fast_encoder._encode_with_multi(
+                x, return_mean=need_fast_mean)
+
+        if need_fast_mean:
+            z_fast, fast_regloss, fast_multiband, fast_mean = fast_out
+        else:
+            z_fast, fast_regloss, fast_multiband = fast_out
+            fast_mean = None
              
         if freeze_encoder and self.freeze_mode in ["both", "slow"]:
-            with torch.no_grad():   
-                z_slow, slow_regloss, _ = self.slow_encoder._encode_with_multi(x)
+            with torch.no_grad():
+                z_slow, slow_regloss, slow_multiband = \
+                    self.slow_encoder._encode_with_multi(x)
         else:
-            z_slow, slow_regloss, _ = self.slow_encoder._encode_with_multi(x)
+            z_slow, slow_regloss, slow_multiband = \
+                self.slow_encoder._encode_with_multi(x)
 
-        fast_regloss *= self.regloss_ratio
-        regloss = fast_regloss + slow_regloss
-        return z_fast, z_slow, regloss, fast_multiband
+        regularisations = {
+            "fast_kl": fast_regloss,
+            "slow_kl": slow_regloss,
+        }
+        if self.predictive_fast_codes:
+            z_slow_past = self._shift_slow_to_past(z_slow)
+            prediction = self._predict_from_past(z_slow_past,
+                                                 z_fast.shape[-1])
+            regularisations["prediction"] = nn.functional.mse_loss(
+                prediction, fast_mean.detach())
+            z_fast = self.residual_extractor(z_fast, prediction)
+        return (z_fast, z_slow, regularisations, fast_multiband,
+                slow_multiband)
 
     def _encode_combined(self,
                          x,
                          with_multi: bool = False,
                          freeze_encoder: bool = False):
-        z_fast, z_slow, regloss, fast_multiband = self._encode_branches(
-            x, freeze_encoder=freeze_encoder)
+        (z_fast, z_slow, regularisations, fast_multiband,
+         _) = self._encode_branches(x, freeze_encoder=freeze_encoder)
         z = self.combine_codes(z_fast, z_slow)
 
         if with_multi:
-            return z, regloss, fast_multiband
+            return z, regularisations, fast_multiband
 
-        return z, regloss
+        return z, regularisations
 
     @torch.jit.ignore
     def encode_fast(self,
@@ -569,20 +718,18 @@ class DoubleAE(nn.Module):
 
     @torch.jit.ignore
     def encode_codes(self, x, with_multi: bool = False):
-        """Return raw fast and slow branch codes without concatenating them."""
-        z_fast, fast_regloss, fast_multiband = self.fast_encoder._encode_with_multi(
-            x)
-        z_slow, slow_regloss, slow_multiband = self.slow_encoder._encode_with_multi(
-            x)
-        regloss = fast_regloss + slow_regloss
+        """Return the serializable fast and slow codec codes."""
+        (z_fast, z_slow, regularisations, fast_multiband,
+         slow_multiband) = self._encode_branches(x)
 
         if with_multi:
-            return z_fast, z_slow, regloss, fast_multiband, slow_multiband
-        return z_fast, z_slow, regloss
+            return (z_fast, z_slow, regularisations, fast_multiband,
+                    slow_multiband)
+        return z_fast, z_slow, regularisations
 
     @torch.jit.ignore
     def decode_codes(self, z_fast, z_slow, with_multi: bool = False):
-        """Decode from raw fast and slow branch codes."""
+        """Decode using only serializable fast-residual and slow codes."""
         return self.decode((z_fast, z_slow), with_multi=with_multi)
 
     @torch.jit.ignore
@@ -592,10 +739,38 @@ class DoubleAE(nn.Module):
                 freeze_encoder: bool = False,
                 look_ahead_steps: int = 0,
                 apply_branch_dropout: bool = False):
-        z, regloss, x_multiband = self._encode_combined(
+        z, regularisations, x_multiband = self._encode_combined(
             x, with_multi=True, freeze_encoder=freeze_encoder)
 
-        if self.slow_decoder is not None:
+        if self.predictive_fast_codes:
+            z_fast, z_slow = z
+            fast_steps = z_fast.shape[-1]
+            z_slow_past = self._shift_slow_to_past(z_slow)
+            drop_fast_mask = None
+            if apply_branch_dropout and self.drop_fast_probability > 0.:
+                drop_fast_mask = torch.rand(x.shape[0], 1, 1,
+                                            device=x.device) < self.drop_fast_probability
+
+            if drop_fast_mask is not None:
+                z_fast = torch.where(drop_fast_mask,
+                                     torch.zeros_like(z_fast), z_fast)
+            prediction = self._predict_from_past(z_slow_past, fast_steps)
+            decoder_fast = self.synthesizer(z_fast, prediction)
+
+            if look_ahead_steps > 0:
+                decoder_fast = decoder_fast[..., look_ahead_steps:]
+                decoder_fast = torch.cat(
+                    (decoder_fast,
+                     torch.zeros_like(decoder_fast[..., :look_ahead_steps])),
+                    dim=-1)
+
+            # In predictive mode the slow code is used only to construct the
+            # prediction. The audio decoder sees only the synthesized fast
+            # latent: no slow map and no concatenated slow latent.
+            y, y_multiband = self.decoder.decode(decoder_fast,
+                                                  with_multi=True)
+            z = z_fast
+        elif self.slow_decoder is not None:
             z_fast, z_slow = z
             side = self._decode_slow_map(z_slow, z_fast.shape[-1])
             drop_fast_mask = None
@@ -615,10 +790,11 @@ class DoubleAE(nn.Module):
                     (side, torch.zeros_like(side[..., :look_ahead_steps])),
                     dim=-1)
 
-            y, y_multiband = self.decoder.decode(z_fast,
-                                                  with_multi=True,
-                                                  side=side,
-                                                  drop_fast_mask=drop_fast_mask)
+            y, y_multiband = self.decoder.decode(
+                z_fast,
+                with_multi=True,
+                side=side,
+                drop_fast_mask=drop_fast_mask)
             z = z_fast
         else:
             if look_ahead_steps > 0:
@@ -629,7 +805,7 @@ class DoubleAE(nn.Module):
             y, y_multiband = self.decoder.decode(z, with_multi=True)
 
         if return_all:
-            return y, y_multiband, z, regloss, x_multiband
+            return y, y_multiband, z, regularisations, x_multiband
         return y
 
     @torch.jit.ignore
@@ -646,7 +822,17 @@ class DoubleAE(nn.Module):
     def decode(self, z, with_multi: bool = False):
         if isinstance(z, (tuple, list)):
             z_fast, z_slow = z
-            side = self._decode_slow_map(z_slow, z_fast.shape[-1])
+            fast_steps = z_fast.shape[-1]
+            z_slow_past = self._shift_slow_to_past(z_slow)
+            if self.predictive_fast_codes:
+                prediction = self._predict_from_past(z_slow_past, fast_steps)
+                z_fast = self.synthesizer(z_fast, prediction)
+                return self.decoder.decode(z_fast, with_multi=with_multi)
+            if self.slow_decoder is None:
+                return self.decoder.decode(
+                    self._combine_latents(z_fast, z_slow),
+                    with_multi=with_multi)
+            side = self._decode_slow_map_from_past(z_slow_past, fast_steps)
             return self.decoder.decode(z_fast,
                                        with_multi=with_multi,
                                        side=side)

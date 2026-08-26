@@ -1,0 +1,174 @@
+from __gin__ import dynamic_registration
+
+import after
+from after import autoencoder
+from after.autoencoder.networks import DoubleNet
+from after.autoencoder.networks import bottlenecks
+from after.autoencoder.networks import discriminators
+from after.autoencoder import audio
+import cached_conv
+
+# Model
+SR = 44100
+AUDIO_CHANNELS = None
+FAST_LATENT_SIZE = 2
+SLOW_LATENT_SIZE = 32
+LATENT_SIZE = %FAST_LATENT_SIZE
+TIME_SIZE = 131072
+
+## TRAINING
+FREEZE_ENCODER_STEPS = %WARMUP_STEPS
+WARMUP_STEPS = 200000
+MAX_STEPS = 500000
+FAST_REGULARISATION_WEIGHT = 0.001
+SLOW_REGULARISATION_WEIGHT = 0.0001
+PREDICTION_WEIGHT = 0.0001
+REGULARISATION_WARMUP = 5000
+
+## FAST ENCODER
+FAST_CHANNELS = [16, 32, 32, 64]
+FAST_TIME_RATIOS = [1, 1, 1, 1]
+FAST_FREQ_RATIOS = [2, 2, 2, 2]
+FAST_NFFT = 512
+FAST_HOP = 64
+
+## SLOW ENCODER
+SLOW_CHANNELS = [32, 64, 64, 64, 128, 128, 128, 256]
+SLOW_TIME_RATIOS = [1, 2, 2, 1, 1, 1, 1, 1]
+SLOW_FREQ_RATIOS = [2, 2, 2, 2, 2, 2, 2, 2]
+SLOW_NFFT = 1024
+SLOW_HOP = 512
+
+DROP_FAST_PROBABILITY = 0.
+
+## SLOW-TO-FAST PREDICTOR
+PREDICTOR_CHANNELS = 32
+PREDICTOR_UPSAMPLE_RATIOS = [2, 2, 2, 2, 2]
+
+## FAST DECODER
+DECODER_CHANNELS = [16, 16, 16, 16, 16, 16]
+DECODER_TIME_RATIOS = [1, 1, 1, 1, 1, 1]
+DECODER_FREQ_RATIOS = [2, 2, 2, 2, 2, 4]
+KERNEL_SIZE = 3
+
+fast_transform/audio.CausalMauerSTFT:
+    nfft = %FAST_NFFT
+    hop_size = %FAST_HOP
+    synthesis_length = 128
+    zero_length = 64
+    skip_features = -1
+    normalize = True
+
+slow_transform/audio.CausalMauerSTFT:
+    nfft = %SLOW_NFFT
+    hop_size = %SLOW_HOP
+    synthesis_length = 128
+    zero_length = 64
+    skip_features = -1
+    normalize = True
+
+fast_encoder/DoubleNet.Encoder2D:
+    in_size = 2
+    bottleneck_size = %FAST_LATENT_SIZE
+    audio_channels = %AUDIO_CHANNELS
+    channels = %FAST_CHANNELS
+    time_ratios = %FAST_TIME_RATIOS
+    freq_ratios = %FAST_FREQ_RATIOS
+    freq_size = %FAST_NFFT
+    kernel_size = %KERNEL_SIZE
+    bottleneck = @fast_bottleneck/bottlenecks.VAEBottleneck()
+    time_transform = @fast_transform/audio.CausalMauerSTFT()
+    use_vae = True
+
+slow_encoder/DoubleNet.Encoder2D:
+    in_size = 2
+    bottleneck_size = %SLOW_LATENT_SIZE
+    audio_channels = %AUDIO_CHANNELS
+    channels = %SLOW_CHANNELS
+    time_ratios = %SLOW_TIME_RATIOS
+    freq_ratios = %SLOW_FREQ_RATIOS
+    freq_size = %SLOW_NFFT
+    kernel_size = %KERNEL_SIZE
+    bottleneck = @slow_bottleneck/bottlenecks.VAEBottleneck()
+    time_transform = @slow_transform/audio.CausalMauerSTFT()
+    use_vae = True
+
+predictor/DoubleNet.SlowToFastPredictor:
+    slow_channels = %SLOW_LATENT_SIZE
+    fast_channels = %FAST_LATENT_SIZE
+    hidden_channels = %PREDICTOR_CHANNELS
+    upsample_ratios = %PREDICTOR_UPSAMPLE_RATIOS
+    kernel_size = %KERNEL_SIZE
+
+residual_extractor/DoubleNet.FastResidualExtractor:
+    fast_channels = %FAST_LATENT_SIZE
+
+synthesizer/DoubleNet.FastLatentSynthesizer:
+    fast_channels = %FAST_LATENT_SIZE
+
+decoder/DoubleNet.Decoder2D:
+    in_size = 2
+    out_size = None
+    bottleneck_size = %LATENT_SIZE
+    audio_channels = %AUDIO_CHANNELS
+    channels = %DECODER_CHANNELS
+    time_ratios = %DECODER_TIME_RATIOS
+    freq_ratios = %DECODER_FREQ_RATIOS
+    freq_size = %FAST_NFFT
+    kernel_size = %KERNEL_SIZE
+    time_transform = @fast_transform/audio.CausalMauerSTFT()
+    side_channels = 0
+    fusion_after_layers = 0
+
+DoubleNet.DoubleAE:
+    fast_encoder = @fast_encoder/DoubleNet.Encoder2D()
+    slow_encoder = @slow_encoder/DoubleNet.Encoder2D()
+    decoder = @decoder/DoubleNet.Decoder2D()
+    predictor = @predictor/DoubleNet.SlowToFastPredictor()
+    residual_extractor = @residual_extractor/DoubleNet.FastResidualExtractor()
+    synthesizer = @synthesizer/DoubleNet.FastLatentSynthesizer()
+    slow_shift_steps = 2
+    freeze_mode = "fast"
+    drop_fast_probability = %DROP_FAST_PROBABILITY
+
+autoencoder.core.SpectralDistance:
+    scales = [64, 128, 256, 512, 1024, 2048]
+    sr = %SR
+    mel_bands = [64, 64, 64, 64, 64, 64, 64]
+
+discriminators.SpectroDiscriminator:
+    n_ffts = [128, 256, 512, 1024, 2048, 4096]
+    hop_lengths = [64, 128, 256, 512, 1024, 2048]
+    normalize_losses = True
+    capacity = 16
+    channels = [1, 2, 4, 4, 4, 8]
+    time_size = %TIME_SIZE
+    weights = {
+        "feature_matching": 100.0,
+        "adversarial": 1.0,
+    }
+
+autoencoder.trainer.Trainer:
+    model = @DoubleNet.DoubleAE()
+    discriminator = @discriminators.SpectroDiscriminator()
+    sr = %SR
+    max_steps = %MAX_STEPS
+    warmup_steps = %WARMUP_STEPS
+    freeze_encoder_step = %FREEZE_ENCODER_STEPS
+    waveform_losses = [(1.0, @autoencoder.core.SpectralDistance())]
+    multiband_distances = []
+    reg_losses = []
+    update_discriminator_every = 4
+
+autoencoder.trainer.Trainer.fit:
+    steps_display = 100
+    steps_valid = 5000
+    steps_save = 25000
+    rec_loss_decay = 1.0
+    regularisation_weights = {
+        "fast_kl": %FAST_REGULARISATION_WEIGHT,
+        "slow_kl": %SLOW_REGULARISATION_WEIGHT,
+        "prediction": %PREDICTION_WEIGHT,
+    }
+    warmup_regularisation_loss = %REGULARISATION_WARMUP
+    look_ahead_steps = 0
