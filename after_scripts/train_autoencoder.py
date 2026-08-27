@@ -124,8 +124,8 @@ def main(argv):
 
     if FLAGS.use_psts:
         transforms += [
-            PitchShift(min_semitones=-2, max_semitones=2, p=0.25),
-            TimeStretch(min_rate=0.85, max_rate=1.2, p=0.25),
+            PitchShift(min_semitones=-3, max_semitones=3, p=0.3),
+            TimeStretch(min_rate=0.8, max_rate=1.2, p=0.3),
         ]
 
     pipeline = TransformPipeline(transforms)
