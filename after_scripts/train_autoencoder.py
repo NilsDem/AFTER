@@ -128,6 +128,11 @@ def main(argv):
     if slow_decoder is not None:
         num_el = sum(p.numel() for p in slow_decoder.parameters())
         print("Number of parameters - Slow Decoder : ", num_el / 1e6, "M")
+        
+        
+    if trainer.model.predictor is not None:
+            num_el = sum(p.numel() for p in trainer.model.predictor.parameters())
+            print("Number of parameters - Predictor : ", num_el / 1e6, "M")
 
     ## TRANSFORMS
     transforms = [

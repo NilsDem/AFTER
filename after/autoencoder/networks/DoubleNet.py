@@ -488,8 +488,14 @@ class SlowToFastPredictor(nn.Module):
                 stride=ratio,
                 padding=padding,
                 cumulative_delay=cumulative_delay)
-            layers.extend((upsample, nn.PReLU(hidden_channels)))
-            cumulative_delay = upsample.cumulative_delay
+            conv = cc.Conv1d(hidden_channels,
+                           hidden_channels,
+                           kernel_size=3,
+                           padding=cc.get_padding(kernel_size, mode="causal"),
+                           cumulative_delay= upsample.cumulative_delay)
+            
+            layers.extend((upsample, conv, nn.PReLU(hidden_channels)))
+            cumulative_delay = conv.cumulative_delay
 
         output = cc.Conv1d(hidden_channels,
                            fast_channels,
