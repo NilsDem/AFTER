@@ -101,6 +101,8 @@ class Trainer(nn.Module):
         self.freeze_encoder_step = freeze_encoder_step
         self.step = 0
         self.device = device
+        self.device_type = torch.device(device).type
+        self.fused_optimizer = self.device_type == "cuda"
         self.update_discriminator_every = update_discriminator_every
         self.encoder_frozen = False
 
@@ -114,17 +116,17 @@ class Trainer(nn.Module):
                 p.requires_grad = False
             self.encoder_frozen = True
 
-    def _model_forward(self, *args, **kwargs):
-        if self.model_ddp is not None:
+    def _model_forward(self, *args, use_wrapped=True, **kwargs):
+        if use_wrapped and self.model_ddp is not None:
             return self.model_ddp(*args, **kwargs)
-        if self.model_dp is not None:
+        if use_wrapped and self.model_dp is not None:
             return self.model_dp(*args, **kwargs)
         return self.model(*args, **kwargs)
 
-    def _discriminator_forward(self, *args, **kwargs):
-        if self.discriminator_ddp is not None:
+    def _discriminator_forward(self, *args, use_wrapped=True, **kwargs):
+        if use_wrapped and self.discriminator_ddp is not None:
             return self.discriminator_ddp(*args, **kwargs)
-        if self.discriminator_dp is not None:
+        if use_wrapped and self.discriminator_dp is not None:
             return self.discriminator_dp(*args, **kwargs)
         return self.discriminator(*args, **kwargs)
 
@@ -140,7 +142,7 @@ class Trainer(nn.Module):
         losses = {}
         for dist in self.waveform_losses:
             loss_value = dist(x, y)
-            losses[dist.name] = loss_value.item()
+            losses[dist.name] = loss_value.detach()
             total_loss += loss_value * dist.scale
 
         total_loss = total_loss * self.weight_waveform_losses
@@ -154,15 +156,15 @@ class Trainer(nn.Module):
         if x_multiband is not None and y_multiband is not None:
             for dist in self.multiband_distances:
                 loss_value = dist(x_multiband, y_multiband)
-                losses[dist.name + "_multiband"] = loss_value.item()
+                losses[dist.name + "_multiband"] = loss_value.detach()
                 total_loss += loss_value * dist.scale
 
         if torch.is_tensor(total_loss):
-            losses["total_loss"] = total_loss.item()
+            losses["total_loss"] = total_loss.detach()
         else:
             losses["total_loss"] = float(total_loss)
         if regloss is not None:
-            losses["regularisation_loss"] = regloss.item()
+            losses["regularisation_loss"] = regloss.detach()
 
         return total_loss, losses
 
@@ -189,7 +191,10 @@ class Trainer(nn.Module):
         parameters = list(self.model.encoder.parameters()) + list(
             self.model.decoder.parameters())
 
-        self.opt = AdamW(parameters, lr=lr, betas=(0.9, 0.999))
+        self.opt = AdamW(parameters,
+                         lr=lr,
+                         betas=(0.9, 0.999),
+                         fused=self.fused_optimizer)
 
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.opt,
                                                                 gamma=0.999996)
@@ -197,11 +202,24 @@ class Trainer(nn.Module):
         if self.discriminator is not None:
             self.opt_dis = AdamW(self.discriminator.parameters(),
                                  lr=lr,
-                                 betas=(0.8, 0.9))
+                                 betas=(0.8, 0.9),
+                                 fused=self.fused_optimizer)
             self.scheduler_dis = torch.optim.lr_scheduler.ExponentialLR(
                 self.opt, gamma=0.999996)
         else:
             self.opt_dis = None
+
+    def _normalize_optimizer_execution_mode(self, optimizer):
+        """Match a restored optimizer's execution mode to this device."""
+        for group in optimizer.param_groups:
+            group["fused"] = self.fused_optimizer
+            if self.fused_optimizer:
+                group["foreach"] = None
+                for parameter in group["params"]:
+                    state = optimizer.state.get(parameter)
+                    if state and torch.is_tensor(state.get("step")):
+                        state["step"] = state["step"].to(
+                            device=parameter.device, dtype=torch.float32)
 
     def load_model(self, path, step, load_discrim=False):
         checkpoint_path = os.path.join(path, "checkpoint" + str(step) + ".pt")
@@ -210,6 +228,7 @@ class Trainer(nn.Module):
 
         try:
             self.opt.load_state_dict(d["opt_state"])
+            self._normalize_optimizer_execution_mode(self.opt)
         except:
             print("could not load optimizer state")
 
@@ -217,6 +236,7 @@ class Trainer(nn.Module):
             self.discriminator.load_state_dict(d["dis_state"], strict=False)
             try:
                 self.opt_dis.load_state_dict(d["opt_dis_state"])
+                self._normalize_optimizer_execution_mode(self.opt_dis)
             except:
                 print("could not load discriminator optimizer state")
 
@@ -244,12 +264,13 @@ class Trainer(nn.Module):
         return loss_gen, loss_dis, loss_dis_dict
 
     # @torch.compile(mode='max-autotune', disable=False)
-    def ae_forward(self, x):
+    def ae_forward(self, x, use_wrapped=True):
         y, y_multiband, z, regloss, x_multiband = self._model_forward(
             x,
             return_all=True,
             freeze_encoder=self.step > self.freeze_encoder_step,
-            look_ahead_steps=self.look_ahead_steps)
+            look_ahead_steps=self.look_ahead_steps,
+            use_wrapped=use_wrapped)
 
         if self.look_ahead_steps == 0:
             loss_ae, loss_out = self.compute_loss(x,
@@ -268,11 +289,14 @@ class Trainer(nn.Module):
                 y_multiband=None,
                 regloss=regloss)
 
-        if self.warmup:
+        if self.warmup and self.discriminator is not None:
+            # Backpropagate through the discriminator input, but do not compute
+            # discriminator parameter gradients during generator updates.
+            self.discriminator.requires_grad_(False)
             loss_gen, loss_dis, loss_dis_dict = self._discriminator_forward(
-                x, y)
+                x, y, use_wrapped=False)
         else:
-            loss_gen = torch.tensor(0.).to(x)
+            loss_gen = x.new_zeros(())
             loss_dis_dict = {}
         return loss_out, loss_ae, loss_gen, loss_dis_dict, z, y
 
@@ -285,14 +309,10 @@ class Trainer(nn.Module):
 
             loss_out = {}
 
+            self.discriminator.requires_grad_(True)
             loss_gen, loss_dis, loss_dis_dict = self.discrim_forward(x)
 
-            loss_dis_dict = {
-                k: (v.mean().item() if torch.is_tensor(v) and v.ndim > 0 else
-                    v.item() if torch.is_tensor(v) else v)
-                for k, v in loss_dis_dict.items()
-            }
-            self.opt_dis.zero_grad()
+            self.opt_dis.zero_grad(set_to_none=True)
             if loss_dis.ndim > 0:
                 loss_dis = loss_dis.mean()
             loss_dis.backward()
@@ -306,15 +326,10 @@ class Trainer(nn.Module):
             loss_out, loss_ae, loss_gen, loss_dis_dict, z, y = self.ae_forward(
                 x)
 
-            loss_dis_dict = {
-                k: (v.mean().item() if torch.is_tensor(v) and v.ndim > 0 else
-                    v.item() if torch.is_tensor(v) else v)
-                for k, v in loss_dis_dict.items()
-            }
             loss_out.update(loss_dis_dict)
             loss_gen = loss_gen + loss_ae
 
-            self.opt.zero_grad()
+            self.opt.zero_grad(set_to_none=True)
             if loss_gen.ndim > 0:
                 loss_gen = loss_gen.mean()
             loss_gen.backward()
@@ -332,8 +347,9 @@ class Trainer(nn.Module):
 
         with torch.no_grad():
             for i, x in enumerate(validloader):
-                x = x.to(self.device)
-                losses, _, _, _, _, y = self.ae_forward(x)
+                x = x.to(self.device, non_blocking=True)
+                losses, _, _, _, _, y = self.ae_forward(
+                    x, use_wrapped=not self.distributed)
 
                 for k, v in losses.items():
                     all_losses[k] = v + all_losses.get(k, 0.)
@@ -346,7 +362,11 @@ class Trainer(nn.Module):
                 if i == 50:
                     break
 
-            all_losses = {k: v / (i + 1) for k, v in all_losses.items()}
+            all_losses = {
+                k: (v / (i + 1)).item() if torch.is_tensor(v) else v /
+                (i + 1)
+                for k, v in all_losses.items()
+            }
             if get_audio:
                 x, y = x[:4], y[:4]
 
@@ -411,27 +431,37 @@ class Trainer(nn.Module):
                 if self.step >= self.max_steps:
                     break
 
-                x = x.to(self.device)
+                x = x.to(self.device, non_blocking=True)
 
                 all_losses = self.training_step(x)
 
-                for k in all_losses:
-                    all_losses_sum[k] = all_losses[k] + all_losses_sum.get(
-                        k, 0.)
-                    all_losses_count[k] = 1 + all_losses_count.get(k, 0)
+                if self.is_main_process:
+                    for k, value in all_losses.items():
+                        if torch.is_tensor(value):
+                            value = value.detach()
+                        all_losses_sum[k] = value + all_losses_sum.get(k, 0.)
+                        all_losses_count[k] = 1 + all_losses_count.get(k, 0)
 
                 tepoch.update(1)
 
                 self.update_waveform_losses(rec_loss_decay)
 
                 if not self.step % steps_display and self.is_main_process:
-                    tepoch.set_postfix(loss=all_losses_sum["total_loss"] /
-                                       steps_display)
+                    if all_losses_count.get("total_loss", 0) > 0:
+                        total_average = (all_losses_sum["total_loss"] /
+                                         all_losses_count["total_loss"])
+                        total_value = (total_average.item()
+                                       if torch.is_tensor(total_average) else
+                                       total_average)
+                        tepoch.set_postfix(loss=total_value)
                     for k in all_losses_sum:
                         if all_losses_count[k] == 0:
                             continue
+                        value = all_losses_sum[k] / all_losses_count[k]
+                        if torch.is_tensor(value):
+                            value = value.item()
                         logger.add_scalar('Loss/' + k,
-                                          all_losses_sum[k] / all_losses_count[k],
+                                          value,
                                           global_step=self.step)
                         all_losses_sum[k] = 0.
                         all_losses_count[k] = 0
