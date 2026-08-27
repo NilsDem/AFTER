@@ -173,6 +173,23 @@ def get_midi_chunk(midi_data, chunk_idx, num_signal, sr):
     return midi_out
 
 
+def load_or_extract_midi(preloaded_midi_path, basic_pitch, audio, file_path):
+    """Load aligned MIDI or run Basic Pitch, independently of codec use."""
+    if preloaded_midi_path is not None:
+        try:
+            return pretty_midi.PrettyMIDI(preloaded_midi_path)
+        except Exception as error:
+            print(f"MIDI load error ({preloaded_midi_path}): {error}")
+            return None
+    if basic_pitch is not None:
+        try:
+            audio_mono = audio.mean(axis=0) if audio.ndim == 2 else audio
+            return basic_pitch(audio_mono)
+        except Exception as error:
+            print(f"BasicPitch error ({file_path}): {error}")
+    return None
+
+
 def encode_batch(model, audio_list, device):
     """Encode a list of 1-D (mono) or 2-D (C, T) numpy arrays; returns (N, *z_shape) numpy array."""
     t = torch.from_numpy(np.stack(audio_list)).to(device)
@@ -403,21 +420,10 @@ def process_db(input_path, output_path, device, emb_model, z_length,
             chunks = audio.reshape(audio.shape[0], -1,
                                    FLAGS.num_signal).transpose(1, 0, 2)
 
-            # --- Full-file feature extraction (only when embedding model is present) ---
-            full_midi = None
-            if emb_model is not None:
-                if preloaded_midi_path is not None:
-                    try:
-                        full_midi = pretty_midi.PrettyMIDI(preloaded_midi_path)
-                    except Exception as e:
-                        print(f"MIDI load error ({preloaded_midi_path}): {e}")
-                elif bp is not None:
-                    try:
-                        audio_mono = audio.mean(
-                            axis=0) if audio.ndim == 2 else audio
-                        full_midi = bp(audio_mono)
-                    except Exception as e:
-                        print(f"BasicPitch error ({file}): {e}")
+            # MIDI extraction is independent of codec embedding extraction.
+            # This supports --save_waveform --midi without --emb_model_path.
+            full_midi = load_or_extract_midi(preloaded_midi_path, bp, audio,
+                                             file)
 
             total_chunks = len(chunks)
             for chunk_idx, chunk in enumerate(chunks):

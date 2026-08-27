@@ -530,6 +530,11 @@ class StreamableSTFT(torch.nn.Module):
 
         return torch.cat((torch.real(spec), torch.imag(spec)), -3)
 
+    @torch.jit.export
+    def forward_stream(self, x):
+        """Common streaming-analysis interface used by codec networks."""
+        return self.forward(x)
+
     # @torch.no_grad
     def inverse(self, spec):
 

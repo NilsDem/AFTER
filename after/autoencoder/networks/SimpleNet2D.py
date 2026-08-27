@@ -43,6 +43,60 @@ def ConvTranspose2d(*args, **kwargs) -> nn.Module:
     return _wn(CachedConvTranspose2d(*args, **kwargs))
 
 
+class SeparableConv2d(nn.Module):
+    """Cached depthwise convolution followed by a pointwise projection."""
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride=1,
+                 padding_time=(0, 0),
+                 padding_vert=(0, 0)):
+        super().__init__()
+        self.depthwise = Conv2d(in_channels,
+                                in_channels,
+                                kernel_size=kernel_size,
+                                stride=stride,
+                                groups=in_channels,
+                                padding_time=padding_time,
+                                padding_vert=padding_vert)
+        self.pointwise = Conv2d(in_channels,
+                                out_channels,
+                                kernel_size=1,
+                                padding=0)
+        self.cumulative_delay = self.depthwise.cumulative_delay
+
+    def forward(self, x):
+        return self.pointwise(self.depthwise(x))
+
+
+class SeparableConvTranspose2d(nn.Module):
+    """Cached depthwise transposed convolution plus pointwise projection."""
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride=1,
+                 padding=0):
+        super().__init__()
+        self.depthwise = ConvTranspose2d(in_channels=in_channels,
+                                         out_channels=in_channels,
+                                         kernel_size=kernel_size,
+                                         stride=stride,
+                                         padding=padding,
+                                         groups=in_channels)
+        self.pointwise = Conv2d(in_channels,
+                                out_channels,
+                                kernel_size=1,
+                                padding=0)
+        self.cumulative_delay = self.depthwise.cumulative_delay
+
+    def forward(self, x):
+        return self.pointwise(self.depthwise(x))
+
+
 class EncoderBlock2D(nn.Module):
 
     def __init__(self,
@@ -52,26 +106,28 @@ class EncoderBlock2D(nn.Module):
                  ratio=2,
                  freq_ratio=2,
                  kernel_multiplier=2,
+                 separable=False,
                  act=nn.SiLU):
         super().__init__()
         self.act = act()
-        self.conv = Conv2d(in_c,
-                           in_c,
-                           kernel_size=kernel_size,
-                           padding_vert="same",
-                           padding_time=cc.get_padding(kernel_size=kernel_size,
-                                                       stride=1,
-                                                       mode="causal"))
-        self.pool = Conv2d(in_channels=in_c,
-                           out_channels=out_c,
-                           kernel_size=(freq_ratio * kernel_multiplier + 1,
-                                        ratio * kernel_multiplier + 1),
-                           stride=(freq_ratio, ratio),
-                           padding_vert="same",
-                           padding_time=cc.get_padding(
-                               kernel_size=ratio * kernel_multiplier + 1,
-                               mode="causal",
-                               stride=ratio))
+        conv = SeparableConv2d if separable else Conv2d
+        self.conv = conv(in_c,
+                         in_c,
+                         kernel_size=kernel_size,
+                         padding_vert="same",
+                         padding_time=cc.get_padding(kernel_size=kernel_size,
+                                                     stride=1,
+                                                     mode="causal"))
+        self.pool = conv(in_channels=in_c,
+                         out_channels=out_c,
+                         kernel_size=(freq_ratio * kernel_multiplier + 1,
+                                      ratio * kernel_multiplier + 1),
+                         stride=(freq_ratio, ratio),
+                         padding_vert="same",
+                         padding_time=cc.get_padding(
+                             kernel_size=ratio * kernel_multiplier + 1,
+                             mode="causal",
+                             stride=ratio))
         self.proj_pool = nn.AvgPool2d(kernel_size=(freq_ratio, ratio),
                                       stride=(freq_ratio, ratio))
         self.proj = Conv2d(in_c, out_c, kernel_size=1, padding=0)
@@ -95,10 +151,14 @@ class DecoderBlock2D(nn.Module):
                  kernel_size,
                  act=nn.SiLU,
                  ratio=2,
-                 freq_ratio=2):
+                 freq_ratio=2,
+                 separable=False):
         super().__init__()
         self.act = act()
-        self.up = ConvTranspose2d(
+        conv = SeparableConv2d if separable else Conv2d
+        conv_transpose = (SeparableConvTranspose2d
+                          if separable else ConvTranspose2d)
+        self.up = conv_transpose(
             in_channels=in_c,
             out_channels=out_c,
             kernel_size=(2 * freq_ratio + (1 if freq_ratio == 1 else 0),
@@ -106,13 +166,13 @@ class DecoderBlock2D(nn.Module):
             stride=(freq_ratio, ratio),
             padding=(freq_ratio // 2 + (1 if freq_ratio == 1 else 0),
                      ratio // 2 + (1 if ratio == 1 else 0)))
-        self.conv = Conv2d(in_c,
-                           in_c,
-                           kernel_size=kernel_size,
-                           padding_vert="same",
-                           padding_time=cc.get_padding(kernel_size=kernel_size,
-                                                       stride=1,
-                                                       mode="causal"))
+        self.conv = conv(in_c,
+                         in_c,
+                         kernel_size=kernel_size,
+                         padding_vert="same",
+                         padding_time=cc.get_padding(kernel_size=kernel_size,
+                                                     stride=1,
+                                                     mode="causal"))
         self.proj_pool = nn.Upsample(scale_factor=(freq_ratio, ratio),
                                      mode='nearest')
         self.proj = Conv2d(in_c, out_c, kernel_size=1, padding=0)
@@ -191,7 +251,8 @@ class AutoEncoder2D(nn.Module):
                  kernel_size: int = 3,
                  bottleneck=None,
                  time_transform=None,
-                 use_vae: bool = False):
+                 use_vae: bool = False,
+                 separable_convs: bool = False):
         super().__init__()
 
         if channels is None:
@@ -244,13 +305,15 @@ class AutoEncoder2D(nn.Module):
                                out_c=channels[i + 1],
                                kernel_size=kernel_size,
                                ratio=time_ratios[i],
-                               freq_ratio=freq_ratios[i]))
+                               freq_ratio=freq_ratios[i],
+                               separable=separable_convs))
 
         self.stereo_merge = (EncoderBlock2D(in_c=2 * channels[-1],
                                             out_c=channels[-1],
                                             kernel_size=kernel_size,
                                             ratio=1,
-                                            freq_ratio=1)
+                                            freq_ratio=1,
+                                            separable=separable_convs)
                              if audio_channels == 2 else nn.Identity())
 
         freq_total_ratio = math.prod(freq_ratios)
@@ -276,13 +339,15 @@ class AutoEncoder2D(nn.Module):
                                out_c=channels_dec[n - i - 1],
                                kernel_size=kernel_size,
                                ratio=time_ratios[n - i],
-                               freq_ratio=freq_ratios[n - i]))
+                               freq_ratio=freq_ratios[n - i],
+                               separable=separable_convs))
 
         self.stereo_split = (DecoderBlock2D(in_c=channels_dec[-1],
                                             out_c=2 * channels_dec[-1],
                                             kernel_size=kernel_size,
                                             ratio=1,
-                                            freq_ratio=1)
+                                            freq_ratio=1,
+                                            separable=separable_convs)
                              if audio_channels == 2 else nn.Identity())
 
         # Expose encoder/decoder as module lists (used by Trainer.init_opt)
@@ -375,7 +440,7 @@ class AutoEncoder2D(nn.Module):
     def encode_stream(self, x):
         if self.audio_channels == 2:
             x = self.pack_audio(x)
-        x = self.time_transform(x)
+        x = self.time_transform.forward_stream(x)
         h = self._encode_features(x)
         h = self.bottleneck.forward_stream(h)
         return h
@@ -392,7 +457,7 @@ class AutoEncoder2D(nn.Module):
     def forward_stream(self, x):
         if self.audio_channels == 2:
             x = self.pack_audio(x)
-        x = self.time_transform(x)
+        x = self.time_transform.forward_stream(x)
         h = self._encode_features(x)
         h = self.bottleneck.forward_stream(h)
         h = self._decode_features(h)

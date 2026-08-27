@@ -1,0 +1,89 @@
+from __gin__ import dynamic_registration
+
+import after.dafter.data
+import after.dafter.model
+import after.dafter.network
+import after.dafter.style
+import after.dafter.trainer
+
+# Audio representation: 44.1 kHz, one complex Mauer frame every 64 samples.
+SR = 44100
+HOP_SIZE = 64
+NFFT = 512
+SPECTRAL_BINS = 256
+
+# Training crops contain 512 spectrogram/MIDI frames (about 0.743 seconds).
+N_FRAMES = 512
+STYLE_CROP_SAMPLES = 131072
+STYLE_CHANNELS = 64
+# Fixed style conditioning source for the whole run: "encode", "data", or "none".
+STYLE_CONDITION_SOURCE = "encode"
+STYLE_EMBEDDING_KEY = None
+BATCH_SIZE = 4
+MAX_STEPS = 1000000
+
+# The patcher reduces frequency only: 256 -> 128 -> 64 -> 32 -> 16.
+after.dafter.network.DafterNetwork:
+    nfft = %NFFT
+    hop_size = %HOP_SIZE
+    patch_ratio = 16
+    patch_channels = 16
+    # Causal temporal context inside each frequency-downsampling block.
+    patch_time_kernel = 3
+    hidden_channels = 256
+    n_layers = 4
+    n_heads = 8
+    mlp_multiplier = 2
+    midi_channels = 128
+    style_channels = %STYLE_CHANNELS
+    condition_width = 128
+    # 276 hops at 44.1 kHz is 400.5 ms of history.
+    attention_context_frames = 276
+    # Allocate independent KV caches for up to 20 rectified-flow Euler steps.
+    max_flow_steps = 20
+    # Streaming inference is intended for one Max/MSP stream at a time.
+    max_batch_size = 1
+    max_stream_frames = 16
+
+# Style encoder used only when STYLE_CONDITION_SOURCE is "encode".
+# For "data", set STYLE_EMBEDDING_KEY to the fixed embedding field in the DB.
+after.dafter.style.SpectralStyleEncoder:
+    style_channels = %STYLE_CHANNELS
+    channels = [16, 32, 64, 128]
+    nfft = 512
+    hop_size = 128
+
+after.dafter.model.DafterRectifiedFlow:
+    style_condition_source = %STYLE_CONDITION_SOURCE
+    midi_dropout = 0.10
+    style_dropout = 0.10
+    freeze_style_encoder = False
+
+after.dafter.data.collate_dafter:
+    n_frames = %N_FRAMES
+    hop_size = %HOP_SIZE
+    sample_rate = %SR
+    style_crop_samples = %STYLE_CROP_SAMPLES
+    style_embedding_dim = %STYLE_CHANNELS
+    style_condition_source = %STYLE_CONDITION_SOURCE
+    style_embedding_key = %STYLE_EMBEDDING_KEY
+
+after.dafter.data.get_dafter_datasets:
+    validation_size = 0.02
+    style_condition_source = %STYLE_CONDITION_SOURCE
+    style_embedding_key = %STYLE_EMBEDDING_KEY
+
+after.dafter.trainer.DafterTrainer:
+    learning_rate = 1e-4
+    weight_decay = 0.01
+    gradient_clip = 1.0
+
+after.dafter.trainer.DafterTrainer.fit:
+    max_steps = %MAX_STEPS
+    sample_rate = %SR
+    steps_display = 100
+    steps_valid = 5000
+    steps_save = 25000
+    max_validation_batches = 50
+    validation_sample_steps = [5, 20]
+    validation_audio_examples = 4
