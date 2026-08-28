@@ -438,6 +438,8 @@ class DafterNetwork(nn.Module):
             skip_features=-1,
             normalize=True,
             max_batch_size=max_batch_size,
+            alpha_rescale=0.25,
+            beta_rescale=1.,
         )
         self.patcher = FrequencyPatcher(
             self.spectral_bins,

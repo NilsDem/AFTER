@@ -10,7 +10,7 @@ import pretty_midi
 import torch
 
 from after.dafter.data import collate_dafter, get_dafter_datasets
-from after.dafter.model import DafterRectifiedFlow
+from after.dafter.model import DafterRectifiedFlow, pseudo_huber_loss
 from after.dafter.network import DafterNetwork
 from after.dafter.style import SpectralStyleEncoder
 from after.dafter.summary import format_model_summary, model_summary
@@ -140,6 +140,33 @@ def test_rectified_flow_loss_backward_and_euler_sampling_shapes():
     assert audio.shape == waveform.shape
 
 
+def test_pseudo_huber_loss_matches_elementwise_definition_and_is_scalar():
+    prediction = torch.tensor([[[[0.0, 1.0], [-2.0, 3.0]]]],
+                              requires_grad=True)
+    target = torch.zeros_like(prediction)
+    transition = 0.00054 * np.sqrt(prediction[0].numel())
+    expected = (
+        torch.sqrt((prediction - target).square() + transition**2) -
+        transition).mean()
+
+    loss = pseudo_huber_loss(prediction, target)
+
+    assert loss.ndim == 0
+    torch.testing.assert_close(loss, expected)
+    loss.backward()
+    assert prediction.grad is not None
+    assert torch.isfinite(prediction.grad).all()
+
+
+def test_pseudo_huber_transition_scale_is_independent_of_batch_size():
+    prediction = torch.linspace(-2.0, 2.0, 24).reshape(1, 2, 4, 3)
+    target = torch.zeros_like(prediction)
+    single_loss = pseudo_huber_loss(prediction, target)
+    repeated_loss = pseudo_huber_loss(prediction.repeat(5, 1, 1, 1),
+                                      target.repeat(5, 1, 1, 1))
+    torch.testing.assert_close(repeated_loss, single_loss)
+
+
 def test_midi_and_style_dropout_are_independent_config_entries():
     model = tiny_model(midi_dropout=1.0, style_dropout=0.0)
     midi = torch.ones(4, 128, 8)
@@ -248,7 +275,9 @@ def test_reference_gin_config_is_64_hop_and_256_bins():
     assert network.nfft == 512
     assert network.spectral_bins == 256
     assert network.patcher.patched_bins == 16
-    assert network.blocks[0].attention.embed_dim == 256
+    assert (network.patcher.patch_channels * network.patcher.patched_bins ==
+            512)
+    assert network.blocks[0].attention.embed_dim == 512
     gin.clear_config()
 
 

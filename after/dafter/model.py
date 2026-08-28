@@ -1,12 +1,27 @@
 """Rectified-flow training and sampling for DAFTER."""
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional, Tuple
 
 import gin
 import torch
-import torch.nn.functional as F
 from torch import nn
+
+
+def pseudo_huber_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Mean pseudo-Huber penalty with sample-size-dependent transition scale."""
+    if x.shape != y.shape:
+        raise ValueError(
+            f"pseudo-Huber inputs must have the same shape; got {tuple(x.shape)} "
+            f"and {tuple(y.shape)}")
+    if x.ndim < 1 or x.shape[0] == 0:
+        raise ValueError("pseudo-Huber inputs must contain a batch dimension")
+
+    transition = 0.00054 * math.sqrt(x[0].numel())
+    residual = x - y
+    elementwise_loss = torch.sqrt(residual.square() + transition**2) - transition
+    return elementwise_loss.mean()
 
 
 @gin.configurable
@@ -152,7 +167,7 @@ class DafterRectifiedFlow(nn.Module):
                        broadcast_time * clean_spectrum)
         target_velocity = clean_spectrum - noise
         predicted_velocity = self.network(interpolant, midi, style, flow_time)
-        flow_loss = F.mse_loss(predicted_velocity, target_velocity)
+        flow_loss = pseudo_huber_loss(predicted_velocity, target_velocity)
 
         return {
             "loss": flow_loss,

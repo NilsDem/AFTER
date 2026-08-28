@@ -13,7 +13,7 @@ NFFT = 512
 SPECTRAL_BINS = 256
 
 # Training crops contain 512 spectrogram/MIDI frames (about 0.743 seconds).
-N_FRAMES = 512
+N_FRAMES = 1024
 STYLE_CROP_SAMPLES = 131072
 STYLE_CHANNELS = 64
 # Fixed style conditioning source for the whole run: "encode", "data", or "none".
@@ -27,10 +27,10 @@ after.dafter.network.DafterNetwork:
     nfft = %NFFT
     hop_size = %HOP_SIZE
     patch_ratio = 16
-    patch_channels = 16
+    patch_channels = 32
     # Causal temporal context inside each frequency-downsampling block.
     patch_time_kernel = 3
-    hidden_channels = 256
+    hidden_channels = 512
     n_layers = 4
     n_heads = 8
     mlp_multiplier = 2
@@ -67,8 +67,8 @@ after.dafter.data.get_dafter_datasets:
 
 after.dafter.trainer.DafterTrainer:
     learning_rate = 1e-4
-    weight_decay = 0.01
-    gradient_clip = 1.0
+    weight_decay = 0.
+    gradient_clip = 10.
 
 after.dafter.trainer.DafterTrainer.fit:
     max_steps = %MAX_STEPS
