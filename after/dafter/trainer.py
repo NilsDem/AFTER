@@ -12,7 +12,7 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
 from torch.utils.tensorboard import SummaryWriter
-
+from tqdm import tqdm
 
 def _move_batch(batch: Dict, device: torch.device) -> Dict:
     return {
@@ -244,6 +244,11 @@ class DafterTrainer:
                 config_file.write(gin.config_str())
         if self.distributed:
             dist.barrier()
+        
+        tepoch = tqdm(total=max_steps,
+                              initial=self.step,
+                              unit="batch",
+                              disable=not self.is_main_process)
 
         last_checkpoint_step = -1
         epoch = 0
@@ -256,6 +261,8 @@ class DafterTrainer:
                 made_progress = True
                 metrics = self.training_step(batch)
                 self.step += 1
+                
+                tepoch.update(1)
 
                 if self.step == 1 or self.step % steps_display == 0:
                     metrics = self._average_metrics(metrics)
@@ -263,7 +270,8 @@ class DafterTrainer:
                         f"{name}={value:.5f}"
                         for name, value in metrics.items())
                     if self.is_main_process:
-                        print(f"step {self.step}: {values}")
+                        # print(f"step {self.step}: {values}")
+                        tepoch.set_postfix(**metrics)
                         for name, value in metrics.items():
                             logger.add_scalar(f"train/{name}", value,
                                               self.step)

@@ -17,7 +17,7 @@ N_FRAMES = 512
 STYLE_CROP_SAMPLES = 131072
 STYLE_CHANNELS = 64
 # Fixed style conditioning source for the whole run: "encode", "data", or "none".
-STYLE_CONDITION_SOURCE = "encode"
+STYLE_CONDITION_SOURCE = "none"
 STYLE_EMBEDDING_KEY = None
 BATCH_SIZE = 4
 MAX_STEPS = 1000000
@@ -45,18 +45,10 @@ after.dafter.network.DafterNetwork:
     max_batch_size = 1
     max_stream_frames = 16
 
-# Style encoder used only when STYLE_CONDITION_SOURCE is "encode".
-# For "data", set STYLE_EMBEDDING_KEY to the fixed embedding field in the DB.
-after.dafter.style.SpectralStyleEncoder:
-    style_channels = %STYLE_CHANNELS
-    channels = [16, 32, 64, 128]
-    nfft = 512
-    hop_size = 128
-
 after.dafter.model.DafterRectifiedFlow:
     style_condition_source = %STYLE_CONDITION_SOURCE
     midi_dropout = 0.10
-    style_dropout = 0.10
+    style_dropout = 0.
     freeze_style_encoder = False
 
 after.dafter.data.collate_dafter:
