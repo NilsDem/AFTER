@@ -6,7 +6,7 @@ import os
 import pathlib
 
 from after.autoencoder import Trainer
-from after.autoencoder.transforms import PhaseMangle, RandomGain, PitchShift, TimeStretch, TransformPipeline
+from after.autoencoder.transforms import PhaseMangle, RandomGain, PitchShift, TimeStretch, TransformPipeline, TimeMask
 from after.dataset import SimpleDataset, CombinedDataset
 from after.utils import resolve_device
 
@@ -42,6 +42,9 @@ flags.DEFINE_bool("use_cache", False, "Wether to load the dataset in cache")
 flags.DEFINE_bool("use_validation", True, "Use a train/validation split")
 flags.DEFINE_bool("use_psts", True,
                   "Use pitch shift and time stretch augmentation")
+
+flags.DEFINE_bool("use_silence", True,
+                  "Use silencing augmentation")
 flags.DEFINE_multi_string("filter_include", [],
                           "Glob patterns to include in dataset.")
 flags.DEFINE_multi_string("filter_exclude", [],
@@ -133,6 +136,14 @@ def main(argv):
             PitchShift(min_semitones=-3, max_semitones=3, p=0.3),
             TimeStretch(min_rate=0.8, max_rate=1.2, p=0.3),
         ]
+    if FLAGS.use_silence:
+        transforms.append(TimeMask(
+            min_band_part=0.05,
+            max_band_part=0.3,
+            fade_duration=0.008,
+            p=0.05,
+        )
+)
 
     pipeline = TransformPipeline(transforms)
 

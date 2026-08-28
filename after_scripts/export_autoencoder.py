@@ -196,6 +196,7 @@ class AE_Spectral(nn_tilde.Module):
         z = z - self.latent_mean.unsqueeze(-1)
         z = F.conv1d(z, self.latent_pca.unsqueeze(-1))
         z = z[:, :self.latent_size]
+        print("DOING PCA")
         return z
 
     def _pre_process_latent(self, z):
@@ -208,6 +209,8 @@ class AE_Spectral(nn_tilde.Module):
             z = torch.cat([z, noise * self.temperature[0]], 1)
         
         z = F.conv1d(z, self.latent_pca.T.unsqueeze(-1))
+        
+        print("UNDOING PCA")
             
         return z + self.latent_mean.unsqueeze(-1)
 

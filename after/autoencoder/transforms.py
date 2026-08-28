@@ -9,7 +9,7 @@ from random import random as _random
 from after.dataset import random_phase_mangle
 from audiomentations import PitchShift as _PitchShift
 from audiomentations import TimeStretch as _TimeStretch
-
+from audiomentations import TimeMask as _TimeMask
 
 class PhaseMangle:
 
@@ -73,6 +73,23 @@ class TimeStretch:
     def __call__(self, x: np.ndarray, sr: int) -> np.ndarray:
         return self._t(x, sr)
 
+
+
+class TimeMask:
+    def __init__(self,
+                     min_band_part: float =0.05,
+                     max_band_part: float =0.3,
+                     fade_duration: float =0.005,
+                     p: float =0.05,):
+        
+        
+        self._t = _TimeMask(min_band_part=min_band_part,
+                        max_band_part=max_band_part,
+                        fade_duration=fade_duration,
+                        p=p)
+    
+    def __call__(self, x: np.ndarray, sr: int) -> np.ndarray:
+        return self._t(x, sr)
 
 class TransformPipeline:
     """Applies a list of transforms sequentially to a single sample (C, T)."""
