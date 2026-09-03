@@ -146,17 +146,47 @@ class TemporalAttention(nn.Module):
             v.reshape(cache_shape),
         )
 
+    def _local_mask(
+        self,
+        frames: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        offsets = torch.arange(self.time_window, device=device)
+        positions = torch.arange(frames, device=device)[:, None]
+        allowed = offsets[None, :] >= self.time_window - 1 - positions
+        bias = self.relative_bias.flip(-1)[:, None, :].expand(-1, frames, -1)
+        invalid = torch.full_like(bias, torch.finfo(dtype).min)
+        return torch.where(allowed[None, :, :], bias.to(dtype), invalid)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         leading = x.shape[:-2]
         frames = x.shape[-2]
         q, k, v = self._project(x)
-        mask = self._mask(frames, 0, x.device, x.dtype)
-        y = self.attention.attend(
-            q.reshape(-1, self.heads, frames, self.head_dim),
-            k.reshape(-1, self.heads, frames, self.head_dim),
-            v.reshape(-1, self.heads, frames, self.head_dim),
-            mask,
-        )
+        q = q.reshape(-1, self.heads, frames, self.head_dim)
+        k = k.reshape(-1, self.heads, frames, self.head_dim)
+        v = v.reshape(-1, self.heads, frames, self.head_dim)
+
+        history = self.time_window - 1
+        k = F.pad(k, (0, 0, history, 0))
+        v = F.pad(v, (0, 0, history, 0))
+        k = k.unfold(-2, self.time_window, 1).transpose(-1, -2)
+        v = v.unfold(-2, self.time_window, 1).transpose(-1, -2)
+
+        q = q.permute(0, 2, 1, 3).unsqueeze(-2)
+        k = k.permute(0, 2, 1, 3, 4)
+        v = v.permute(0, 2, 1, 3, 4)
+        mask = self._local_mask(frames, x.device, x.dtype)
+        mask = mask.permute(1, 0, 2)[None, :, :, None, :]
+
+        if self.attention.attention_impl == "sdpa":
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        else:
+            scores = (q * k).sum(dim=-1) * self.attention.scale
+            weights = torch.softmax(scores + mask.squeeze(-2), dim=-1)
+            y = (weights.unsqueeze(-1) * v).sum(dim=-2)
+
+        y = y.squeeze(-2).permute(0, 2, 1, 3)
         y = self.attention.merge(y)
         return y.reshape(*leading, frames, self.dim)
 
