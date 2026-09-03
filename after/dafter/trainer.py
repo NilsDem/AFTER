@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
-from typing import Dict, Iterable, Optional, Sequence
+from typing import Dict, Iterable, Optional, Sequence, Union
 
 import gin
 import torch
@@ -13,6 +13,10 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+
+
+Metric = Union[float, torch.Tensor]
+
 
 def _move_batch(batch: Dict, device: torch.device) -> Dict:
     return {
@@ -36,11 +40,37 @@ class DafterTrainer:
         use_amp: bool = False,
         distributed: bool = False,
         is_main_process: bool = True,
+        use_compile: bool = False,
+        use_channels_last: bool = False,
+        use_fused_adamw: bool = False,
     ) -> None:
         self.device = torch.device(device)
         self.model = model.to(self.device)
+        self.channels_last = bool(use_channels_last)
+        if self.channels_last:
+            # Applying a memory format to the whole module also visits 5-D KV
+            # cache buffers, which cannot use the 4-D channels_last format.
+            # Convert only the convolution modules that consume NCHW tensors.
+            for module in self.model.modules():
+                if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
+                    module.to(memory_format=torch.channels_last)
+            network = getattr(self.model, "network", None)
+            if network is not None and hasattr(network, "channels_last"):
+                network.channels_last = True
+        network = getattr(self.model, "network", None)
+        if (network is not None and
+                hasattr(network, "prepare_flex_attention")):
+            network.prepare_flex_attention(self.device)
         self.distributed = bool(distributed)
         self.is_main_process = bool(is_main_process)
+        self.compile_enabled = bool(use_compile)
+        if (self.distributed and
+                bool(getattr(network, "use_flex_attention", False))):
+            # PyTorch 2.5's DDPOptimizer cannot partition graphs containing
+            # FlexAttention's higher-order operator. FlexAttention compiles its
+            # own kernel even when whole-model compilation is disabled, so this
+            # must apply independently of use_compile. DDP reduction remains.
+            torch._dynamo.config.optimize_ddp = False
         if self.distributed:
             if not dist.is_available() or not dist.is_initialized():
                 raise RuntimeError(
@@ -57,15 +87,28 @@ class DafterTrainer:
             )
         else:
             self.training_model = self.model
+        if self.compile_enabled:
+            if not hasattr(torch, "compile"):
+                raise RuntimeError("torch.compile is unavailable in this PyTorch")
+            self.training_model = torch.compile(
+                self.training_model, mode="reduce-overhead")
         self.gradient_clip = float(gradient_clip)
         self.amp_enabled = bool(use_amp and self.device.type == "cuda")
+        self.fused_adamw = bool(use_fused_adamw and
+                                self.device.type == "cuda")
         parameters = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = AdamW(parameters,
                                lr=learning_rate,
                                weight_decay=weight_decay,
-                               betas=(0.9, 0.999))
+                               betas=(0.9, 0.999),
+                               fused=self.fused_adamw)
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
         self.step = 0
+
+    def _barrier(self) -> None:
+        device_ids = ([self.device.index]
+                      if self.device.type == "cuda" else None)
+        dist.barrier(device_ids=device_ids)
 
     def save_checkpoint(self, model_dir: str) -> str:
         if not self.is_main_process:
@@ -87,23 +130,93 @@ class DafterTrainer:
         self.model.load_state_dict(checkpoint["model_state"])
         if "optimizer_state" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+            for group in self.optimizer.param_groups:
+                group["fused"] = self.fused_adamw
+                if self.fused_adamw:
+                    group["foreach"] = None
+                    for parameter in group["params"]:
+                        state = self.optimizer.state.get(parameter)
+                        if state and torch.is_tensor(state.get("step")):
+                            state["step"] = state["step"].to(
+                                device=parameter.device,
+                                dtype=torch.float32)
         self.step = int(checkpoint.get("step", 0))
 
-    def _average_metrics(self, metrics: Dict[str, float]) -> Dict[str, float]:
+    def _average_metrics(self, metrics: Dict[str, Metric]) -> Dict[str, Metric]:
         if not self.distributed:
             return metrics
         names = sorted(metrics)
-        values = torch.tensor([metrics[name] for name in names],
-                              device=self.device,
-                              dtype=torch.float64)
+        values = torch.stack([
+            value.detach().to(device=self.device, dtype=torch.float64)
+            if torch.is_tensor(value) else
+            torch.tensor(value, device=self.device, dtype=torch.float64)
+            for value in (metrics[name] for name in names)
+        ])
         dist.all_reduce(values, op=dist.ReduceOp.SUM)
         values /= dist.get_world_size()
+        return dict(zip(names, values.unbind()))
+
+    @staticmethod
+    def _metrics_for_logging(metrics: Dict[str, Metric]) -> Dict[str, float]:
+        """Transfer scalar metrics to CPU only at a logging boundary."""
         return {
-            name: float(value.cpu())
-            for name, value in zip(names, values)
+            name: (float(value.detach().cpu())
+                   if torch.is_tensor(value) else float(value))
+            for name, value in metrics.items()
         }
 
-    def training_step(self, batch: Dict) -> Dict[str, float]:
+    @torch.no_grad()
+    def fit_spectrum_whitening(
+        self,
+        dataloader: Iterable,
+        max_batches: Optional[int] = None,
+        minimum_std: float = 1e-6,
+    ) -> int:
+        """Estimate and install training-set spectrum mean/std statistics."""
+        network = self.model.network
+        if not bool(getattr(network, "whiten_spectrum", False)):
+            raise ValueError(
+                "spectrum whitening is disabled on the model network")
+        if max_batches is not None and max_batches < 1:
+            raise ValueError("max_batches must be positive or None")
+        if minimum_std <= 0:
+            raise ValueError("minimum_std must be positive")
+
+        value_sum = torch.zeros_like(
+            network.spectrum_whitening_mean, dtype=torch.float64,
+            device=self.device)
+        square_sum = torch.zeros_like(value_sum)
+        value_count = torch.zeros((), dtype=torch.float64, device=self.device)
+        batches = 0
+
+        for batch in dataloader:
+            waveform = batch["waveform"].to(self.device, non_blocking=True)
+            spectrum = network.time_transform(waveform).to(torch.float64)
+            value_sum += spectrum.sum(dim=(0, 3), keepdim=True)
+            square_sum += spectrum.square().sum(dim=(0, 3), keepdim=True)
+            value_count += spectrum.shape[0] * spectrum.shape[3]
+            batches += 1
+            if max_batches is not None and batches >= max_batches:
+                break
+
+        if self.distributed:
+            dist.all_reduce(value_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(square_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(value_count, op=dist.ReduceOp.SUM)
+        if value_count.item() == 0:
+            raise ValueError("cannot fit whitening from an empty dataloader")
+
+        mean = value_sum / value_count
+        channel_variance = square_sum / value_count - mean.square()
+        # Real and imaginary components share one scale, so every complex
+        # frequency bin has unit variance as a whole. This also handles the
+        # identically-zero imaginary component of the DC bin.
+        variance = channel_variance.mean(dim=1, keepdim=True)
+        std = variance.clamp_min(minimum_std**2).sqrt()
+        network.set_spectrum_whitening_statistics(mean, std)
+        return batches
+
+    def training_step(self, batch: Dict) -> Dict[str, Metric]:
         self.model.train()
         batch = _move_batch(batch, self.device)
         self.optimizer.zero_grad(set_to_none=True)
@@ -128,15 +241,15 @@ class DafterTrainer:
         self.scaler.update()
 
         return {
-            name: float(value.detach().cpu())
+            name: value.detach() if torch.is_tensor(value) else float(value)
             for name, value in output.items()
         }
 
     @torch.no_grad()
     def validate(self, dataloader: Iterable,
-                 max_batches: int) -> Dict[str, float]:
+                 max_batches: int) -> Dict[str, Metric]:
         self.model.eval()
-        totals: Dict[str, float] = {}
+        totals: Dict[str, torch.Tensor] = {}
         count = 0
         for batch in dataloader:
             batch = _move_batch(batch, self.device)
@@ -147,7 +260,8 @@ class DafterTrainer:
                 style_embedding=batch.get("style_embedding"),
             )
             for name, value in output.items():
-                totals[name] = totals.get(name, 0.0) + float(value.cpu())
+                value = value.detach()
+                totals[name] = totals.get(name, torch.zeros_like(value)) + value
             count += 1
             if count >= max_batches:
                 break
@@ -155,15 +269,17 @@ class DafterTrainer:
             return {}
         if self.distributed:
             names = sorted(totals)
-            values = torch.tensor([totals[name] for name in names] + [count],
-                                  device=self.device,
-                                  dtype=torch.float64)
+            values = torch.cat((
+                torch.stack([
+                    totals[name].to(dtype=torch.float64) for name in names
+                ]),
+                torch.tensor([count],
+                             device=self.device,
+                             dtype=torch.float64),
+            ))
             dist.all_reduce(values, op=dist.ReduceOp.SUM)
-            count = int(values[-1].item())
-            totals = {
-                name: float(value.item())
-                for name, value in zip(names, values[:-1])
-            }
+            count = values[-1]
+            totals = dict(zip(names, values[:-1].unbind()))
         return {name: value / count for name, value in totals.items()}
 
     @torch.no_grad()
@@ -196,7 +312,7 @@ class DafterTrainer:
                             device=self.device,
                             dtype=midi.dtype)
 
-        target = batch["waveform"][:count].float().cpu().clamp(-1.0, 1.0)
+        target = batch["waveform"][:count].float().cpu()#clamp(-1.0, 1.0)
         for example_index in range(count):
             logger.add_audio(f"audio/target/{example_index}",
                              target[example_index],
@@ -243,7 +359,7 @@ class DafterTrainer:
                 # Keep data-pipeline macros needed when restarting a run.
                 config_file.write(gin.config_str())
         if self.distributed:
-            dist.barrier()
+            self._barrier()
         
         tepoch = tqdm(total=max_steps,
                               initial=self.step,
@@ -266,13 +382,10 @@ class DafterTrainer:
 
                 if self.step == 1 or self.step % steps_display == 0:
                     metrics = self._average_metrics(metrics)
-                    values = " ".join(
-                        f"{name}={value:.5f}"
-                        for name, value in metrics.items())
                     if self.is_main_process:
-                        # print(f"step {self.step}: {values}")
-                        tepoch.set_postfix(**metrics)
-                        for name, value in metrics.items():
+                        metrics_for_logging = self._metrics_for_logging(metrics)
+                        tepoch.set_postfix(**metrics_for_logging)
+                        for name, value in metrics_for_logging.items():
                             logger.add_scalar(f"train/{name}", value,
                                               self.step)
 
@@ -281,6 +394,8 @@ class DafterTrainer:
                     validation_metrics = self.validate(validloader,
                                                        max_validation_batches)
                     if self.is_main_process:
+                        validation_metrics = self._metrics_for_logging(
+                            validation_metrics)
                         for name, value in validation_metrics.items():
                             logger.add_scalar(f"validation/{name}", value,
                                               self.step)
@@ -293,14 +408,14 @@ class DafterTrainer:
                         except StopIteration:
                             pass
                     if self.distributed:
-                        dist.barrier()
+                        self._barrier()
 
                 if steps_save > 0 and self.step % steps_save == 0:
                     if self.is_main_process:
                         self.save_checkpoint(model_dir)
                     last_checkpoint_step = self.step
                     if self.distributed:
-                        dist.barrier()
+                        self._barrier()
 
                 if self.step >= max_steps:
                     break
@@ -313,4 +428,4 @@ class DafterTrainer:
         if self.is_main_process:
             logger.flush()
         if self.distributed:
-            dist.barrier()
+            self._barrier()

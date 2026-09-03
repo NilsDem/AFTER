@@ -55,6 +55,13 @@ class DafterRectifiedFlow(nn.Module):
         if style_condition_source != "encode" and style_encoder is not None:
             raise ValueError(
                 "a style encoder is only used when style source is 'encode'")
+        network_uses_style = bool(getattr(network, "use_style", True))
+        if style_condition_source == "none" and network_uses_style:
+            raise ValueError(
+                "style source 'none' requires a network with use_style=False")
+        if style_condition_source != "none" and not network_uses_style:
+            raise ValueError(
+                "style source 'encode' or 'data' requires use_style=True")
 
         self.network = network
         self.style_encoder = style_encoder
@@ -80,20 +87,21 @@ class DafterRectifiedFlow(nn.Module):
     def audio_to_spectrum(self, waveform: torch.Tensor) -> torch.Tensor:
         """Transform clean waveform targets without constructing a grad graph."""
         with torch.no_grad():
-            return self.network.time_transform(waveform)
+            return self.network.audio_to_spectrum(waveform)
+
+    def spectrum_to_audio(self, spectrum: torch.Tensor) -> torch.Tensor:
+        """Undo optional whitening and synthesize a waveform."""
+        return self.network.spectrum_to_audio(spectrum)
 
     def resolve_style(
         self,
         style_waveform: Optional[torch.Tensor] = None,
         style_embedding: Optional[torch.Tensor] = None,
         reference: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         """Resolve the single style-conditioning source selected for this run."""
         if self.style_condition_source == "none":
-            if reference is None:
-                raise ValueError("reference is required for style source 'none'")
-            style = reference.new_zeros(reference.shape[0],
-                                        self.network.style_dim)
+            return None
         elif self.style_condition_source == "encode":
             if style_waveform is None:
                 raise ValueError(
@@ -118,20 +126,23 @@ class DafterRectifiedFlow(nn.Module):
     def drop_conditions(
         self,
         midi: torch.Tensor,
-        style: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        style: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
         """Apply independent classifier-free dropout to MIDI and style."""
         batch_size = midi.shape[0]
         midi_mask = torch.rand(batch_size, device=midi.device) < self.midi_dropout
-        if self.style_condition_source == "none":
+        if style is None:
+            if self.style_condition_source != "none":
+                raise ValueError("style cannot be None when style is enabled")
             style_mask = torch.zeros(batch_size,
-                                     device=style.device,
+                                     device=midi.device,
                                      dtype=torch.bool)
+            dropped_style = None
         else:
             style_mask = (torch.rand(batch_size, device=style.device) <
                           self.style_dropout)
+            dropped_style = style.masked_fill(style_mask[:, None], 0.0)
         dropped_midi = midi.masked_fill(midi_mask[:, None, None], 0.0)
-        dropped_style = style.masked_fill(style_mask[:, None], 0.0)
         return dropped_midi, dropped_style, midi_mask, style_mask
 
     def forward(
@@ -167,8 +178,9 @@ class DafterRectifiedFlow(nn.Module):
                        broadcast_time * clean_spectrum)
         target_velocity = clean_spectrum - noise
         predicted_velocity = self.network(interpolant, midi, style, flow_time)
-        flow_loss = pseudo_huber_loss(predicted_velocity, target_velocity)
+        # flow_loss = pseudo_huber_loss(predicted_velocity, target_velocity)
 
+        flow_loss = torch.nn.functional.mse_loss(predicted_velocity, target_velocity)
         return {
             "loss": flow_loss,
             "flow_loss": flow_loss.detach(),
@@ -180,7 +192,7 @@ class DafterRectifiedFlow(nn.Module):
     def sample_spectrogram(
         self,
         midi: torch.Tensor,
-        style: torch.Tensor,
+        style: Optional[torch.Tensor],
         num_steps: int,
         initial_noise: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -214,10 +226,10 @@ class DafterRectifiedFlow(nn.Module):
     def sample_audio(
         self,
         midi: torch.Tensor,
-        style: torch.Tensor,
+        style: Optional[torch.Tensor],
         num_steps: int,
         initial_noise: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         spectrum = self.sample_spectrogram(midi, style, num_steps,
                                            initial_noise)
-        return self.network.time_transform.inverse(spectrum)
+        return self.spectrum_to_audio(spectrum)

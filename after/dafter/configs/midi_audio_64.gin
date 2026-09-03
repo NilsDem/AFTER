@@ -11,6 +11,8 @@ SR = 44100
 HOP_SIZE = 64
 NFFT = 512
 SPECTRAL_BINS = 256
+STFT_ALPHA = 1.
+STFT_BETA = 1.
 
 # Training crops contain 512 spectrogram/MIDI frames (about 0.743 seconds).
 N_FRAMES = 1024
@@ -26,13 +28,16 @@ MAX_STEPS = 1000000
 after.dafter.network.DafterNetwork:
     nfft = %NFFT
     hop_size = %HOP_SIZE
+    stft_alpha = %STFT_ALPHA
+    stft_beta = %STFT_BETA
     patch_ratio = 16
     patch_channels = 32
     # Causal temporal context inside each frequency-downsampling block.
     patch_time_kernel = 3
-    hidden_channels = 512
-    n_layers = 4
-    n_heads = 8
+    hidden_channels = 384
+    n_layers = 8
+    # 12 x 32-wide heads satisfy FlexAttention's power-of-two head requirement.
+    n_heads = 12
     mlp_multiplier = 2
     midi_channels = 128
     style_channels = %STYLE_CHANNELS
@@ -41,6 +46,13 @@ after.dafter.network.DafterNetwork:
     attention_context_frames = 276
     # Allocate independent KV caches for up to 20 rectified-flow Euler steps.
     max_flow_steps = 20
+    # Precompute offline attention masks and rotary tables for this crop length.
+    max_training_frames = %N_FRAMES
+    # Exact block-sparse bounded-causal attention during compiled CUDA training.
+    use_flex_attention = True
+    # Standardize each packed spectrum frequency bin using training data.
+    # The fitted mean/std buffers are stored in every checkpoint.
+    whiten_spectrum = False
     # Streaming inference is intended for one Max/MSP stream at a time.
     max_batch_size = 1
     max_stream_frames = 16

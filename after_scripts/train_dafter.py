@@ -5,6 +5,7 @@ import os
 import pathlib
 
 import gin
+import numpy as np
 import torch
 import torch.distributed as dist
 from absl import app, flags
@@ -35,6 +36,10 @@ flags.DEFINE_multi_float("freqs", None,
 flags.DEFINE_integer("batch_size", None,
                      "Override the BATCH_SIZE gin macro.")
 flags.DEFINE_integer("num_workers", 0, "DataLoader worker count.")
+flags.DEFINE_bool("persistent_workers", True,
+                  "Keep DataLoader workers alive between epochs.")
+flags.DEFINE_integer("prefetch_factor", 2,
+                     "Batches prefetched by each DataLoader worker.")
 flags.DEFINE_bool("use_cache", False, "Cache LMDB examples in memory.")
 flags.DEFINE_bool("use_validation", True,
                   "Create and use the configured validation split.")
@@ -50,10 +55,55 @@ flags.DEFINE_integer("gpu", 0, "Legacy CUDA device index.")
 flags.DEFINE_string("device", None,
                     "cpu, mps, cuda, cuda:N, or auto.")
 flags.DEFINE_bool("amp", False, "Use CUDA automatic mixed precision.")
+flags.DEFINE_bool("compile", True,
+                  "Compile the training forward with reduce-overhead mode.")
+flags.DEFINE_bool("channels_last", True,
+                  "Use channels-last layout for 2D convolutions.")
+flags.DEFINE_bool("fused_adamw", False,
+                  "Use fused AdamW on CUDA.")
+flags.DEFINE_bool(
+    "whiten_spectrum", False,
+    "Estimate per-frequency spectrum statistics before a new run and train "
+    "in zero-mean, unit-variance coordinates.")
+flags.DEFINE_integer(
+    "whitening_batches", 256,
+    "Training batches used to estimate spectrum whitening; 0 uses one full "
+    "pass over the training loader.")
 flags.DEFINE_bool("ddp", False,
                   "Enable DistributedDataParallel (launch with torchrun).")
 flags.DEFINE_bool("summary_only", False,
                   "Print the layer/parameter report without loading data.")
+flags.DEFINE_bool(
+    "test", False,
+    "Overfit one fixed, deterministically collated training example.")
+
+
+class _RepeatedBatchLoader:
+    """Yield one already-collated batch forever without changing its crop."""
+
+    sampler = None
+
+    def __init__(self, batch):
+        self.batch = batch
+
+    def __iter__(self):
+        while True:
+            yield self.batch
+
+
+def _collate_fixed_example(dataset):
+    """Collate dataset item zero once with a reproducible random crop."""
+    if len(dataset) == 0:
+        raise ValueError("Cannot run --test with an empty training dataset")
+    numpy_state = np.random.get_state()
+    try:
+        np.random.seed(0)
+        batch = collate_dafter([dataset[0]])
+    finally:
+        np.random.set_state(numpy_state)
+    if not batch:
+        raise ValueError("The fixed --test example produced an empty batch")
+    return batch
 
 
 def _add_gin_extension(path: str) -> str:
@@ -110,7 +160,9 @@ def _setup_distributed():
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl", init_method="env://")
+    dist.init_process_group(backend="nccl",
+                            init_method="env://",
+                            device_id=torch.device(f"cuda:{local_rank}"))
     return (True, rank, world_size, f"cuda:{local_rank}")
 
 
@@ -123,17 +175,52 @@ def _distributed_sampler(base_sampler, dataset, rank: int, world_size: int,
                                       seed=seed)
 
 
+def _configure_cuda_performance(device: str) -> None:
+    if not str(device).startswith("cuda"):
+        return
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+
+def _loader_worker_kwargs() -> dict:
+    num_workers = FLAGS["num_workers"].value
+    prefetch_factor = FLAGS["prefetch_factor"].value
+    kwargs = {"num_workers": num_workers}
+    if num_workers > 0:
+        if prefetch_factor < 1:
+            raise ValueError("--prefetch_factor must be positive")
+        kwargs.update(
+            persistent_workers=FLAGS["persistent_workers"].value,
+            prefetch_factor=prefetch_factor,
+        )
+    return kwargs
+
+
 def _run_training(distributed: bool, rank: int, world_size: int,
                   device: str):
     is_main_process = rank == 0
     model_dir = os.path.join(FLAGS.out_path, FLAGS.name)
 
+    test_bindings = []
+    if FLAGS.test:
+        test_bindings = [
+            "after.dafter.model.DafterRectifiedFlow.midi_dropout = 0.0",
+            "after.dafter.model.DafterRectifiedFlow.style_dropout = 0.0",
+            "after.dafter.trainer.fit.max_validation_batches = 1",
+        ]
+
     if FLAGS.restart is None:
+        runtime_bindings = list(test_bindings)
+        if FLAGS.whiten_spectrum:
+            runtime_bindings.append(
+                "after.dafter.network.DafterNetwork.whiten_spectrum = True")
         gin.parse_config_files_and_bindings(
-            [_add_gin_extension(path) for path in FLAGS.config], [])
+            [_add_gin_extension(path) for path in FLAGS.config], runtime_bindings)
     else:
         saved_config = os.path.join(model_dir, "config.gin")
-        gin.parse_config_files_and_bindings([saved_config], [])
+        gin.parse_config_files_and_bindings([saved_config], test_bindings)
 
     n_frames = int(gin.query_parameter("%N_FRAMES"))
     style_crop_samples = int(
@@ -143,7 +230,7 @@ def _run_training(distributed: bool, rank: int, world_size: int,
     batch_size = (configured_batch_size if FLAGS.batch_size is None else
                   FLAGS.batch_size)
 
-    network = DafterNetwork()
+    network = DafterNetwork(use_style=style_condition_source != "none")
     style_encoder = (SpectralStyleEncoder()
                      if style_condition_source == "encode" else None)
     model = DafterRectifiedFlow(network=network,
@@ -181,38 +268,46 @@ def _run_training(distributed: bool, rank: int, world_size: int,
             db_list=paths,
             freqs=FLAGS.freqs,
             use_cache=FLAGS.use_cache,
-            use_validation=FLAGS.use_validation,
+            # Test mode supplies its own validation loader from the same fixed
+            # batch and must also work for an LMDB containing only one item.
+            use_validation=False if FLAGS.test else FLAGS.use_validation,
             filter=filter_config,
         ))
-    if distributed:
-        train_sampler = _distributed_sampler(train_sampler, train_dataset,
-                                             rank, world_size, seed=0)
-        if valid_dataset is not None:
-            valid_sampler = _distributed_sampler(valid_sampler, valid_dataset,
-                                                 rank, world_size, seed=42)
-    pin_memory = str(device).startswith("cuda")
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
-        num_workers=FLAGS.num_workers,
-        drop_last=False,
-        pin_memory=pin_memory,
-        collate_fn=collate_dafter,
-    )
-    valid_loader = None
-    if valid_dataset is not None:
-        valid_loader = DataLoader(
-            valid_dataset,
+    if FLAGS.test:
+        fixed_batch = _collate_fixed_example(train_dataset)
+        train_loader = _RepeatedBatchLoader(fixed_batch)
+        valid_loader = _RepeatedBatchLoader(fixed_batch)
+    else:
+        if distributed:
+            train_sampler = _distributed_sampler(train_sampler, train_dataset,
+                                                 rank, world_size, seed=0)
+            if valid_dataset is not None:
+                valid_sampler = _distributed_sampler(
+                    valid_sampler, valid_dataset, rank, world_size, seed=42)
+        pin_memory = str(device).startswith("cuda")
+        worker_kwargs = _loader_worker_kwargs()
+        train_loader = DataLoader(
+            train_dataset,
             batch_size=batch_size,
-            shuffle=False,
-            sampler=valid_sampler,
-            num_workers=FLAGS.num_workers,
-            drop_last=False,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
+            drop_last=True,
             pin_memory=pin_memory,
             collate_fn=collate_dafter,
+            **worker_kwargs,
         )
+        valid_loader = None
+        if valid_dataset is not None:
+            valid_loader = DataLoader(
+                valid_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                sampler=valid_sampler,
+                drop_last=True,
+                pin_memory=pin_memory,
+                collate_fn=collate_dafter,
+                **worker_kwargs,
+            )
 
     if is_main_process:
         os.makedirs(model_dir, exist_ok=True)
@@ -222,22 +317,44 @@ def _run_training(distributed: bool, rank: int, world_size: int,
             report_file.write(summary_text + "\n")
 
     if distributed:
-        dist.barrier()
+        dist.barrier(device_ids=[torch.cuda.current_device()])
     if is_main_process:
-        if distributed:
+        if FLAGS.test:
+            print("TEST MODE: repeatedly overfitting dataset item 0 with one "
+                  "fixed crop (batch size 1, conditioning dropout disabled)")
+        elif distributed:
             print(f"Training on {world_size} GPU(s); per-GPU batch "
                   f"{batch_size}, global batch {batch_size * world_size}")
         else:
             print(f"Training on {device} with batch size {batch_size}")
+    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR",
+                          os.path.join(model_dir, "compiled"))
     trainer = DafterTrainer(model=model,
                             device=device,
                             use_amp=FLAGS.amp,
                             distributed=distributed,
-                            is_main_process=is_main_process)
+                            is_main_process=is_main_process,
+                            use_compile=FLAGS.compile,
+                            use_channels_last=FLAGS.channels_last,
+                            use_fused_adamw=FLAGS.fused_adamw)
     if FLAGS.restart is not None:
         checkpoint_path = os.path.join(model_dir,
                                        f"checkpoint{FLAGS.restart}.pt")
         trainer.load_checkpoint(checkpoint_path)
+    elif model.network.whiten_spectrum:
+        whitening_batches = (1 if FLAGS.test else FLAGS.whitening_batches)
+        if whitening_batches < 0:
+            raise ValueError("--whitening_batches must be non-negative")
+        fitted_batches = trainer.fit_spectrum_whitening(
+            train_loader,
+            max_batches=whitening_batches or None,
+        )
+        if is_main_process:
+            whitening_std = model.network.spectrum_whitening_std
+            print(
+                f"Fitted spectrum whitening from {fitted_batches:,} batch(es): "
+                f"std range [{float(whitening_std.min()):.6g}, "
+                f"{float(whitening_std.max()):.6g}]")
     trainer.fit(dataloader=train_loader,
                 validloader=valid_loader,
                 model_dir=model_dir)
@@ -246,6 +363,7 @@ def _run_training(distributed: bool, rank: int, world_size: int,
 def main(argv):
     del argv
     distributed, rank, world_size, device = _setup_distributed()
+    _configure_cuda_performance(device)
     try:
         _run_training(distributed, rank, world_size, device)
     finally:

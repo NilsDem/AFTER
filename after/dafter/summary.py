@@ -59,10 +59,11 @@ def model_summary(model,
                                n_frames,
                                device=device,
                                dtype=dtype)
-            style = torch.randn(batch_size,
-                                model.network.style_dim,
-                                device=device,
-                                dtype=dtype)
+            style = (torch.randn(batch_size,
+                                 model.network.style_dim,
+                                 device=device,
+                                 dtype=dtype)
+                     if model.network.use_style else None)
             flow_time = torch.rand(batch_size,
                                    model.network.flow_time_dim,
                                    device=device,

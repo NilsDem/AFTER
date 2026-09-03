@@ -49,6 +49,14 @@ def test_cached_attention_matches_offline_and_is_bounded():
             dim=1,
         )
     torch.testing.assert_close(streaming, offline, atol=1e-5, rtol=1e-5)
+    positions = torch.arange(12)
+    distances = positions[:, None] - positions[None, :]
+    expected_mask = (distances >= 0) & (distances <= 4)
+    assert torch.equal(attention.attention_mask[:12, :12], expected_mask)
+    assert attention.rotary_cos.shape == (1024, 4)
+    assert attention.rotary_sin.shape == (1024, 4)
+    assert "attention_mask" not in attention.state_dict()
+    assert "rotary_cos" not in attention.state_dict()
     assert attention.k_cache.shape[3] == 4
     assert attention.cache_valid[0].sum() == 4
     assert attention.cache_valid[1].sum() == 0
@@ -110,17 +118,32 @@ def test_patcher_strides_frequency_but_not_time_and_is_causal():
         assert block.conv.stride == (2, 1)
         assert block.conv.kernel_size == (4, 3)
     for block in model.depatcher.upsample_blocks:
-        assert block[0].stride == (2, 1)
+        assert block.conv.stride == (2, 1)
+        assert block.conv.in_channels == 2 * model.patcher.patch_channels
 
     spectrum = torch.randn(1, 2, model.spectral_bins, 9)
     with torch.no_grad():
-        offline = model.patcher(spectrum)
+        offline_tokens, offline_features = model.patcher(spectrum)
         model.patcher.reset_stream()
-        streaming = torch.cat([
+        stream_outputs = [
             model.patcher.forward_stream(spectrum[..., start:start + 3], 0)
             for start in range(0, spectrum.shape[-1], 3)
-        ], dim=1)
-    torch.testing.assert_close(streaming, offline, atol=1e-5, rtol=1e-5)
+        ]
+        streaming_tokens = torch.cat([output[0] for output in stream_outputs],
+                                     dim=1)
+        streaming_features = [
+            torch.cat([output[1][level] for output in stream_outputs], dim=-1)
+            for level in range(len(offline_features))
+        ]
+    torch.testing.assert_close(streaming_tokens,
+                               offline_tokens,
+                               atol=1e-5,
+                               rtol=1e-5)
+    for streaming, offline in zip(streaming_features, offline_features):
+        torch.testing.assert_close(streaming,
+                                   offline,
+                                   atol=1e-5,
+                                   rtol=1e-5)
 
 
 def test_four_tenths_context_conversion():

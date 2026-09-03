@@ -23,6 +23,7 @@ def _tiny_model():
                             n_heads=4,
                             midi_channels=128,
                             style_channels=8,
+                            use_style=False,
                             condition_width=16,
                             attention_context_frames=8,
                             max_flow_steps=1,
