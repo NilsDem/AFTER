@@ -13,10 +13,10 @@ AUDIO_CHANNELS = None
 LATENT_SIZE = 16
 TIME_SIZE = 131072
 
-FREEZE_ENCODER_STEPS = %MAX_STEPS
-WARMUP_STEPS = 100000
-MAX_STEPS = 500000
-REGULARISATION_WEIGHT = 0.0005
+FREEZE_ENCODER_STEPS = %WARMUP_STEPS
+WARMUP_STEPS = 200000
+MAX_STEPS = 1000000
+REGULARISATION_WEIGHT = 0.01
 REGULARISATION_WARMUP = 10000
 
 # 4096-sample codec ratio: hop 512 and 8x encoder time downsampling.
@@ -86,4 +86,4 @@ autoencoder.trainer.Trainer.fit:
     rec_loss_decay = 1.0
     weight_regularisation_loss = %REGULARISATION_WEIGHT
     warmup_regularisation_loss = %REGULARISATION_WARMUP
-    look_ahead_steps = 1
+    look_ahead_steps = 0

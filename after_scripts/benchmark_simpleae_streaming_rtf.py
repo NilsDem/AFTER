@@ -217,6 +217,7 @@ def main() -> None:
     print(f"device={device} threads={args.threads} torch={torch.__version__}")
     print("name|ratio|callback|bandwidth_hz|params|MAC/callback|GMAC/s|RTF|"
           "callback_ms|p95_ms|p99_ms|max_ms")
+    
     for candidate in selected:
         model = make_model(candidate, args.latent_size).to(device)
         ratio = audio_to_code_ratio(model)

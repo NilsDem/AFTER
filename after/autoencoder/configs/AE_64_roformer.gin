@@ -2,7 +2,7 @@ from __gin__ import dynamic_registration
 
 import after
 from after import autoencoder
-from after.autoencoder.networks import SimpleNet2D
+from after.autoencoder.networks import RofNet
 from after.autoencoder.networks import bottlenecks
 from after.autoencoder.networks import discriminators
 from after.autoencoder import audio
@@ -22,9 +22,8 @@ REGULARISATION_WARMUP = 10000
 # 64-sample codec ratio: hop 64 and no encoder temporal downsampling.
 # The first/last frequency ratios stay at two so the decoder remains full-band.
 # This is the balanced CPU candidate from benchmark_simpleae_streaming_rtf.py.
-CHANNELS = [16, 32, 64, 64, 128]
-TIME_RATIOS = [1, 1, 1, 1, 1]
-FREQ_RATIOS = [2, 4, 4, 2, 2]
+CHANNELS = [16, 32, 64, 128]
+FREQ_RATIOS = [2, 2, 2]
 NFFT = 256
 HOP = 64
 KERNEL_SIZE = 3
@@ -37,20 +36,25 @@ audio.CausalMauerSTFT:
     skip_features = -1
     normalize = True
 
-SimpleNet2D.AutoEncoder2D:
+RofNet.RofNet:
     in_size = 2
     out_size = None
     bottleneck_size = %LATENT_SIZE
     audio_channels = %AUDIO_CHANNELS
-    channels = %CHANNELS
-    time_ratios = %TIME_RATIOS
+    dims = %CHANNELS
+    freq_size = 128
     freq_ratios = %FREQ_RATIOS
-    freq_size = %NFFT
-    kernel_size = %KERNEL_SIZE
+    depths = [1,1,1,1]
+    heads=[4,4,4,4]
+    middle_dim = 64
+    middle_layers=2
+    middle_heads=4
+    time_window=8
+    ff_mult=2
+    smoothing_conv = True
     bottleneck = @bottlenecks.VAEBottleneck()
     time_transform = @audio.CausalMauerSTFT()
     use_vae = True
-    separable_convs = False
 
 autoencoder.core.SpectralDistance:
     scales = [64, 128, 256, 512, 1024, 2048]
@@ -70,7 +74,7 @@ discriminators.SpectroDiscriminator:
     }
 
 autoencoder.trainer.Trainer:
-    model = @SimpleNet2D.AutoEncoder2D()
+    model = @RofNet.RofNet()
     discriminator = @discriminators.SpectroDiscriminator()
     sr = %SR
     max_steps = %MAX_STEPS
