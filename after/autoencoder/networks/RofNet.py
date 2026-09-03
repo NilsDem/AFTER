@@ -93,7 +93,13 @@ class TemporalAttention(nn.Module):
     """Local causal attention; cache layout is ``(..., H, W-1, Dh)``."""
 
     def __init__(
-        self, dim: int, heads: int, time_window: int, attention_impl: str
+        self,
+        dim: int,
+        heads: int,
+        time_window: int,
+        attention_impl: str,
+        byblock: bool = False,
+        block_size: Optional[int] = None,
     ):
         super().__init__()
         if time_window < 1:
@@ -102,6 +108,12 @@ class TemporalAttention(nn.Module):
         self.heads = int(heads)
         self.head_dim = dim // heads
         self.time_window = int(time_window)
+        self.byblock = bool(byblock)
+        self.block_size = int(
+            2 * self.time_window if block_size is None else block_size
+        )
+        if self.block_size < 1:
+            raise ValueError("block_size must be positive")
         self.attention = SharedAttention(dim, heads, attention_impl)
         self.relative_bias = nn.Parameter(torch.zeros(heads, time_window))
         self.register_buffer("k_cache", torch.empty(0), persistent=False)
@@ -159,6 +171,75 @@ class TemporalAttention(nn.Module):
         invalid = torch.full_like(bias, torch.finfo(dtype).min)
         return torch.where(allowed[None, :, :], bias.to(dtype), invalid)
 
+    def _block_mask(
+        self,
+        block_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        first: bool,
+    ) -> torch.Tensor:
+        history = self.time_window - 1
+        query_positions = torch.arange(block_size, device=device)[:, None]
+        key_positions = torch.arange(-history, block_size, device=device)[None, :]
+        lag = query_positions - key_positions
+        allowed = torch.logical_and(lag >= 0, lag < self.time_window)
+        if first and history:
+            allowed = torch.logical_and(allowed, key_positions >= 0)
+        bias = self.relative_bias.to(dtype)[:, lag.clamp(0, self.time_window - 1)]
+        invalid = torch.full_like(bias, torch.finfo(dtype).min)
+        return torch.where(allowed[None, :, :], bias, invalid)
+
+    def _attend_by_block(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        frames: int,
+    ) -> torch.Tensor:
+        batch = q.shape[0]
+        block = self.block_size
+        blocks = (frames + block - 1) // block
+        padded_frames = blocks * block
+        right_padding = padded_frames - frames
+        history = self.time_window - 1
+        context = block + history
+
+        q = F.pad(q, (0, 0, 0, right_padding))
+        k = F.pad(k, (0, 0, history, right_padding))
+        v = F.pad(v, (0, 0, history, right_padding))
+
+        q = q.reshape(batch, self.heads, blocks, block, self.head_dim)
+        q = q.permute(0, 2, 1, 3, 4)
+        k = k.unfold(-2, context, block).transpose(-1, -2)
+        v = v.unfold(-2, context, block).transpose(-1, -2)
+        k = k.permute(0, 2, 1, 3, 4)
+        v = v.permute(0, 2, 1, 3, 4)
+
+        first_mask = self._block_mask(block, q.device, q.dtype, first=True)
+        first_output = self.attention.attend(
+            q[:, 0].contiguous(),
+            k[:, 0].contiguous(),
+            v[:, 0].contiguous(),
+            first_mask,
+        )[:, None]
+
+        if blocks > 1:
+            steady_mask = self._block_mask(block, q.device, q.dtype, first=False)
+            rest_output = self.attention.attend(
+                q[:, 1:].reshape(-1, self.heads, block, self.head_dim),
+                k[:, 1:].reshape(-1, self.heads, context, self.head_dim),
+                v[:, 1:].reshape(-1, self.heads, context, self.head_dim),
+                steady_mask,
+            ).reshape(batch, blocks - 1, self.heads, block, self.head_dim)
+            output = torch.cat((first_output, rest_output), dim=1)
+        else:
+            output = first_output
+
+        output = output.permute(0, 2, 1, 3, 4)
+        return output.reshape(batch, self.heads, padded_frames, self.head_dim)[
+            :, :, :frames
+        ]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         leading = x.shape[:-2]
         frames = x.shape[-2]
@@ -166,6 +247,11 @@ class TemporalAttention(nn.Module):
         q = q.reshape(-1, self.heads, frames, self.head_dim)
         k = k.reshape(-1, self.heads, frames, self.head_dim)
         v = v.reshape(-1, self.heads, frames, self.head_dim)
+
+        if self.byblock:
+            y = self._attend_by_block(q, k, v, frames)
+            y = self.attention.merge(y)
+            return y.reshape(*leading, frames, self.dim)
 
         history = self.time_window - 1
         k = F.pad(k, (0, 0, history, 0))
@@ -265,13 +351,15 @@ class AxialBlock(nn.Module):
         time_window: int,
         ff_mult: int,
         attention_impl: str,
+        byblock: bool = False,
+        block_size: Optional[int] = None,
     ):
         super().__init__()
         self.freq_norm = nn.LayerNorm(dim)
         self.freq_attention = FrequencyAttention(dim, heads, attention_impl)
         self.time_norm = nn.LayerNorm(dim)
         self.time_attention = TemporalAttention(
-            dim, heads, time_window, attention_impl
+            dim, heads, time_window, attention_impl, byblock, block_size
         )
         self.mlp_norm = nn.LayerNorm(dim)
         self.mlp = FeedForward(dim, ff_mult)
@@ -310,10 +398,14 @@ class TemporalBlock(nn.Module):
         time_window: int,
         ff_mult: int,
         attention_impl: str,
+        byblock: bool = False,
+        block_size: Optional[int] = None,
     ):
         super().__init__()
         self.attention_norm = nn.LayerNorm(dim)
-        self.attention = TemporalAttention(dim, heads, time_window, attention_impl)
+        self.attention = TemporalAttention(
+            dim, heads, time_window, attention_impl, byblock, block_size
+        )
         self.mlp_norm = nn.LayerNorm(dim)
         self.mlp = FeedForward(dim, ff_mult)
 
@@ -440,6 +532,8 @@ class RofNet(nn.Module):
         smoothing_conv: bool = False,
         smoothing_kernel_size=(3, 3),
         attention_impl: str = "sdpa",
+        byblock: bool = False,
+        block_size: Optional[int] = None,
     ):
         super().__init__()
         dims = tuple(dims)
@@ -475,6 +569,10 @@ class RofNet(nn.Module):
         self.middle_layers = int(middle_layers)
         self.middle_heads = int(middle_heads)
         self.time_window = int(time_window)
+        self.byblock = bool(byblock)
+        self.block_size = int(2 * time_window if block_size is None else block_size)
+        if self.block_size < 1:
+            raise ValueError("block_size must be positive")
         self.use_vae = bool(use_vae)
         self.attention_impl = attention_impl
         self.time_transform = time_transform
@@ -512,7 +610,13 @@ class RofNet(nn.Module):
                 nn.ModuleList(
                     [
                         AxialBlock(
-                            dim, stage_heads, time_window, ff_mult, attention_impl
+                            dim,
+                            stage_heads,
+                            time_window,
+                            ff_mult,
+                            attention_impl,
+                            self.byblock,
+                            self.block_size,
                         )
                         for _ in range(depth)
                     ]
@@ -522,7 +626,13 @@ class RofNet(nn.Module):
                 nn.ModuleList(
                     [
                         AxialBlock(
-                            dim, stage_heads, time_window, ff_mult, attention_impl
+                            dim,
+                            stage_heads,
+                            time_window,
+                            ff_mult,
+                            attention_impl,
+                            self.byblock,
+                            self.block_size,
                         )
                         for _ in range(depth)
                     ]
@@ -547,7 +657,13 @@ class RofNet(nn.Module):
         self.middle_encoder = nn.ModuleList(
             [
                 TemporalBlock(
-                    middle_dim, middle_heads, time_window, ff_mult, attention_impl
+                    middle_dim,
+                    middle_heads,
+                    time_window,
+                    ff_mult,
+                    attention_impl,
+                    self.byblock,
+                    self.block_size,
                 )
                 for _ in range(middle_layers)
             ]
@@ -558,7 +674,13 @@ class RofNet(nn.Module):
         self.middle_decoder = nn.ModuleList(
             [
                 TemporalBlock(
-                    middle_dim, middle_heads, time_window, ff_mult, attention_impl
+                    middle_dim,
+                    middle_heads,
+                    time_window,
+                    ff_mult,
+                    attention_impl,
+                    self.byblock,
+                    self.block_size,
                 )
                 for _ in range(middle_layers)
             ]
