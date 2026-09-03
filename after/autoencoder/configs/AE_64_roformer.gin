@@ -10,20 +10,20 @@ import cached_conv
 
 SR = 44100
 AUDIO_CHANNELS = 1
-LATENT_SIZE = 16
-TIME_SIZE = 131072
+LATENT_SIZE = 8
+TIME_SIZE = 32768
 
 FREEZE_ENCODER_STEPS = %MAX_STEPS
 WARMUP_STEPS = 100000
 MAX_STEPS = 500000
-REGULARISATION_WEIGHT = 0.005
+REGULARISATION_WEIGHT = 0.01
 REGULARISATION_WARMUP = 10000
 
 # 64-sample codec ratio: hop 64 and no encoder temporal downsampling.
 # The first/last frequency ratios stay at two so the decoder remains full-band.
 # This is the balanced CPU candidate from benchmark_simpleae_streaming_rtf.py.
-CHANNELS = [16, 32, 64, 128]
-FREQ_RATIOS = [2, 2, 2]
+CHANNELS = [16, 32, 64, 64]
+FREQ_RATIOS = [4, 2, 2]
 NFFT = 256
 HOP = 64
 KERNEL_SIZE = 3
@@ -37,6 +37,7 @@ audio.CausalMauerSTFT:
     normalize = True
 
 RofNet.RofNet:
+    byblock=False
     in_size = 2
     out_size = None
     bottleneck_size = %LATENT_SIZE
@@ -46,7 +47,7 @@ RofNet.RofNet:
     freq_ratios = %FREQ_RATIOS
     depths = [1,1,1,1]
     heads=[4,4,4,4]
-    middle_dim = 64
+    middle_dim = 128
     middle_layers=2
     middle_heads=4
     time_window=8
@@ -54,13 +55,14 @@ RofNet.RofNet:
     smoothing_conv = True
     bottleneck = @bottlenecks.VAEBottleneck()
     time_transform = @audio.CausalMauerSTFT()
-    use_vae = True
+    use_vae = True	
+    attention_impl="manual"
 
 autoencoder.core.SpectralDistance:
     scales = [64, 128, 256, 512, 1024, 2048]
     sr = %SR
     mel_bands = [64, 64, 64, 64, 64, 64, 64]
-
+	
 discriminators.SpectroDiscriminator:
     n_ffts = [128, 256, 512, 1024, 2048, 4096]
     hop_lengths = [64, 128, 256, 512, 1024, 2048]
