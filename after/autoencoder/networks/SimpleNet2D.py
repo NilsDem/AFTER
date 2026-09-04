@@ -4,6 +4,7 @@ Ported from acids_codecs/networks/AE2D.py.
 Uses StreamableSTFT as time_transform (see after.autoencoder.audio).
 """
 import math
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -267,6 +268,7 @@ class AutoEncoder2D(nn.Module):
         self.time_transform = time_transform
         self.channels = channels
         self.bottleneck = bottleneck
+        self.use_vae = use_vae
         self.in_size = in_size
         self.audio_channels = audio_channels
         out_size = in_size if out_size is None else out_size
@@ -444,6 +446,21 @@ class AutoEncoder2D(nn.Module):
         h = self._encode_features(x)
         h = self.bottleneck.forward_stream(h)
         return h
+
+    @torch.jit.export
+    def encode_stats_stream(
+            self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the encoder distribution mean and variance."""
+        if self.audio_channels == 2:
+            x = self.pack_audio(x)
+        x = self.time_transform.forward_stream(x)
+        h = self._encode_features(x)
+        if self.use_vae:
+            mean, scale = h.chunk(2, 1)
+            std = torch.nn.functional.softplus(scale) + 1e-2
+            return mean, std * std
+        mean = self.bottleneck.forward_stream(h)
+        return mean, torch.zeros_like(mean)
 
     @torch.jit.export
     def decode_stream(self, z):
