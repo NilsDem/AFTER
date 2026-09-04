@@ -11,6 +11,7 @@ from absl import app, flags
 import os
 import numpy as np
 import torch.nn.functional as F
+from typing import Tuple
 from after.autoencoder.networks.SimpleNet2D import AutoEncoder2D
 
 FLAGS = flags.FLAGS
@@ -101,6 +102,18 @@ class AE_Spectral(nn_tilde.Module):
         if self.latent_pca is not None:
             z = self._post_process_latent(z)
         return z
+
+    @torch.jit.export
+    def encode_stats(
+            self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        mean, variance = self.model.encode_stats_stream(x)
+        if self.latent_pca is not None:
+            mean = self._post_process_latent(mean)
+            variance = F.conv1d(
+                variance,
+                self.latent_pca.square().unsqueeze(-1),
+            )
+        return mean, variance
 
     @torch.jit.export
     def decode(self, z: torch.Tensor) -> torch.Tensor:

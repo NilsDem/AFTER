@@ -63,13 +63,14 @@ flags.DEFINE_string('emb_model_path', None,
 flags.DEFINE_integer('batch_size', 8, 'Chunk batch size for embedding')
 flags.DEFINE_integer(
     'latent_hop_size', 0,
-    'When positive, also store a causal sliding-window latent sequence as '
-    '"z_dense", using this hop size in audio samples. The window size is the '
-    'embedding model compression ratio; 0 disables dense latents.')
+    'When positive, also store causal sliding-window encoder statistics as '
+    '"z_dense_mean" and "z_dense_variance", using this hop size in audio '
+    'samples. The window size is the embedding model compression ratio; 0 '
+    'disables dense statistics.')
 flags.DEFINE_integer(
     'latent_hop_batch_size', 128,
-    'Number of sliding windows encoded at once for z_dense. Reduce if this '
-    'path runs out of accelerator memory.')
+    'Number of sliding windows encoded at once for dense encoder statistics. '
+    'Reduce if this path runs out of accelerator memory.')
 flags.DEFINE_integer('gpu',
                      "-1",
                      help='Legacy CUDA gpu index. Use -1 for cpu. '
@@ -205,18 +206,25 @@ def encode_batch(model, audio_list, device):
     return model.encode(t).cpu().numpy()
 
 
-def encode_sliding_latents(model, audio_list, device, window_size, hop_size,
-                           batch_size):
-    """Encode causal overlapping windows without materializing them all.
+def encode_stats_batch(model, audio_list, device):
+    """Return encoder means and variances for a batch of audio windows."""
+    t = torch.from_numpy(np.stack(audio_list)).to(device)
+    mean, variance = model.encode_stats(t)
+    return mean.cpu().numpy(), variance.cpu().numpy()
+
+
+def encode_sliding_stats(model, audio_list, device, window_size, hop_size,
+                         batch_size):
+    """Encode causal overlapping-window statistics in bounded batches.
 
     Each input is left-padded by ``window_size - hop_size``. Consequently the
     first window contains the first ``hop_size`` real samples and the last one
     is exactly ``x[..., n - window_size:n]``. When the input length is a
     multiple of ``hop_size``, the output has ``n / hop_size`` time steps.
 
-    The embedding model must emit one latent time step for a ``window_size``
-    input. Sliding windows are copied to the device in bounded batches so the
-    much denser sequence does not require a correspondingly huge input tensor.
+    The embedding model must emit one mean and variance time step for a
+    ``window_size`` input. Sliding windows are copied to the device in bounded
+    batches so the dense sequence does not require a huge input tensor.
     """
     if window_size <= 0:
         raise ValueError("window_size must be positive")
@@ -227,7 +235,8 @@ def encode_sliding_latents(model, audio_list, device, window_size, hop_size,
     if batch_size <= 0:
         raise ValueError("latent_hop_batch_size must be positive")
 
-    dense_latents = []
+    dense_means = []
+    dense_variances = []
     left_padding = window_size - hop_size
 
     for audio in audio_list:
@@ -238,7 +247,8 @@ def encode_sliding_latents(model, audio_list, device, window_size, hop_size,
 
         padded = np.pad(audio, ((0, 0), (left_padding, 0)))
         num_windows = audio.shape[-1] // hop_size
-        latent_batches = []
+        mean_batches = []
+        variance_batches = []
 
         for first in range(0, num_windows, batch_size):
             last = min(first + batch_size, num_windows)
@@ -246,19 +256,25 @@ def encode_sliding_latents(model, audio_list, device, window_size, hop_size,
                 padded[..., idx * hop_size:idx * hop_size + window_size]
                 for idx in range(first, last)
             ])
-            encoded = encode_batch(model, windows, device)
-            if encoded.shape[-1] != 1:
+            mean, variance = encode_stats_batch(model, windows, device)
+            if mean.shape != variance.shape:
+                raise ValueError(
+                    "Encoder mean and variance shapes differ: "
+                    f"{mean.shape} != {variance.shape}")
+            if mean.shape[-1] != 1:
                 raise ValueError(
                     "The embedding model must produce exactly one latent time "
                     f"step for a {window_size}-sample window, but produced "
-                    f"shape {encoded.shape[1:]}")
+                    f"shape {mean.shape[1:]}")
             # Turn (window_batch, *latent_shape, 1) into
             # (*latent_shape, window_batch), preserving any feature axes.
-            latent_batches.append(np.moveaxis(encoded[..., 0], 0, -1))
+            mean_batches.append(np.moveaxis(mean[..., 0], 0, -1))
+            variance_batches.append(np.moveaxis(variance[..., 0], 0, -1))
 
-        dense_latents.append(np.concatenate(latent_batches, axis=-1))
+        dense_means.append(np.concatenate(mean_batches, axis=-1))
+        dense_variances.append(np.concatenate(variance_batches, axis=-1))
 
-    return np.stack(dense_latents)
+    return np.stack(dense_means), np.stack(dense_variances)
 
 
 def to_int16(audio):
@@ -339,7 +355,7 @@ def flush_chunk_batch(entries, env, cur_index, device, emb_model, z_length,
 
     chunks = [entry["chunk"] for entry in entries]
     
-    latents = dense_latents = base_descriptors = None
+    latents = dense_means = dense_variances = base_descriptors = None
     structure_results = []
     timbre_latents = []
 
@@ -347,7 +363,7 @@ def flush_chunk_batch(entries, env, cur_index, device, emb_model, z_length,
         latents = encode_batch(emb_model, chunks, device)
 
         if FLAGS.latent_hop_size > 0:
-            dense_latents = encode_sliding_latents(
+            dense_means, dense_variances = encode_sliding_stats(
                 emb_model,
                 chunks,
                 device,
@@ -395,9 +411,12 @@ def flush_chunk_batch(entries, env, cur_index, device, emb_model, z_length,
         if latents is not None:
             ae.put_array("z", latents[item_idx], dtype=np.float32)
 
-        if dense_latents is not None:
-            ae.put_array("z_dense",
-                         dense_latents[item_idx],
+        if dense_means is not None:
+            ae.put_array("z_dense_mean",
+                         dense_means[item_idx],
+                         dtype=np.float32)
+            ae.put_array("z_dense_variance",
+                         dense_variances[item_idx],
                          dtype=np.float32)
             metadata["z_dense_hop_size"] = FLAGS.latent_hop_size
             metadata["z_dense_window_size"] = ae_ratio
@@ -604,6 +623,11 @@ def main(_):
               f"(ae_ratio={ae_ratio})")
 
         if FLAGS.latent_hop_size > 0:
+            if not hasattr(emb_model, "encode_stats"):
+                raise ValueError(
+                    "Dense encoder statistics require a model exported with "
+                    "the encode_stats TorchScript method. Re-export it with "
+                    "after export_autoencoder.")
             if ae_ratio % FLAGS.latent_hop_size:
                 raise ValueError(
                     f"latent_hop_size ({FLAGS.latent_hop_size}) must divide "
@@ -611,8 +635,9 @@ def main(_):
             if FLAGS.latent_hop_batch_size <= 0:
                 raise ValueError("latent_hop_batch_size must be positive")
             dense_length = z_length * ae_ratio // FLAGS.latent_hop_size
-            print("Dense latent extraction enabled; "
-                  f"key=z_dense, hop={FLAGS.latent_hop_size}, "
+            print("Dense encoder statistics extraction enabled; "
+                  "keys=z_dense_mean,z_dense_variance, "
+                  f"hop={FLAGS.latent_hop_size}, "
                   f"length={dense_length}")
     else:
         if FLAGS.latent_hop_size > 0:
