@@ -68,7 +68,7 @@ flags.DEFINE_integer(
     'samples. The window size is the embedding model compression ratio; 0 '
     'disables dense statistics.')
 flags.DEFINE_integer(
-    'latent_hop_batch_size', 128,
+    'latent_hop_batch_size', 16,
     'Number of sliding windows encoded at once for dense encoder statistics. '
     'Reduce if this path runs out of accelerator memory.')
 flags.DEFINE_integer('gpu',
@@ -212,71 +212,179 @@ def encode_stats_batch(model, audio_list, device):
     mean, variance = model.encode_stats(t)
     return mean.cpu().numpy(), variance.cpu().numpy()
 
+def encode_sliding_stats(
+    model,
+    audio_list,
+    device,
+    window_size,
+    hop_size,
+    batch_size,
+):
+    """Encode dense causal statistics using phase-shifted full-sequence passes.
 
-def encode_sliding_stats(model, audio_list, device, window_size, hop_size,
-                         batch_size):
-    """Encode causal overlapping-window statistics in bounded batches.
+    Instead of explicitly extracting every overlapping window, run the
+    encoder `window_size // hop_size` times with different causal alignments
+    and interleave the resulting latent sequences.
 
-    Each input is left-padded by ``window_size - hop_size``. Consequently the
-    first window contains the first ``hop_size`` real samples and the last one
-    is exactly ``x[..., n - window_size:n]``. When the input length is a
-    multiple of ``hop_size``, the output has ``n / hop_size`` time steps.
+    Example:
+        window_size = 256
+        hop_size = 64
 
-    The embedding model must emit one mean and variance time step for a
-    ``window_size`` input. Sliding windows are copied to the device in bounded
-    batches so the dense sequence does not require a huge input tensor.
+        phase 0 -> output indices 0, 4, 8, ...
+        phase 1 -> output indices 1, 5, 9, ...
+        phase 2 -> output indices 2, 6, 10, ...
+        phase 3 -> output indices 3, 7, 11, ...
+
+    This assumes:
+      - the encoder is causal;
+      - its temporal downsampling ratio is exactly `window_size`;
+      - a sequence of length N * window_size produces N latent steps;
+      - window_size is divisible by hop_size.
+
+    `batch_size` now controls how many phase-shifted full sequences are
+    encoded simultaneously.
     """
     if window_size <= 0:
         raise ValueError("window_size must be positive")
+
     if hop_size <= 0 or hop_size > window_size:
         raise ValueError(
-            "latent_hop_size must be between 1 and the codec ratio "
-            f"({window_size}), got {hop_size}")
+            "hop_size must be between 1 and window_size "
+            f"({window_size}), got {hop_size}"
+        )
+
+    if window_size % hop_size:
+        raise ValueError(
+            "Phase-interleaved encoding requires window_size to be divisible "
+            f"by hop_size, got {window_size} and {hop_size}"
+        )
+
     if batch_size <= 0:
-        raise ValueError("latent_hop_batch_size must be positive")
+        raise ValueError("batch_size must be positive")
+
+    num_phases = window_size // hop_size
 
     dense_means = []
     dense_variances = []
-    left_padding = window_size - hop_size
 
     for audio in audio_list:
-        if audio.shape[-1] % hop_size:
+        n = audio.shape[-1]
+
+        if n % hop_size:
             raise ValueError(
-                f"Audio length {audio.shape[-1]} is not divisible by "
-                f"latent_hop_size {hop_size}")
+                f"Audio length {n} is not divisible by hop_size {hop_size}"
+            )
 
-        padded = np.pad(audio, ((0, 0), (left_padding, 0)))
-        num_windows = audio.shape[-1] // hop_size
-        mean_batches = []
-        variance_batches = []
+        num_dense_steps = n // hop_size
 
-        for first in range(0, num_windows, batch_size):
-            last = min(first + batch_size, num_windows)
-            windows = np.stack([
-                padded[..., idx * hop_size:idx * hop_size + window_size]
-                for idx in range(first, last)
-            ])
-            mean, variance = encode_stats_batch(model, windows, device)
-            if mean.shape != variance.shape:
-                raise ValueError(
-                    "Encoder mean and variance shapes differ: "
-                    f"{mean.shape} != {variance.shape}")
-            if mean.shape[-1] != 1:
-                raise ValueError(
-                    "The embedding model must produce exactly one latent time "
-                    f"step for a {window_size}-sample window, but produced "
-                    f"shape {mean.shape[1:]}")
-            # Turn (window_batch, *latent_shape, 1) into
-            # (*latent_shape, window_batch), preserving any feature axes.
-            mean_batches.append(np.moveaxis(mean[..., 0], 0, -1))
-            variance_batches.append(np.moveaxis(variance[..., 0], 0, -1))
+        # Build phase streams. Streams with the same number of coarse
+        # outputs have the same length and can therefore be batched.
+        phase_groups = {}
 
-        dense_means.append(np.concatenate(mean_batches, axis=-1))
-        dense_variances.append(np.concatenate(variance_batches, axis=-1))
+        for phase in range(min(num_phases, num_dense_steps)):
+            # Dense indices belonging to this phase:
+            #
+            #   phase,
+            #   phase + num_phases,
+            #   phase + 2 * num_phases,
+            #   ...
+            num_steps = (
+                (num_dense_steps - 1 - phase) // num_phases + 1
+            )
 
-    return np.stack(dense_means), np.stack(dense_variances)
+            # The first desired output ends at:
+            #
+            #   (phase + 1) * hop_size
+            #
+            # Since the normal encoder output ends after window_size samples,
+            # prepend exactly enough zeros to align it.
+            left_padding = (
+                window_size - (phase + 1) * hop_size
+            )
 
+            # Last real-sample endpoint needed for this phase.
+            last_endpoint = (
+                (phase + 1) * hop_size
+                + (num_steps - 1) * window_size
+            )
 
+            phase_audio = np.pad(
+                audio[..., :last_endpoint],
+                ((0, 0), (left_padding, 0)),
+            )
+
+            # By construction:
+            #
+            #   phase_audio.shape[-1] == num_steps * window_size
+            #
+            assert phase_audio.shape[-1] == num_steps * window_size
+
+            phase_groups.setdefault(num_steps, []).append(
+                (phase, phase_audio)
+            )
+
+        dense_mean = None
+        dense_variance = None
+
+        # Usually there are only one or two different sequence lengths here.
+        for num_steps, streams in phase_groups.items():
+            for first in range(0, len(streams), batch_size):
+                batch_streams = streams[first:first + batch_size]
+
+                phases = [phase for phase, _ in batch_streams]
+
+                x = np.stack([
+                    stream for _, stream in batch_streams
+                ])
+
+                mean, variance = encode_stats_batch(
+                    model,
+                    x,
+                    device,
+                )
+
+                if mean.shape != variance.shape:
+                    raise ValueError(
+                        "Encoder mean and variance shapes differ: "
+                        f"{mean.shape} != {variance.shape}"
+                    )
+
+                if mean.shape[-1] != num_steps:
+                    raise ValueError(
+                        "Expected encoder temporal downsampling ratio to be "
+                        f"{window_size}: input length {x.shape[-1]} should "
+                        f"produce {num_steps} time steps, but got "
+                        f"{mean.shape[-1]}"
+                    )
+
+                if dense_mean is None:
+                    latent_shape = mean.shape[1:-1]
+
+                    dense_mean = np.empty(
+                        (*latent_shape, num_dense_steps),
+                        dtype=mean.dtype,
+                    )
+                    dense_variance = np.empty(
+                        (*latent_shape, num_dense_steps),
+                        dtype=variance.dtype,
+                    )
+
+                for batch_idx, phase in enumerate(phases):
+                    dense_mean[
+                        ..., phase::num_phases
+                    ] = mean[batch_idx]
+
+                    dense_variance[
+                        ..., phase::num_phases
+                    ] = variance[batch_idx]
+
+        dense_means.append(dense_mean)
+        dense_variances.append(dense_variance)
+
+    return (
+        np.stack(dense_means),
+        np.stack(dense_variances),
+    )
 def to_int16(audio):
     return np.clip(audio * (2**15 - 1), -(2**15), 2**15 - 1).astype(np.int16)
 
