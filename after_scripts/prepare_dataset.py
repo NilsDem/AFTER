@@ -61,6 +61,15 @@ flags.DEFINE_bool(
 flags.DEFINE_string('emb_model_path', None,
                     'TorchScript (.pt) embedding model')
 flags.DEFINE_integer('batch_size', 8, 'Chunk batch size for embedding')
+flags.DEFINE_integer(
+    'latent_hop_size', 0,
+    'When positive, also store a causal sliding-window latent sequence as '
+    '"z_dense", using this hop size in audio samples. The window size is the '
+    'embedding model compression ratio; 0 disables dense latents.')
+flags.DEFINE_integer(
+    'latent_hop_batch_size', 128,
+    'Number of sliding windows encoded at once for z_dense. Reduce if this '
+    'path runs out of accelerator memory.')
 flags.DEFINE_integer('gpu',
                      "-1",
                      help='Legacy CUDA gpu index. Use -1 for cpu. '
@@ -196,6 +205,62 @@ def encode_batch(model, audio_list, device):
     return model.encode(t).cpu().numpy()
 
 
+def encode_sliding_latents(model, audio_list, device, window_size, hop_size,
+                           batch_size):
+    """Encode causal overlapping windows without materializing them all.
+
+    Each input is left-padded by ``window_size - hop_size``. Consequently the
+    first window contains the first ``hop_size`` real samples and the last one
+    is exactly ``x[..., n - window_size:n]``. When the input length is a
+    multiple of ``hop_size``, the output has ``n / hop_size`` time steps.
+
+    The embedding model must emit one latent time step for a ``window_size``
+    input. Sliding windows are copied to the device in bounded batches so the
+    much denser sequence does not require a correspondingly huge input tensor.
+    """
+    if window_size <= 0:
+        raise ValueError("window_size must be positive")
+    if hop_size <= 0 or hop_size > window_size:
+        raise ValueError(
+            "latent_hop_size must be between 1 and the codec ratio "
+            f"({window_size}), got {hop_size}")
+    if batch_size <= 0:
+        raise ValueError("latent_hop_batch_size must be positive")
+
+    dense_latents = []
+    left_padding = window_size - hop_size
+
+    for audio in audio_list:
+        if audio.shape[-1] % hop_size:
+            raise ValueError(
+                f"Audio length {audio.shape[-1]} is not divisible by "
+                f"latent_hop_size {hop_size}")
+
+        padded = np.pad(audio, ((0, 0), (left_padding, 0)))
+        num_windows = audio.shape[-1] // hop_size
+        latent_batches = []
+
+        for first in range(0, num_windows, batch_size):
+            last = min(first + batch_size, num_windows)
+            windows = np.stack([
+                padded[..., idx * hop_size:idx * hop_size + window_size]
+                for idx in range(first, last)
+            ])
+            encoded = encode_batch(model, windows, device)
+            if encoded.shape[-1] != 1:
+                raise ValueError(
+                    "The embedding model must produce exactly one latent time "
+                    f"step for a {window_size}-sample window, but produced "
+                    f"shape {encoded.shape[1:]}")
+            # Turn (window_batch, *latent_shape, 1) into
+            # (*latent_shape, window_batch), preserving any feature axes.
+            latent_batches.append(np.moveaxis(encoded[..., 0], 0, -1))
+
+        dense_latents.append(np.concatenate(latent_batches, axis=-1))
+
+    return np.stack(dense_latents)
+
+
 def to_int16(audio):
     return np.clip(audio * (2**15 - 1), -(2**15), 2**15 - 1).astype(np.int16)
 
@@ -268,18 +333,28 @@ def print_midi_size_stats(midi):
 
 
 def flush_chunk_batch(entries, env, cur_index, device, emb_model, z_length,
-                      desc_model, augment_pool):
+                      ae_ratio, desc_model, augment_pool):
     if not entries:
         return cur_index
 
     chunks = [entry["chunk"] for entry in entries]
     
-    latents = base_descriptors = None
+    latents = dense_latents = base_descriptors = None
     structure_results = []
     timbre_latents = []
 
     if emb_model is not None:
         latents = encode_batch(emb_model, chunks, device)
+
+        if FLAGS.latent_hop_size > 0:
+            dense_latents = encode_sliding_latents(
+                emb_model,
+                chunks,
+                device,
+                window_size=ae_ratio,
+                hop_size=FLAGS.latent_hop_size,
+                batch_size=FLAGS.latent_hop_batch_size,
+            )
 
         if desc_model is not None:
             base_descriptors = [
@@ -319,6 +394,13 @@ def flush_chunk_batch(entries, env, cur_index, device, emb_model, z_length,
 
         if latents is not None:
             ae.put_array("z", latents[item_idx], dtype=np.float32)
+
+        if dense_latents is not None:
+            ae.put_array("z_dense",
+                         dense_latents[item_idx],
+                         dtype=np.float32)
+            metadata["z_dense_hop_size"] = FLAGS.latent_hop_size
+            metadata["z_dense_window_size"] = ae_ratio
 
         if entry["midi"] is not None:
             ae.put_buffer("midi", pickle.dumps(entry["midi"]), shape=None)
@@ -364,7 +446,7 @@ def flush_chunk_batch(entries, env, cur_index, device, emb_model, z_length,
 # ---------------------------------------------------------------------------
 
 
-def process_db(input_path, output_path, device, emb_model, z_length,
+def process_db(input_path, output_path, device, emb_model, z_length, ae_ratio,
                desc_model, bp, structure_aug, timbre_aug):
 
     env = lmdb.open(output_path,
@@ -464,7 +546,7 @@ def process_db(input_path, output_path, device, emb_model, z_length,
                 if len(chunk_entries) >= FLAGS.batch_size:
                     cur_index = flush_chunk_batch(chunk_entries, env,
                                                   cur_index, device, emb_model,
-                                                  z_length, desc_model,
+                                                  z_length, ae_ratio, desc_model,
                                                   augment_pool)
                     chunk_entries = []
                     if FLAGS.test:
@@ -472,7 +554,7 @@ def process_db(input_path, output_path, device, emb_model, z_length,
                         exit()
 
         cur_index = flush_chunk_batch(chunk_entries, env, cur_index, device,
-                                      emb_model, z_length, desc_model,
+                                      emb_model, z_length, ae_ratio, desc_model,
                                       augment_pool)
     except KeyboardInterrupt:
         interrupted = True
@@ -504,17 +586,39 @@ def main(_):
     print(f"Device: {device}")
 
     # Embedding model
-    emb_model = z_length = None
+    emb_model = z_length = ae_ratio = None
+    if FLAGS.latent_hop_size < 0:
+        raise ValueError("latent_hop_size must be non-negative")
     if FLAGS.emb_model_path is not None:
         emb_model = torch.jit.load(FLAGS.emb_model_path).to(device).eval()
         with torch.no_grad():
             dummy = torch.randn(1, 1 if not FLAGS.stereo else 2,
                                 FLAGS.num_signal).to(device)
             z_length = emb_model.encode(dummy).shape[-1]
-        print(
-            f"Embedding model loaded; z_length={z_length} (ae_ratio={FLAGS.num_signal // z_length})"
-        )
+        if FLAGS.num_signal % z_length:
+            raise ValueError(
+                f"num_signal ({FLAGS.num_signal}) must be divisible by the "
+                f"model latent length ({z_length})")
+        ae_ratio = FLAGS.num_signal // z_length
+        print(f"Embedding model loaded; z_length={z_length} "
+              f"(ae_ratio={ae_ratio})")
+
+        if FLAGS.latent_hop_size > 0:
+            if ae_ratio % FLAGS.latent_hop_size:
+                raise ValueError(
+                    f"latent_hop_size ({FLAGS.latent_hop_size}) must divide "
+                    f"the codec ratio ({ae_ratio})")
+            if FLAGS.latent_hop_batch_size <= 0:
+                raise ValueError("latent_hop_batch_size must be positive")
+            dense_length = z_length * ae_ratio // FLAGS.latent_hop_size
+            print("Dense latent extraction enabled; "
+                  f"key=z_dense, hop={FLAGS.latent_hop_size}, "
+                  f"length={dense_length}")
     else:
+        if FLAGS.latent_hop_size > 0:
+            raise ValueError(
+                "latent_hop_size requires an embedding model via "
+                "--emb_model_path")
         if not FLAGS.save_waveform:
             print(
                 "Warning: No embedding model specified and --save_waveform is False; the DB will contain no data!"
@@ -562,7 +666,7 @@ def main(_):
             name) if len(FLAGS.input_path) > 1 else FLAGS.output_path
         os.makedirs(out_dir, exist_ok=True)
         print(f"\n--- {name}: {input_path} → {out_dir} ---")
-        process_db(input_path, out_dir, device, emb_model, z_length,
+        process_db(input_path, out_dir, device, emb_model, z_length, ae_ratio,
                    desc_model, bp, structure_aug, timbre_aug)
 
 
