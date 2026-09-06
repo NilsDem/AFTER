@@ -38,6 +38,9 @@ flags.DEFINE_string("device", None,
                     "Overrides --gpu when set.")
 flags.DEFINE_bool("ddp", False, "Use DistributedDataParallel")
 flags.DEFINE_bool("amp", False, "Use CUDA automatic mixed precision")
+flags.DEFINE_bool("compile", False,
+                  "Compile the autoencoder training forward with "
+                  "torch.compile in default mode")
 flags.DEFINE_integer("num_workers", 4, "Number of data-loading workers")
 flags.DEFINE_bool("use_cache", False, "Wether to load the dataset in cache")
 flags.DEFINE_bool("use_validation", True, "Use a train/validation split")
@@ -47,10 +50,156 @@ flags.DEFINE_multi_string("filter_include", [],
                           "Glob patterns to include in dataset.")
 flags.DEFINE_multi_string("filter_exclude", [],
                           "Glob patterns to exclude from dataset.")
+flags.DEFINE_bool(
+    "force_latent", False,
+    "Train from z_dense_mean/z_dense_variance targets. During teacher "
+    "forcing the decoder receives a sample from the stored distribution and "
+    "the encoder is matched to that distribution with KL(teacher || student). "
+    "After forcing, the decoder receives student samples while teacher KL "
+    "continues to replace the ordinary VAE prior.")
+flags.DEFINE_integer(
+    "teacher_forcing_steps", -1,
+    "Number of steps for which the decoder receives teacher latent samples. "
+    "Afterward it receives student samples while teacher KL remains active. "
+    "A negative value keeps decoder teacher forcing enabled for the whole run.")
+flags.DEFINE_integer(
+    "latent_hop_size", 64,
+    "Audio-sample hop represented by adjacent dense latent targets.")
+flags.DEFINE_float(
+    "latent_kl_weight", 1.0,
+    "Weight of KL(teacher distribution || student distribution).")
+flags.DEFINE_bool(
+    "condition_encoder", False,
+    "Condition the distilled encoder on the teacher's native-rate z sequence.")
+flags.DEFINE_integer(
+    "conditioning_compute_delay", 1024,
+    "Extra audio-sample delay added after one teacher codec frame.")
+
+
 def add_gin_extension(config_name: str) -> str:
     if config_name[-4:] != '.gin':
         config_name += '.gin'
     return config_name
+
+
+def make_collate_fn(num_signal,
+                    sr,
+                    audio_channels,
+                    pipeline=None,
+                    force_latent=False,
+                    latent_hop_size=64,
+                    condition_encoder=False,
+                    conditioning_compute_delay=1024):
+    """Build a collator, preserving dense-latent/audio crop alignment."""
+    if condition_encoder and not force_latent:
+        raise ValueError("Encoder conditioning is only available in distillation mode")
+    if conditioning_compute_delay < 0:
+        raise ValueError("conditioning_compute_delay must be non-negative")
+    if force_latent and num_signal % latent_hop_size:
+        raise ValueError(
+            f"n_signal ({num_signal}) must be divisible by latent_hop_size "
+            f"({latent_hop_size})")
+
+    def collate_fn(batch):
+        waveforms = []
+        latent_means = []
+        latent_variances = []
+        encoder_conditioning = []
+
+        for item in batch:
+            waveform = item["waveform"]
+            if waveform.ndim == 1:
+                waveform = waveform[None, :]
+            if audio_channels == 2 and waveform.shape[0] == 1:
+                waveform = np.repeat(waveform, 2, axis=0)
+
+            if force_latent:
+                metadata = item.get("metadata", {})
+                stored_hop = metadata.get("z_dense_hop_size")
+                if stored_hop != latent_hop_size:
+                    raise ValueError(
+                        "Dense-latent hop mismatch: dataset metadata reports "
+                        f"{stored_hop}, but --latent_hop_size is "
+                        f"{latent_hop_size}")
+
+                mean = np.asarray(item["z_dense_mean"])
+                variance = np.asarray(item["z_dense_variance"])
+                if mean.shape != variance.shape:
+                    raise ValueError(
+                        "z_dense_mean and z_dense_variance shapes differ: "
+                        f"{mean.shape} != {variance.shape}")
+
+                required_steps = num_signal // latent_hop_size
+                available_steps = min(mean.shape[-1],
+                                      waveform.shape[-1] // latent_hop_size)
+                if available_steps < required_steps:
+                    raise ValueError(
+                        "Dataset item is shorter than the requested crop: "
+                        f"{available_steps} latent steps available, "
+                        f"{required_steps} required")
+                max_start_step = available_steps - required_steps
+                start_step = (np.random.randint(max_start_step + 1)
+                              if max_start_step else 0)
+                start_sample = start_step * latent_hop_size
+                waveform = waveform[:, start_sample:start_sample + num_signal]
+                mean = mean[..., start_step:start_step + required_steps]
+                variance = variance[..., start_step:start_step + required_steps]
+                latent_means.append(mean)
+                latent_variances.append(variance)
+                if condition_encoder:
+                    teacher_hop = metadata.get("z_dense_window_size")
+                    if teacher_hop is None or teacher_hop % latent_hop_size:
+                        raise ValueError(
+                            "Teacher codec ratio must be present in "
+                            "z_dense_window_size and divisible by the student hop")
+                    total_delay = teacher_hop + conditioning_compute_delay
+                    if total_delay % latent_hop_size:
+                        raise ValueError(
+                            "Teacher ratio plus conditioning delay must be "
+                            "divisible by the student hop")
+                    teacher_z = torch.from_numpy(
+                        np.asarray(item["z"], dtype=np.float32)).unsqueeze(0)
+                    dense_z = torch.nn.functional.interpolate(
+                        teacher_z,
+                        size=available_steps,
+                        mode="linear",
+                        align_corners=False,
+                    )[0]
+                    delay_steps = total_delay // latent_hop_size
+                    dense_z = torch.nn.functional.pad(
+                        dense_z, (delay_steps, 0))[..., :dense_z.shape[-1]]
+                    encoder_conditioning.append(
+                        dense_z[..., start_step:start_step + required_steps])
+            else:
+                if waveform.shape[-1] > num_signal:
+                    start_sample = np.random.randint(
+                        waveform.shape[-1] - num_signal + 1)
+                    waveform = waveform[:, start_sample:start_sample + num_signal]
+                if pipeline is not None:
+                    waveform = pipeline(waveform, sr)
+
+            if waveform.shape[-1] != num_signal:
+                raise ValueError(
+                    f"Expected {num_signal} waveform samples after cropping, "
+                    f"got {waveform.shape[-1]}")
+            waveforms.append(waveform)
+
+        waveform_batch = torch.from_numpy(
+            np.stack(waveforms).astype(np.float32)).float()
+        if not force_latent:
+            return waveform_batch
+        result = {
+            "waveform": waveform_batch,
+            "latent_mean": torch.from_numpy(
+                np.stack(latent_means).astype(np.float32)).float(),
+            "latent_variance": torch.from_numpy(
+                np.stack(latent_variances).astype(np.float32)).float(),
+        }
+        if condition_encoder:
+            result["encoder_conditioning"] = torch.stack(encoder_conditioning)
+        return result
+
+    return collate_fn
 
 
 def main(argv):
@@ -101,13 +250,44 @@ def main(argv):
     with gin.unlock_config():
         gin.bind_parameter("%AUDIO_CHANNELS", audio_channels)
 
+        if FLAGS.restart is None and FLAGS.force_latent:
+            # RofNet normally shares positional embeddings across both
+            # branches. Distillation uses separate copies so reconstruction
+            # gradients cannot update any encoder parameter in phase one.
+            gin.bind_parameter(
+                "RofNet.RofNet.separate_frequency_positions", True)
+
+        if FLAGS.restart is None and FLAGS.condition_encoder:
+            gin.bind_parameter("RofNet.RofNet.condition_encoder", True)
+
+        distillation_flags = {
+            "force_latent": FLAGS.force_latent,
+            "teacher_forcing_steps": FLAGS.teacher_forcing_steps,
+            "latent_hop_size": FLAGS.latent_hop_size,
+            "latent_kl_weight": FLAGS.latent_kl_weight,
+            "condition_encoder": FLAGS.condition_encoder,
+            "conditioning_compute_delay": FLAGS.conditioning_compute_delay,
+        }
+        for parameter, value in distillation_flags.items():
+            # On resume, the operative config is authoritative unless the
+            # corresponding command-line flag was explicitly supplied.
+            if FLAGS.restart is None or FLAGS[parameter].present:
+                gin.bind_parameter(f"Trainer.{parameter}", value)
+
     ## MODELS — detect architecture from gin config
     ## Start the training
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(
+        output_root, model_name, "compiled")
     trainer = Trainer(device=device,
                       device_ids=device_ids,
                       distributed=ddp_enabled,
                       is_main_process=rank == 0,
-                      use_amp=FLAGS.amp)
+                      use_amp=FLAGS.amp,
+                      use_compile=FLAGS.compile)
+
+    # Use the resolved trainer value below: on restart it may have come from
+    # the saved operative config instead of the current flag default.
+    force_latent = trainer.force_latent
 
     ### TEST NETWORK (shape depends on audio_channels)
     x = torch.randn(1, audio_channels, 4096 * 16).to(trainer.device)
@@ -150,29 +330,19 @@ def main(argv):
         ]
 
     pipeline = TransformPipeline(transforms)
-
-    ## COLLATE
-    def collate_fn(batch):
-        x = [l["waveform"] for l in batch]
-
-        for i in range(len(x)):
-            xi = x[i]
-
-            # Ensure (C, T) shape
-            if xi.ndim == 1:
-                xi = xi[None, :]  # (1, T)
-            # mono → stereo if needed
-            if audio_channels == 2 and xi.shape[0] == 1:
-                xi = np.repeat(xi, 2, axis=0)
-            # crop
-            if xi.shape[-1] > num_signal:
-                i0 = np.random.randint(0, xi.shape[-1] - num_signal)
-                xi = xi[:, i0:i0 + num_signal]
-            x[i] = pipeline(xi, sr)
-
-        x = np.stack(x).astype(np.float32)  # (B, C, T)
-
-        return torch.from_numpy(x).float()
+    if force_latent:
+        print("Latent distillation enabled: waveform augmentation is disabled "
+              "to preserve alignment with stored teacher statistics.")
+    collate_fn = make_collate_fn(
+        num_signal=num_signal,
+        sr=sr,
+        audio_channels=audio_channels,
+        pipeline=pipeline,
+        force_latent=force_latent,
+        latent_hop_size=trainer.latent_hop_size,
+        condition_encoder=trainer.condition_encoder,
+        conditioning_compute_delay=trainer.conditioning_compute_delay,
+    )
 
     ## DATASET
     db_paths = list(FLAGS.db_path)
@@ -217,9 +387,13 @@ def main(argv):
         "exclude": FLAGS.filter_exclude
     }
 
+    dataset_keys = (["waveform", "z_dense_mean", "z_dense_variance"]
+                    if force_latent else ["waveform"])
+    if trainer.condition_encoder:
+        dataset_keys.append("z")
     dataset = CombinedDataset(
         path_dict=path_dict,
-        keys=["waveform"],
+        keys=dataset_keys,
         freqs="estimate" if FLAGS.freqs is None else FLAGS.freqs,
         config="train",
         init_cache=FLAGS.use_cache,
@@ -232,7 +406,7 @@ def main(argv):
             path_dict=path_dict,
             config="validation",
             freqs="estimate" if FLAGS.freqs is None else FLAGS.freqs,
-            keys=["waveform"],
+            keys=dataset_keys,
             init_cache=FLAGS.use_cache,
             filter=filter_dict,
         )
@@ -286,16 +460,17 @@ def main(argv):
     else:
         validloader = None
 
-    x = next(iter(dataloader))
-    print("Training size : ", x.shape)
+    first_batch = next(iter(dataloader))
+    if isinstance(first_batch, dict):
+        print("Training size:", first_batch["waveform"].shape,
+              "teacher latent size:", first_batch["latent_mean"].shape)
+    else:
+        print("Training size : ", first_batch.shape)
 
     if step_restart is not None:
         print("Loading model from step ", step_restart)
         path = os.path.join(output_root, model_name)
         trainer.load_model(path, step_restart, load_discrim=True)
-
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(
-        output_root, model_name, "compiled")
 
     trainer.fit(dataloader,
                 validloader,

@@ -1,163 +1,167 @@
-"""
-Export autoencoder to nn_tilde .ts format.
-Supports both spectral (AE2D) and PQMF (SimpleNetsStream) architectures.
-Based on acids_codecs/export.py.
-"""
-import nn_tilde
-import torch
+"""Export the autoencoder selected by a training run's Gin config."""
+
+import os
+from typing import Tuple
+
+from absl import app, flags
 import cached_conv as cc
 import gin
-from absl import app, flags
-import os
-import numpy as np
-import torch.nn.functional as F
-from typing import Tuple
-from after.autoencoder.networks.SimpleNet2D import AutoEncoder2D
+import nn_tilde
+import torch
+
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_integer("step", None, "Step to load the model from")
-flags.DEFINE_string("model_path", None, "Path of the trained model directory")
+flags.DEFINE_integer("step", None, "Step to load; defaults to the latest")
+flags.DEFINE_string("model_path", None, "Trained model directory")
 
 
 def _load_checkpoint(model_path, step):
     if step is None:
         steps = [
-            int(f.replace("checkpoint", "")[:-3])
-            for f in os.listdir(model_path)
-            if f.startswith("checkpoint") and f.endswith(".pt")
+            int(name[len("checkpoint"):-len(".pt")])
+            for name in os.listdir(model_path)
+            if name.startswith("checkpoint") and name.endswith(".pt")
         ]
         step = max(steps)
-    ckpt = os.path.join(model_path, f"checkpoint{step}.pt")
-    print(f"Loading checkpoint: {ckpt}")
-    return torch.load(ckpt, map_location="cpu"), step
+    path = os.path.join(model_path, f"checkpoint{step}.pt")
+    return torch.load(path, map_location="cpu", weights_only=False), step
 
 
-# ─── Spectral (AE2D) wrapper ──────────────────────────────────────────────────
-class AE_Spectral(nn_tilde.Module):
+def _configured_model(checkpoint):
+    reference = gin.query_parameter("Trainer.model")
+    model = reference.scoped_configurable_fn()
+    model.load_state_dict(checkpoint["model_state"], strict=False)
+    return model.eval()
 
-    def __init__(self, ckpt: str, latent_mean=None, latent_pca=None) -> None:
+
+class ExportedAutoencoder(nn_tilde.Module):
+    __constants__ = ["streaming"]
+
+    def __init__(self, model, audio_channels: int, latent_size: int,
+                 comp_ratio: int, streaming: bool = False) -> None:
         super().__init__()
+        self.model = model
+        self.comp_ratio = comp_ratio
+        self.streaming = streaming
 
-        model = AutoEncoder2D()
-        d = torch.load(ckpt, map_location="cpu")
-        model.load_state_dict(d["model_state"], strict=False)
-        self.model = model.eval()
-
-        audio_channels = model.audio_channels
-        latent_size = gin.query_parameter("%LATENT_SIZE")
-
-        # Determine compression ratio from a forward pass
-        test = torch.zeros(1, audio_channels, 131072)
-        with torch.no_grad():
-            z = self.model.encode_stream(test)
-        self.comp_ratio = test.shape[-1] // z.shape[-1]
-
-        self.register_buffer("latent_pca", latent_pca)
-        self.register_buffer("latent_mean", latent_mean)
-
-        in_labels = [f"(signal) Input {i+1}" for i in range(audio_channels)]
-        out_labels = [f"(signal) Channel {i+1}" for i in range(audio_channels)]
-        lat_in_labels = [f"(signal) Latent {i}" for i in range(latent_size)]
-        lat_out_labels = [f"Latent {i}" for i in range(latent_size)]
+        audio_inputs = [f"(signal) Input {i + 1}"
+                        for i in range(audio_channels)]
+        audio_outputs = [f"(signal) Channel {i + 1}"
+                         for i in range(audio_channels)]
+        latent_inputs = [f"(signal) Latent {i}"
+                         for i in range(latent_size)]
+        latent_outputs = [f"Latent {i}" for i in range(latent_size)]
 
         self.register_method("encode",
                              in_channels=audio_channels,
                              in_ratio=1,
                              out_channels=latent_size,
                              out_ratio=self.comp_ratio,
-                             input_labels=in_labels,
-                             output_labels=lat_out_labels,
+                             input_labels=audio_inputs,
+                             output_labels=latent_outputs,
                              test_buffer_size=self.comp_ratio)
-
         self.register_method("decode",
                              in_channels=latent_size,
                              in_ratio=self.comp_ratio,
                              out_channels=audio_channels,
                              out_ratio=1,
-                             input_labels=lat_in_labels,
-                             output_labels=out_labels,
+                             input_labels=latent_inputs,
+                             output_labels=audio_outputs,
                              test_buffer_size=self.comp_ratio)
-
         self.register_method("forward",
                              in_channels=audio_channels,
                              in_ratio=1,
                              out_channels=audio_channels,
                              out_ratio=1,
-                             input_labels=in_labels,
-                             output_labels=out_labels,
+                             input_labels=audio_inputs,
+                             output_labels=audio_outputs,
                              test_buffer_size=self.comp_ratio)
-
-    def _post_process_latent(self, z):
-        z = z - self.latent_mean.unsqueeze(-1)
-        return F.conv1d(z, self.latent_pca.unsqueeze(-1))
-
-    def _pre_process_latent(self, z):
-        z = F.conv1d(z, self.latent_pca.T.unsqueeze(-1))
-        return z + self.latent_mean.unsqueeze(-1)
 
     @torch.jit.export
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.model.encode_stream(x)
-        if self.latent_pca is not None:
-            z = self._post_process_latent(z)
-        return z
+        if self.streaming:
+            return self.model.encode_stream(x)
+        return self.model.encode_stats(x)[0]
 
     @torch.jit.export
     def encode_stats(
-            self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        mean, variance = self.model.encode_stats_stream(x)
-        if self.latent_pca is not None:
-            mean = self._post_process_latent(mean)
-            variance = F.conv1d(
-                variance,
-                self.latent_pca.square().unsqueeze(-1),
-            )
-        return mean, variance
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.streaming:
+            return self.model.encode_stats_stream(x)
+        return self.model.encode_stats(x)
 
     @torch.jit.export
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        if self.latent_pca is not None:
-            z = self._pre_process_latent(z)
-        return self.model.decode_stream(z)
+        if self.streaming:
+            return self.model.decode_stream(z)
+        return self.model.decode(z)
 
     @torch.jit.export
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decode(self.encode(x))
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+class ConditionedExportedAutoencoder(ExportedAutoencoder):
+
+    @torch.jit.export
+    def encode_conditioned(
+        self, x: torch.Tensor, conditioning: torch.Tensor
+    ) -> torch.Tensor:
+        if self.streaming:
+            return self.model.encode_stream(x, conditioning)
+        return self.model.encode_stats(x, conditioning)[0]
+
+    @torch.jit.export
+    def encode_stats_conditioned(
+        self, x: torch.Tensor, conditioning: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.streaming:
+            return self.model.encode_stats_stream(x, conditioning)
+        return self.model.encode_stats(x, conditioning)
+
+    @torch.jit.export
+    def forward_conditioned(
+        self, x: torch.Tensor, conditioning: torch.Tensor
+    ) -> torch.Tensor:
+        return self.decode(self.encode_conditioned(x, conditioning))
 
 
+@torch.no_grad()
 def main(argv):
+    del argv
     model_path = FLAGS.model_path
-    config = os.path.join(model_path, "config.gin")
+    gin.parse_config_file(os.path.join(model_path, "config.gin"))
+    checkpoint, step = _load_checkpoint(model_path, FLAGS.step)
+    test_samples = gin.query_parameter("%TIME_SIZE")
 
-    gin.parse_config_files_and_bindings([config], [])
+    probe = _configured_model(checkpoint)
+    audio_channels = probe.audio_channels
+    test = torch.zeros(1, audio_channels, test_samples)
+    mean, _ = probe.encode_stats(test)
+    latent_size = mean.shape[1]
+    latent_frames = mean.shape[-1]
+    comp_ratio = test_samples // latent_frames
 
-    d, step = _load_checkpoint(model_path, FLAGS.step)
-    ckpt = os.path.join(model_path, f"checkpoint{step}.pt")
-
-    # ── Offline export ──
-    cc.use_cached_conv(False)
-    with gin.unlock_config():
-        gin.bind_parameter("audio.StreamableSTFT.stream", False)
-
-    ae = AE_Spectral(ckpt=ckpt)
-
-    path_offline = os.path.join(model_path, "export.ts")
-    ae.export_to_ts(path_offline)
-    print(f"Exported offline model to {path_offline}")
-
-    # ── Streaming export ──
-    cc.use_cached_conv(True)
-    with gin.unlock_config():
-        gin.bind_parameter("audio.StreamableSTFT.stream", True)
-    ae_stream = AE_Spectral(ckpt=ckpt)
-
-    path_stream = os.path.join(model_path, "export_stream.ts")
-    ae_stream.export_to_ts(path_stream)
-    print(f"Exported streaming model to {path_stream}")
+    for streaming, filename in ((False, "export.ts"),
+                                (True, "export_stream.ts")):
+        cc.use_cached_conv(streaming)
+        with gin.unlock_config():
+            gin.bind_parameter("audio.StreamableSTFT.stream", streaming)
+        model = _configured_model(checkpoint)
+        wrapper = (ConditionedExportedAutoencoder
+                   if getattr(model, "condition_encoder", False)
+                   else ExportedAutoencoder)
+        exported = wrapper(model, audio_channels, latent_size, comp_ratio,
+                           streaming)
+        # Registration tests exercise the stream; save it with clean caches.
+        for module in exported.model.modules():
+            if hasattr(module, "reset_stream"):
+                module.reset_stream()
+        path = os.path.join(model_path, filename)
+        exported.export_to_ts(path)
+        print(f"Exported checkpoint {step} to {path}")
 
 
 if __name__ == "__main__":

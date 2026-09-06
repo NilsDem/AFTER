@@ -4,7 +4,7 @@ Ported from acids_codecs/networks/AE2D.py.
 Uses StreamableSTFT as time_transform (see after.autoencoder.audio).
 """
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -385,7 +385,9 @@ class AutoEncoder2D(nn.Module):
                 x,
                 return_all: bool = True,
                 freeze_encoder: bool = False,
-                look_ahead_steps: int = 0):
+                look_ahead_steps: int = 0,
+                forced_latent: Optional[torch.Tensor] = None,
+                return_encoder_stats: bool = False):
         if self.audio_channels == 2:
             x = self.pack_audio(x)
 
@@ -394,13 +396,35 @@ class AutoEncoder2D(nn.Module):
 
         if freeze_encoder:
             with torch.no_grad():
-                h = self._encode_features(h)
-                h, regloss = self.bottleneck(h)
+                encoded_features = self._encode_features(h)
         else:
-            h = self._encode_features(h)
-            h, regloss = self.bottleneck(h)
+            encoded_features = self._encode_features(h)
 
-        z = h.clone()
+        if forced_latent is not None or return_encoder_stats:
+            if self.use_vae:
+                encoder_mean, scale = encoded_features.chunk(2, dim=1)
+                encoder_std = torch.nn.functional.softplus(scale) + 1e-2
+                encoder_variance = encoder_std.square()
+            else:
+                if hasattr(self.bottleneck, "forward_stream"):
+                    encoder_mean = self.bottleneck.forward_stream(
+                        encoded_features)
+                else:
+                    encoder_mean = encoded_features
+                encoder_variance = torch.zeros_like(encoder_mean)
+
+        if forced_latent is not None:
+            regloss = encoded_features.new_zeros(())
+            if forced_latent.shape != encoder_mean.shape:
+                raise ValueError(
+                    "Forced latent shape must match the encoder distribution: "
+                    f"{tuple(forced_latent.shape)} != {tuple(encoder_mean.shape)}"
+                )
+            z = forced_latent
+        else:
+            h, regloss = self.bottleneck(encoded_features)
+            z = h
+        z = z.clone()
         if look_ahead_steps > 0:
             z = z[..., look_ahead_steps:]
             z = torch.cat((z, torch.zeros_like(z[..., :look_ahead_steps])),
@@ -414,6 +438,9 @@ class AutoEncoder2D(nn.Module):
             y = self.unpack_audio(y)
 
         if return_all:
+            if return_encoder_stats:
+                return (y, y_multiband, z, regloss, x_multiband,
+                        encoder_mean, encoder_variance)
             return y, y_multiband, z, regloss, x_multiband
         return y
 
@@ -428,15 +455,27 @@ class AutoEncoder2D(nn.Module):
             return h, x_multiband
         return h, regloss
 
-    @torch.jit.ignore
     def decode(self, z, with_multi: bool = False):
         h = self._decode_features(z)
         y = self.time_transform.inverse(h)
         if self.audio_channels == 2:
             y = self.unpack_audio(y)
-        if with_multi:
-            return y, h
+        if not torch.jit.is_scripting():
+            if with_multi:
+                return y, h
         return y
+
+    def encode_stats(
+            self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.audio_channels == 2:
+            x = self.pack_audio(x)
+        h = self._encode_features(self.time_transform(x))
+        if self.use_vae:
+            mean, scale = h.chunk(2, 1)
+            std = torch.nn.functional.softplus(scale) + 1e-2
+            return mean, std.square()
+        mean = self.bottleneck.forward_stream(h)
+        return mean, torch.zeros_like(mean)
 
     @torch.jit.export
     def encode_stream(self, x):

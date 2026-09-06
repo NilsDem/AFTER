@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import gin
 import torch
@@ -78,6 +78,13 @@ class SharedAttention(nn.Module):
         return self.merge(self.attend(q, k, v, mask))
 
 
+class AxialStage(nn.ModuleList):
+    def forward(self, x: torch.Tensor, streaming: bool = False) -> torch.Tensor:
+        for block in self:
+            x = block.forward_stream(x) if streaming else block(x)
+        return x
+
+
 class FrequencyAttention(nn.Module):
     def __init__(self, dim: int, heads: int, attention_impl: str):
         super().__init__()
@@ -144,14 +151,13 @@ class TemporalAttention(nn.Module):
                 )[None, :],
             )
         bias = self.relative_bias[:, lag.clamp(0, self.time_window - 1)]
-        invalid = torch.full_like(bias, torch.finfo(dtype).min)
+        invalid = torch.full_like(bias, -torch.inf)
         return torch.where(allowed[None, :, :], bias.to(dtype), invalid)
 
     def _project(self, x: torch.Tensor):
-        leading = x.shape[:-2]
         frames, dim = x.shape[-2:]
         q, k, v = self.attention.project(x.reshape(-1, frames, dim))
-        cache_shape = (*leading, self.heads, frames, self.head_dim)
+        cache_shape = list(x.shape[:-2]) + [self.heads, frames, self.head_dim]
         return (
             q.reshape(cache_shape),
             k.reshape(cache_shape),
@@ -168,7 +174,7 @@ class TemporalAttention(nn.Module):
         positions = torch.arange(frames, device=device)[:, None]
         allowed = offsets[None, :] >= self.time_window - 1 - positions
         bias = self.relative_bias.flip(-1)[:, None, :].expand(-1, frames, -1)
-        invalid = torch.full_like(bias, torch.finfo(dtype).min)
+        invalid = torch.full_like(bias, -torch.inf)
         return torch.where(allowed[None, :, :], bias.to(dtype), invalid)
 
     def _block_mask(
@@ -186,7 +192,7 @@ class TemporalAttention(nn.Module):
         if first and history:
             allowed = torch.logical_and(allowed, key_positions >= 0)
         bias = self.relative_bias.to(dtype)[:, lag.clamp(0, self.time_window - 1)]
-        invalid = torch.full_like(bias, torch.finfo(dtype).min)
+        invalid = torch.full_like(bias, -torch.inf)
         return torch.where(allowed[None, :, :], bias, invalid)
 
     def _attend_by_block(
@@ -241,7 +247,6 @@ class TemporalAttention(nn.Module):
         ]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        leading = x.shape[:-2]
         frames = x.shape[-2]
         q, k, v = self._project(x)
         q = q.reshape(-1, self.heads, frames, self.head_dim)
@@ -251,7 +256,7 @@ class TemporalAttention(nn.Module):
         if self.byblock:
             y = self._attend_by_block(q, k, v, frames)
             y = self.attention.merge(y)
-            return y.reshape(*leading, frames, self.dim)
+            return y.reshape(x.shape)
 
         history = self.time_window - 1
         k = F.pad(k, (0, 0, history, 0))
@@ -274,7 +279,7 @@ class TemporalAttention(nn.Module):
 
         y = y.squeeze(-2).permute(0, 2, 1, 3)
         y = self.attention.merge(y)
-        return y.reshape(*leading, frames, self.dim)
+        return y.reshape(x.shape)
 
     def forward_with_cache(
         self,
@@ -283,7 +288,6 @@ class TemporalAttention(nn.Module):
         v_cache: torch.Tensor,
         cache_valid: Optional[torch.Tensor] = None,
     ):
-        leading = x.shape[:-2]
         frames = x.shape[-2]
         cached = k_cache.shape[-2]
         q, k, v = self._project(x)
@@ -296,7 +300,7 @@ class TemporalAttention(nn.Module):
             full_v.reshape(-1, self.heads, cached + frames, self.head_dim),
             mask,
         )
-        y = self.attention.merge(y).reshape(*leading, frames, self.dim)
+        y = self.attention.merge(y).reshape(x.shape)
         keep = self.time_window - 1
         if keep:
             new_k = full_k[..., -keep:, :]
@@ -307,16 +311,16 @@ class TemporalAttention(nn.Module):
         return y, new_k, new_v
 
     def forward_stream(self, x: torch.Tensor) -> torch.Tensor:
-        leading = x.shape[:-2]
-        expected = (*leading, self.heads, self.head_dim)
+        leading = list(x.shape[:-2])
+        expected = leading + [self.heads, self.head_dim]
         if (
             self.k_cache.numel() == 0
-            or self.k_cache.shape[:-2] != expected[:-1]
+            or list(self.k_cache.shape[:-2]) != expected[:-1]
             or self.k_cache.shape[-1] != expected[-1]
             or self.k_cache.device != x.device
             or self.k_cache.dtype != x.dtype
         ):
-            shape = (*leading, self.heads, 0, self.head_dim)
+            shape = leading + [self.heads, 0, self.head_dim]
             self.k_cache = x.new_empty(shape)
             self.v_cache = x.new_empty(shape)
         y, k, v = self.forward_with_cache(x, self.k_cache, self.v_cache)
@@ -492,7 +496,7 @@ class CausalSmoothingConv(nn.Module):
         expected = (x.shape[0], x.shape[1], x.shape[2], self.time_history)
         if (
             self.cache.numel() == 0
-            or tuple(self.cache.shape) != expected
+            or list(self.cache.shape) != list(expected)
             or self.cache.device != x.device
             or self.cache.dtype != x.dtype
         ):
@@ -509,6 +513,8 @@ class CausalSmoothingConv(nn.Module):
 @gin.configurable
 class RofNet(nn.Module):
     """RoFormer-style streaming spectrogram autoencoder."""
+
+    __constants__ = ["separate_frequency_positions", "condition_encoder"]
 
     def __init__(
         self,
@@ -534,6 +540,8 @@ class RofNet(nn.Module):
         attention_impl: str = "sdpa",
         byblock: bool = False,
         block_size: Optional[int] = None,
+        separate_frequency_positions: bool = False,
+        condition_encoder: bool = False,
     ):
         super().__init__()
         dims = tuple(dims)
@@ -575,6 +583,8 @@ class RofNet(nn.Module):
             raise ValueError("block_size must be positive")
         self.use_vae = bool(use_vae)
         self.attention_impl = attention_impl
+        self.separate_frequency_positions = bool(separate_frequency_positions)
+        self.condition_encoder = bool(condition_encoder)
         self.time_transform = time_transform
         if bottleneck is None:
             bottleneck = VAEBottleneck() if use_vae else nn.Identity()
@@ -599,15 +609,28 @@ class RofNet(nn.Module):
         self.frequencies = tuple(frequencies)
         self.freq_final_dim = frequencies[-1]
 
-        self.input_projection = nn.Linear(in_size, dims[0])
+        encoder_input_size = in_size + (bottleneck_size if condition_encoder else 0)
+        self.input_projection = nn.Linear(encoder_input_size, dims[0])
         self.frequency_positions = nn.ParameterList(
             [nn.Parameter(torch.zeros(1, 1, f, d)) for f, d in zip(frequencies, dims)]
         )
+        if self.separate_frequency_positions:
+            self.decoder_frequency_positions = nn.ParameterList(
+                [
+                    nn.Parameter(torch.zeros(1, 1, f, d))
+                    for f, d in zip(frequencies, dims)
+                ]
+            )
+        else:
+            # Preserve the original state-dict layout for normal Roformer
+            # configs and existing checkpoints.
+            object.__setattr__(self, "decoder_frequency_positions",
+                               self.frequency_positions)
         self.encoder_stages = nn.ModuleList()
         self.decoder_stages = nn.ModuleList()
         for dim, depth, stage_heads in zip(dims, depths, heads):
             self.encoder_stages.append(
-                nn.ModuleList(
+                AxialStage(
                     [
                         AxialBlock(
                             dim,
@@ -623,7 +646,7 @@ class RofNet(nn.Module):
                 )
             )
             self.decoder_stages.append(
-                nn.ModuleList(
+                AxialStage(
                     [
                         AxialBlock(
                             dim,
@@ -738,15 +761,32 @@ class RofNet(nn.Module):
             return x
         return x.reshape(x.shape[0] // self.audio_channels, self.audio_channels, -1)
 
-    def _encode_features(self, spectrum: torch.Tensor, streaming: bool) -> torch.Tensor:
+    def _encode_features(
+        self,
+        spectrum: torch.Tensor,
+        streaming: bool,
+        conditioning: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         x = spectrum.permute(0, 3, 2, 1)
+        if self.condition_encoder:
+            if conditioning is None:
+                conditioning = x.new_zeros(
+                    x.shape[0], self.bottleneck_size, x.shape[1])
+            if (conditioning.shape[0] != x.shape[0]
+                    or conditioning.shape[1] != self.bottleneck_size
+                    or conditioning.shape[-1] != x.shape[1]):
+                raise ValueError(
+                    "Encoder conditioning must match the audio batch and frame count")
+            conditioning = conditioning.transpose(1, 2).unsqueeze(2)
+            conditioning = conditioning.expand(-1, -1, x.shape[2], -1)
+            x = torch.cat((x, conditioning), dim=-1)
         x = self.input_projection(x)
-        for index, stage in enumerate(self.encoder_stages):
-            x = x + self.frequency_positions[index]
-            for block in stage:
-                x = block.forward_stream(x) if streaming else block(x)
-            if index < len(self.frequency_merges):
-                x = self.frequency_merges[index](x)
+        for index, (stage, position) in enumerate(zip(self.encoder_stages, self.frequency_positions)):
+            x = x + position
+            x = stage.forward(x, streaming)
+            for merge_index, merge in enumerate(self.frequency_merges):
+                if merge_index == index:
+                    x = merge(x)
         batch, frames, frequencies, dim = x.shape
         x = self.middle_encode_projection(x.reshape(batch, frames, frequencies * dim))
         for block in self.middle_encoder:
@@ -761,13 +801,15 @@ class RofNet(nn.Module):
         x = self.spectral_projection(x).reshape(
             batch, frames, self.frequencies[-1], self.dims[-1]
         )
-        last = len(self.decoder_stages) - 1
-        for stage_index in range(last, -1, -1):
-            x = x + self.frequency_positions[stage_index]
-            for block in self.decoder_stages[stage_index]:
-                x = block.forward_stream(x) if streaming else block(x)
-            if stage_index:
-                x = self.frequency_expands[stage_index - 1](x)
+        positions = [position for position in self.frequency_positions]
+        if self.separate_frequency_positions:
+            positions = [position for position in self.decoder_frequency_positions]
+        for index, stage in enumerate(self.decoder_stages[::-1]):
+            x = x + positions[len(positions) - 1 - index]
+            x = stage.forward(x, streaming)
+            for expand_index, expand in enumerate(self.frequency_expands[::-1]):
+                if expand_index == index:
+                    x = expand.forward(x)
         x = self.output_projection(x).permute(0, 3, 2, 1)
         if self.smoothing is not None:
             x = self.smoothing.forward_stream(x) if streaming else self.smoothing(x)
@@ -780,6 +822,18 @@ class RofNet(nn.Module):
             return self.bottleneck(x)
         return self.bottleneck(x, return_mean=return_mean)
 
+    def _latent_distribution(self, encoded: torch.Tensor):
+        """Return the distribution represented by the encoder output."""
+        if isinstance(self.bottleneck, VAEBottleneck):
+            mean, scale = encoded.chunk(2, dim=1)
+            std = F.softplus(scale) + 1e-2
+            return mean, std.square()
+        if isinstance(self.bottleneck, TanhBottleneck):
+            mean = self.bottleneck.scale * torch.tanh(encoded)
+        else:
+            mean = encoded
+        return mean, torch.zeros_like(mean)
+
     def _stream_bottleneck(self, x: torch.Tensor) -> torch.Tensor:
         if isinstance(self.bottleneck, VAEBottleneck):
             return x.chunk(2, dim=1)[0]
@@ -789,35 +843,65 @@ class RofNet(nn.Module):
             return x
         return self.bottleneck.forward_stream(x)
 
+    @torch.jit.ignore
     def forward(
         self,
         x: torch.Tensor,
         return_all: bool = True,
         freeze_encoder: bool = False,
         look_ahead_steps: int = 0,
+        forced_latent: Optional[torch.Tensor] = None,
+        return_encoder_stats: bool = False,
+        encoder_conditioning: Optional[torch.Tensor] = None,
     ):
         packed = self._pack_audio(x)
         spectrum = self.time_transform(packed)
         x_multiband = spectrum.clone()
         if freeze_encoder:
             with torch.no_grad():
-                encoded = self._encode_features(spectrum, False)
-                encoded, regloss = self._apply_bottleneck(encoded)
+                encoded_features = self._encode_features(
+                    spectrum, False, encoder_conditioning)
         else:
-            encoded = self._encode_features(spectrum, False)
-            encoded, regloss = self._apply_bottleneck(encoded)
-        z = encoded.clone()
+            encoded_features = self._encode_features(
+                spectrum, False, encoder_conditioning)
+
+        if forced_latent is not None:
+            encoder_mean, encoder_variance = self._latent_distribution(
+                encoded_features)
+            regloss = encoded_features.new_zeros(())
+            if forced_latent.shape != encoder_mean.shape:
+                raise ValueError(
+                    "Forced latent shape must match the encoder distribution: "
+                    f"{tuple(forced_latent.shape)} != {tuple(encoder_mean.shape)}"
+                )
+            z = forced_latent
+        else:
+            encoded, regloss = self._apply_bottleneck(encoded_features)
+            z = encoded
+            if return_encoder_stats:
+                encoder_mean, encoder_variance = self._latent_distribution(
+                    encoded_features)
+        z = z.clone()
         if look_ahead_steps > 0:
             z = torch.cat((z[..., look_ahead_steps:], torch.zeros_like(z[..., :look_ahead_steps])), dim=-1)
         y_multiband = self._decode_features(z, False)
         y = self._unpack_audio(self.time_transform.inverse(y_multiband))
         if return_all:
+            if return_encoder_stats:
+                return (y, y_multiband, z, regloss, x_multiband,
+                        encoder_mean, encoder_variance)
             return y, y_multiband, z, regloss, x_multiband
         return y
 
-    def encode(self, x: torch.Tensor, with_multi: bool = False, return_mean: bool = False):
+    def encode(
+        self,
+        x: torch.Tensor,
+        with_multi: bool = False,
+        return_mean: bool = False,
+        encoder_conditioning: Optional[torch.Tensor] = None,
+    ):
         spectrum = self.time_transform(self._pack_audio(x))
-        encoded = self._encode_features(spectrum, False)
+        encoded = self._encode_features(spectrum, False, encoder_conditioning)
         result = self._apply_bottleneck(encoded, return_mean)
         if return_mean and len(result) == 3:
             latent, regloss, mean = result
@@ -825,28 +909,70 @@ class RofNet(nn.Module):
         latent, regloss = result
         return (latent, spectrum) if with_multi else (latent, regloss)
 
+    def encode_stats(
+        self,
+        x: torch.Tensor,
+        encoder_conditioning: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        spectrum = self.time_transform(self._pack_audio(x))
+        encoded = self._encode_features(spectrum, False, encoder_conditioning)
+        return self._latent_distribution(encoded)
+
     def decode(self, z: torch.Tensor, with_multi: bool = False):
         spectrum = self._decode_features(z, False)
         y = self._unpack_audio(self.time_transform.inverse(spectrum))
-        return (y, spectrum) if with_multi else y
+        if not torch.jit.is_scripting():
+            if with_multi:
+                return y, spectrum
+        return y
 
-    def encode_stream(self, x: torch.Tensor) -> torch.Tensor:
+    @torch.jit.export
+    def encode_stream(
+        self,
+        x: torch.Tensor,
+        encoder_conditioning: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         spectrum = self.time_transform.forward_stream(self._pack_audio(x))
-        encoded = self._encode_features(spectrum, True)
+        encoded = self._encode_features(spectrum, True, encoder_conditioning)
         return self._stream_bottleneck(encoded)
 
+    @torch.jit.export
+    def encode_stats_stream(
+        self,
+        x: torch.Tensor,
+        encoder_conditioning: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        spectrum = self.time_transform.forward_stream(self._pack_audio(x))
+        encoded = self._encode_features(spectrum, True, encoder_conditioning)
+        return self._latent_distribution(encoded)
+
+    @torch.jit.export
     def decode_stream(self, z: torch.Tensor) -> torch.Tensor:
         spectrum = self._decode_features(z, True)
         return self._unpack_audio(self.time_transform.inverse_stream(spectrum))
 
-    def forward_stream(self, x: torch.Tensor) -> torch.Tensor:
-        return self.decode_stream(self.encode_stream(x))
+    @torch.jit.export
+    def forward_stream(
+        self,
+        x: torch.Tensor,
+        encoder_conditioning: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.decode_stream(
+            self.encode_stream(x, encoder_conditioning))
 
+    @torch.jit.export
     def reset_stream_state(self) -> None:
         self.time_transform.reset_stream()
-        for module in self.modules():
-            if isinstance(module, TemporalAttention):
-                module.reset_stream()
+        for stage in self.encoder_stages:
+            for block in stage:
+                block.time_attention.reset_stream()
+        for stage in self.decoder_stages:
+            for block in stage:
+                block.time_attention.reset_stream()
+        for block in self.middle_encoder:
+            block.attention.reset_stream()
+        for block in self.middle_decoder:
+            block.attention.reset_stream()
         if self.smoothing is not None:
             self.smoothing.reset_stream()
 

@@ -18,6 +18,42 @@ import os
 import random
 
 
+class _CompileSafeWeightNorm:
+    """Weight-norm pre-hook that avoids the fused legacy CUDA backward."""
+
+    def __init__(self, name: str, dim: int):
+        self.name = name
+        self.dim = dim
+
+    def __call__(self, module: nn.Module, inputs) -> None:
+        del inputs
+        weight_v = getattr(module, self.name + "_v")
+        weight_g = getattr(module, self.name + "_g")
+        if self.dim == -1:
+            norm = torch.linalg.vector_norm(weight_v)
+        else:
+            norm_dims = tuple(i for i in range(weight_v.ndim)
+                              if i != self.dim)
+            norm = torch.linalg.vector_norm(weight_v,
+                                            dim=norm_dims,
+                                            keepdim=True)
+        setattr(module, self.name, weight_v * (weight_g / norm))
+
+
+def _replace_legacy_weight_norm_for_compile(module: nn.Module) -> int:
+    """Replace legacy hooks while retaining their parameters and state keys."""
+    replaced = 0
+    for child in module.modules():
+        for hook_id, hook in list(child._forward_pre_hooks.items()):
+            if (getattr(hook, "__module__", None)
+                    == "torch.nn.utils.weight_norm"
+                    and hook.__class__.__name__ == "WeightNorm"):
+                child._forward_pre_hooks[hook_id] = _CompileSafeWeightNorm(
+                    hook.name, hook.dim)
+                replaced += 1
+    return replaced
+
+
 class Dummy():
 
     def __getattr__(self, key):
@@ -46,7 +82,15 @@ class Trainer(nn.Module):
                  distributed: bool = False,
                  is_main_process: bool = True,
                  update_discriminator_every: int = 3,
-                 use_amp: bool = True):
+                 use_amp: bool = True,
+                 force_latent: bool = False,
+                 teacher_forcing_steps: int = 300000,
+                 latent_hop_size: int = 64,
+                 latent_kl_weight: float = 10.0,
+                 latent_variance_epsilon: float = 1e-6,
+                 condition_encoder: bool = False,
+                 conditioning_compute_delay: int = 1024,
+                 use_compile: bool = False):
 
         super().__init__()
 
@@ -63,6 +107,9 @@ class Trainer(nn.Module):
         ]).to(device) if len(multiband_distances) > 0 else []
 
         self.model = model.to(device)
+        self.compile_enabled = bool(use_compile)
+        if self.compile_enabled:
+            _replace_legacy_weight_norm_for_compile(self.model)
         self.device_ids = list(device_ids) if device_ids else None
         self.distributed = distributed
         self.is_main_process = is_main_process
@@ -79,6 +126,19 @@ class Trainer(nn.Module):
             self.model_dp = nn.DataParallel(self.model,
                                             device_ids=self.device_ids,
                                             output_device=self.device_ids[0])
+        self.compiled_model = None
+        if self.compile_enabled:
+            if not hasattr(torch, "compile"):
+                raise RuntimeError("torch.compile is unavailable in this PyTorch")
+            if self.model_ddp is not None:
+                training_model = self.model_ddp
+            elif self.model_dp is not None:
+                training_model = self.model_dp
+            else:
+                training_model = self.model
+            # The autoencoder operates on overlapping complex STFT views.
+            # Default mode keeps Inductor enabled without forcing CUDA graphs.
+            self.compiled_model = torch.compile(training_model, mode="default")
         self.discriminator = None if discriminator is None else discriminator.to(
             device)
         self.discriminator_dp = None
@@ -103,6 +163,20 @@ class Trainer(nn.Module):
         self.step = 0
         self.device = device
         self.update_discriminator_every = update_discriminator_every
+        self.force_latent = force_latent
+        self.teacher_forcing_steps = teacher_forcing_steps
+        self.latent_hop_size = latent_hop_size
+        self.latent_kl_weight = latent_kl_weight
+        self.latent_variance_epsilon = latent_variance_epsilon
+        self.condition_encoder = bool(condition_encoder)
+        self.conditioning_compute_delay = int(conditioning_compute_delay)
+        if self.condition_encoder and not self.force_latent:
+            raise ValueError(
+                "Encoder conditioning is only available with latent distillation")
+        if self.condition_encoder and not getattr(self.model,
+                                                  "condition_encoder", False):
+            raise ValueError(
+                "The model must enable condition_encoder for conditioned distillation")
         self.encoder_frozen = False
         self.device_type = torch.device(device).type
         self.use_amp = use_amp and self.device_type == "cuda"
@@ -114,6 +188,56 @@ class Trainer(nn.Module):
         self.warmup_regularisation_loss = 100000
 
         self.init_opt()
+
+    def _teacher_forcing_active(self):
+        return (self.force_latent and
+                (self.teacher_forcing_steps < 0 or
+                 self.step < self.teacher_forcing_steps))
+
+    def _unpack_batch(self, batch):
+        if torch.is_tensor(batch):
+            return batch, None, None, None
+        if not isinstance(batch, dict) or "waveform" not in batch:
+            raise TypeError(
+                "Autoencoder batches must be waveform tensors or dictionaries "
+                "containing a 'waveform' tensor")
+        return (batch["waveform"], batch.get("latent_mean"),
+                batch.get("latent_variance"),
+                batch.get("encoder_conditioning"))
+
+    def _move_batch_to_device(self, batch):
+        if torch.is_tensor(batch):
+            return batch.to(self.device, non_blocking=True)
+        return {
+            key: (value.to(self.device, non_blocking=True)
+                  if torch.is_tensor(value) else value)
+            for key, value in batch.items()
+        }
+
+    def _teacher_latent(self, mean, variance):
+        if mean is None or variance is None:
+            raise ValueError(
+                "Teacher forcing requires both latent_mean and "
+                "latent_variance in each batch")
+        if mean.shape != variance.shape:
+            raise ValueError(
+                "Teacher mean and variance must have the same shape, got "
+                f"{tuple(mean.shape)} and {tuple(variance.shape)}")
+        return mean + torch.randn_like(mean) * variance.clamp_min(0).sqrt()
+
+    def _latent_distribution_kl(self, student_mean, student_variance,
+                                teacher_mean, teacher_variance):
+        """KL(teacher || student), averaged over batch and time."""
+        epsilon = self.latent_variance_epsilon
+        student_variance = student_variance.clamp_min(epsilon)
+        teacher_variance = teacher_variance.clamp_min(epsilon)
+        elementwise = (
+            torch.log(student_variance / teacher_variance)
+            + (teacher_variance + (teacher_mean - student_mean).square())
+            / student_variance
+            - 1.
+        )
+        return 0.5 * elementwise.sum(dim=1).mean()
 
     def _autocast(self):
         return torch.autocast(device_type=self.device_type,
@@ -144,6 +268,8 @@ class Trainer(nn.Module):
             self.encoder_frozen = True
 
     def _model_forward(self, *args, use_wrapped=True, **kwargs):
+        if use_wrapped and self.compiled_model is not None:
+            return self.compiled_model(*args, **kwargs)
         if use_wrapped and self.model_ddp is not None:
             return self.model_ddp(*args, **kwargs)
         if use_wrapped and self.model_dp is not None:
@@ -234,6 +360,8 @@ class Trainer(nn.Module):
         for name in regularisation_names:
             names.append(f"regularisation_{name}")
             names.append(f"weighted_regularisation_{name}")
+        names.extend(["latent_distribution_kl",
+                      "weighted_latent_distribution_kl"])
 
         if True:  #self.model.pqmf_bands > 1:
             for loss in self.multiband_distances:
@@ -332,14 +460,30 @@ class Trainer(nn.Module):
                                                            self.warmup_steps)
 
     # @torch.compile(mode='max-autotune', disable=False)
-    def discrim_forward(self, x):
+    def discrim_forward(self,
+                        x,
+                        latent_mean=None,
+                        latent_variance=None,
+                        encoder_conditioning=None):
+
+        forward_kwargs = {
+            "return_all": True,
+            "freeze_encoder": self.step > self.freeze_encoder_step,
+            "look_ahead_steps": self.look_ahead_steps,
+        }
+        if self._teacher_forcing_active():
+            forward_kwargs["forced_latent"] = self._teacher_latent(
+                latent_mean, latent_variance)
+        if self.condition_encoder:
+            if encoder_conditioning is None:
+                raise ValueError(
+                    "Encoder conditioning requires teacher z in each batch")
+            forward_kwargs["encoder_conditioning"] = encoder_conditioning
 
         with torch.no_grad():
             y, y_multiband, z, regularisations, x_multiband = self._model_forward(
                 x,
-                return_all=True,
-                freeze_encoder=self.step > self.freeze_encoder_step,
-                look_ahead_steps=self.look_ahead_steps)
+                **forward_kwargs)
 
         loss_gen, loss_dis, loss_dis_dict = self._discriminator_forward(x, y)
         return loss_gen, loss_dis, loss_dis_dict
@@ -347,8 +491,13 @@ class Trainer(nn.Module):
     # @torch.compile(mode='max-autotune', disable=False)
     def ae_forward(self,
                    x,
+                   latent_mean=None,
+                   latent_variance=None,
+                   encoder_conditioning=None,
                    use_wrapped=True,
                    apply_branch_dropout=False):
+        distilling_latent = self.force_latent
+        teacher_forcing = self._teacher_forcing_active()
         forward_kwargs = {
             "return_all": True,
             "freeze_encoder": self.step > self.freeze_encoder_step,
@@ -357,10 +506,33 @@ class Trainer(nn.Module):
         if hasattr(self.model, "drop_fast_probability"):
             forward_kwargs["apply_branch_dropout"] = apply_branch_dropout
 
-        y, y_multiband, z, regularisations, x_multiband = self._model_forward(
-            x,
-            use_wrapped=use_wrapped,
-            **forward_kwargs)
+        if distilling_latent:
+            # Encoder/teacher distribution matching remains active after the
+            # decoder stops receiving teacher samples.
+            forward_kwargs["return_encoder_stats"] = True
+
+        if teacher_forcing:
+            forward_kwargs["forced_latent"] = self._teacher_latent(
+                latent_mean, latent_variance)
+        if self.condition_encoder:
+            if encoder_conditioning is None:
+                raise ValueError(
+                    "Encoder conditioning requires teacher z in each batch")
+            forward_kwargs["encoder_conditioning"] = encoder_conditioning
+
+        model_output = self._model_forward(x,
+                                           use_wrapped=use_wrapped,
+                                           **forward_kwargs)
+        if distilling_latent:
+            (y, y_multiband, z, regularisations, x_multiband, encoder_mean,
+             encoder_variance) = model_output
+            # Throughout distillation, teacher matching replaces the ordinary
+            # VAE prior regularisation. During teacher forcing reconstruction
+            # gradients only reach the decoder; afterwards the decoder uses
+            # the student sample and those gradients also reach the encoder.
+            regularisations = None
+        else:
+            y, y_multiband, z, regularisations, x_multiband = model_output
 
         if self.look_ahead_steps == 0:
             loss_ae, loss_out = self.compute_loss(x,
@@ -379,6 +551,27 @@ class Trainer(nn.Module):
                 y_multiband=None,
                 regularisations=regularisations)
 
+        if distilling_latent:
+            if latent_mean is None or latent_variance is None:
+                raise ValueError(
+                    "Latent distillation requires both latent_mean and "
+                    "latent_variance in each batch")
+            if encoder_mean.shape != latent_mean.shape:
+                raise ValueError(
+                    "Student and teacher latent distributions must match, got "
+                    f"{tuple(encoder_mean.shape)} and {tuple(latent_mean.shape)}")
+            latent_kl = self._latent_distribution_kl(
+                encoder_mean,
+                encoder_variance,
+                latent_mean,
+                latent_variance,
+            )
+            weighted_kl = self.latent_kl_weight * latent_kl
+            loss_ae = loss_ae + weighted_kl
+            loss_out["latent_distribution_kl"] = latent_kl.detach()
+            loss_out["weighted_latent_distribution_kl"] = weighted_kl.detach()
+            loss_out["total_loss"] = loss_ae.detach()
+
         if self.warmup and self.discriminator is not None:
             # Generator updates need gradients through the discriminator input,
             # but never through its parameters or DDP reducer.
@@ -390,9 +583,10 @@ class Trainer(nn.Module):
             loss_dis_dict = {}
         return loss_out, loss_ae, loss_gen, loss_dis_dict, z, y
 
-    def training_step(self, x):
+    def training_step(self, batch):
 
         self.train()
+        x, latent_mean, latent_variance, encoder_conditioning = self._unpack_batch(batch)
         self._maybe_freeze_encoder()
         if (self.discriminator is not None and self.warmup
             ) and self.step % self.update_discriminator_every == 0:
@@ -401,7 +595,8 @@ class Trainer(nn.Module):
 
             self.discriminator.requires_grad_(True)
             with self._autocast():
-                loss_gen, loss_dis, loss_dis_dict = self.discrim_forward(x)
+                loss_gen, loss_dis, loss_dis_dict = self.discrim_forward(
+                    x, latent_mean, latent_variance, encoder_conditioning)
 
             self.opt_dis.zero_grad(set_to_none=True)
             if loss_dis.ndim > 0:
@@ -418,7 +613,11 @@ class Trainer(nn.Module):
 
             with self._autocast():
                 loss_out, loss_ae, loss_gen, loss_dis_dict, z, y = self.ae_forward(
-                    x, apply_branch_dropout=True)
+                    x,
+                    latent_mean,
+                    latent_variance,
+                    encoder_conditioning,
+                    apply_branch_dropout=True)
 
             loss_out.update(loss_dis_dict)
             loss_gen = loss_gen + loss_ae
@@ -442,11 +641,16 @@ class Trainer(nn.Module):
         all_losses = {}
 
         with torch.no_grad():
-            for i, x in enumerate(validloader):
-                x = x.to(self.device, non_blocking=True)
+            for i, batch in enumerate(validloader):
+                batch = self._move_batch_to_device(batch)
+                x, latent_mean, latent_variance, encoder_conditioning = self._unpack_batch(batch)
                 with self._autocast():
                     losses, _, _, _, _, y = self.ae_forward(
-                        x, use_wrapped=not self.distributed)
+                        x,
+                        latent_mean,
+                        latent_variance,
+                        encoder_conditioning,
+                        use_wrapped=not self.distributed)
 
                 for k, v in losses.items():
                     all_losses[k] = v + all_losses.get(k, 0.)
@@ -526,13 +730,13 @@ class Trainer(nn.Module):
             if hasattr(trainloader, "sampler") and hasattr(
                     trainloader.sampler, "set_epoch"):
                 trainloader.sampler.set_epoch(epoch_idx)
-            for x in trainloader:
+            for batch in trainloader:
                 if self.step >= self.max_steps:
                     break
 
-                x = x.to(self.device, non_blocking=True)
+                batch = self._move_batch_to_device(batch)
 
-                all_losses = self.training_step(x)
+                all_losses = self.training_step(batch)
 
                 if self.is_main_process:
                     for k, value in all_losses.items():

@@ -4,7 +4,8 @@ from absl import app
 
 AVAILABLE_SCRIPTS = [
     'train', 'prepare_dataset', 'update_dataset', 'train_autoencoder',
-    'export_autoencoder', 'export', 'export_midi', "export_clock"
+    'distill_autoencoder', 'export_autoencoder', 'export', 'export_midi',
+    "export_clock"
 ]
 
 
@@ -41,6 +42,10 @@ def main():
         from after_scripts import train_autoencoder
         sys.argv[0] = train_autoencoder.__name__
         app.run(train_autoencoder.main)
+    elif command == 'distill_autoencoder':
+        from after_scripts import distill_autoencoder
+        sys.argv[0] = distill_autoencoder.__name__
+        app.run(distill_autoencoder.main)
     elif command == 'export_autoencoder':
         from after_scripts import export_autoencoder
         sys.argv[0] = export_autoencoder.__name__

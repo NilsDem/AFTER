@@ -122,6 +122,44 @@ after train_autoencoder \
   --gpu 0
 ```
 
+To distill an existing codec into the 64-sample-hop Roformer, prepare the
+dataset with both waveforms and dense encoder statistics, then use the
+dedicated command:
+
+```bash
+after prepare_dataset \
+  --input_path /audio/folder \
+  --output_path /dataset/path_distill \
+  --save_waveform True \
+  --emb_model_path old_codec/export.ts \
+  --latent_hop_size 64
+
+after distill_autoencoder \
+  --name distilled_roformer \
+  --db_path /dataset/path_distill \
+  --condition_encoder \
+  --teacher_forcing_steps 250000 \
+  --batch_size 6 \
+  --n_signal 131072 \
+  --gpu 0
+```
+
+With `--condition_encoder`, the native teacher sequence stored as `z` is
+linearly interpolated to the student's 64-sample rate and concatenated with
+the STFT features at the Roformer input. It is delayed by one teacher codec
+frame plus 1024 samples (5120 samples for a ratio-4096 teacher), with zeros on
+the left. Use `--conditioning_compute_delay` to change the extra 1024 samples.
+
+Before `teacher_forcing_steps`, the encoder minimizes the diagonal-Gaussian
+`KL(teacher || student)` while the decoder reconstructs audio from a sample of
+the stored teacher distribution. At that step, the decoder switches to samples
+from the student encoder, so reconstruction and adversarial gradients train the
+connected encoder/decoder path. The encoder continues to minimize
+`KL(teacher || student)` instead of being regularized toward the ordinary VAE
+prior. Use a negative value (the default) to feed teacher samples to the decoder
+for the whole run. The distillation command defaults to `AE_64_roformer`; pass
+`--config` to override it.
+
 Logs and checkpoints are saved to `./autoencoder_runs/<name>/` by default. You can train on several gpus (here 3) with 
 
 ```bash
@@ -144,13 +182,21 @@ CUDA_VISIBLE_DEVICES=0,1,2 torchrun --nproc_per_node=3  after_scripts/train_auto
 | `--stereo` | `False` | Train a stereo model |
 | `--restart` | `None` | Resume from this checkpoint step |
 | `--gpu` | `0` | CUDA GPU ID; `-1` for CPU |
+| `--compile` | `False` | Compile the autoencoder training forward with `torch.compile` (default mode) |
 | `--use_psts` | `True` | Enable pitch-shift / time-stretch augmentation |
+| `--force_latent` | `False` | Use stored dense teacher distributions (`distill_autoencoder` defaults this to `True`) |
+| `--teacher_forcing_steps` | `-1` | Switch the decoder from teacher to student samples at this step while retaining teacher KL; negative means never switch decoder input |
+| `--latent_hop_size` | `64` | Sample hop of the stored dense teacher distributions |
+| `--latent_kl_weight` | `1.0` | Weight of `KL(teacher || student)` between diagonal latent distributions |
+| `--condition_encoder` | `False` | Feed the delayed, interpolated native teacher `z` to the distilled encoder |
+| `--conditioning_compute_delay` | `1024` | Extra conditioning delay after one teacher codec frame, in audio samples |
 
 #### Available autoencoder configs
 
 | Config | Description |
 |---|---|
 | `AE_4096` | Spectral (STFT-based) codec, 32-dim latent, compression ratio 4096 |
+| `AE_64_roformer` | Roformer codec with one latent frame every 64 audio samples |
 
 #### Export
 
@@ -163,6 +209,23 @@ after export_autoencoder --model_path autoencoder_runs/AE_model_name
 This exports two TorchScript files into the run folder:
 - `export.ts` — offline inference
 - `export_stream.ts` — real-time streaming inference
+
+To compare a Roformer export against its Python checkpoint across buffer sizes:
+
+```bash
+python -m after_scripts.compare_autoencoder_export \
+  --model_path autoencoder_runs/guitar_roformer_test
+```
+
+Add `--audio /path/to/guitar.wav` to use a recording instead of the seeded test
+signal. The comparison checks latent mean/variance, uses shared VAE noise,
+and aligns audio for Mauer synthesis delay and the configured training lookahead.
+It tests 64–4096-sample buffers and changing buffer sizes within a stream;
+`--buffers` accepts other positive multiples of the latent hop.
+
+Conditioned Roformer exports also expose `encode_conditioned`,
+`encode_stats_conditioned`, and `forward_conditioned`. Their second tensor is
+the delayed teacher conditioning at the student's latent rate.
 
 ---
 
