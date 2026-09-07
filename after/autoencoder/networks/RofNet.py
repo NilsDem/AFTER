@@ -348,6 +348,8 @@ class FeedForward(nn.Module):
 
 
 class AxialBlock(nn.Module):
+    __constants__ = ["use_frequency_attention"]
+
     def __init__(
         self,
         dim: int,
@@ -357,10 +359,16 @@ class AxialBlock(nn.Module):
         attention_impl: str,
         byblock: bool = False,
         block_size: Optional[int] = None,
+        use_frequency_attention: bool = True,
     ):
         super().__init__()
-        self.freq_norm = nn.LayerNorm(dim)
-        self.freq_attention = FrequencyAttention(dim, heads, attention_impl)
+        self.use_frequency_attention = bool(use_frequency_attention)
+        if use_frequency_attention:
+            self.freq_norm = nn.LayerNorm(dim)
+            self.freq_attention = FrequencyAttention(dim, heads, attention_impl)
+        else:
+            self.freq_norm = nn.Identity()
+            self.freq_attention = nn.Identity()
         self.time_norm = nn.LayerNorm(dim)
         self.time_attention = TemporalAttention(
             dim, heads, time_window, attention_impl, byblock, block_size
@@ -369,12 +377,14 @@ class AxialBlock(nn.Module):
         self.mlp = FeedForward(dim, ff_mult)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.freq_attention(self.freq_norm(x))
+        if self.use_frequency_attention:
+            x = x + self.freq_attention(self.freq_norm(x))
         x = x + self.time_attention(self.time_norm(x).transpose(1, 2)).transpose(1, 2)
         return x + self.mlp(self.mlp_norm(x))
 
     def forward_stream(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.freq_attention(self.freq_norm(x))
+        if self.use_frequency_attention:
+            x = x + self.freq_attention(self.freq_norm(x))
         h = self.time_norm(x).transpose(1, 2)
         x = x + self.time_attention.forward_stream(h).transpose(1, 2)
         return x + self.mlp(self.mlp_norm(x))
@@ -386,7 +396,8 @@ class AxialBlock(nn.Module):
         v_cache: torch.Tensor,
         cache_valid: torch.Tensor,
     ):
-        x = x + self.freq_attention(self.freq_norm(x))
+        if self.use_frequency_attention:
+            x = x + self.freq_attention(self.freq_norm(x))
         h, new_k, new_v = self.time_attention.forward_with_cache(
             self.time_norm(x).transpose(1, 2), k_cache, v_cache, cache_valid
         )
@@ -542,6 +553,7 @@ class RofNet(nn.Module):
         block_size: Optional[int] = None,
         separate_frequency_positions: bool = False,
         condition_encoder: bool = False,
+        skip_frequency_attention_stages: int = 0,
     ):
         super().__init__()
         dims = tuple(dims)
@@ -554,6 +566,11 @@ class RofNet(nn.Module):
             raise ValueError("freq_ratios must contain one entry between each stage")
         if not dims:
             raise ValueError("at least one spectral stage is required")
+        if not 0 <= skip_frequency_attention_stages <= len(dims):
+            raise ValueError(
+                "skip_frequency_attention_stages must be between 0 and "
+                f"the number of stages ({len(dims)})"
+            )
         for dim, stage_heads in zip(dims, heads):
             if dim % stage_heads:
                 raise ValueError(f"embedding dimension {dim} is not divisible by {stage_heads} heads")
@@ -585,6 +602,8 @@ class RofNet(nn.Module):
         self.attention_impl = attention_impl
         self.separate_frequency_positions = bool(separate_frequency_positions)
         self.condition_encoder = bool(condition_encoder)
+        self.skip_frequency_attention_stages = int(
+            skip_frequency_attention_stages)
         self.time_transform = time_transform
         if bottleneck is None:
             bottleneck = VAEBottleneck() if use_vae else nn.Identity()
@@ -628,7 +647,10 @@ class RofNet(nn.Module):
                                self.frequency_positions)
         self.encoder_stages = nn.ModuleList()
         self.decoder_stages = nn.ModuleList()
-        for dim, depth, stage_heads in zip(dims, depths, heads):
+        for stage_index, (dim, depth, stage_heads) in enumerate(
+                zip(dims, depths, heads)):
+            use_frequency_attention = (
+                stage_index >= self.skip_frequency_attention_stages)
             self.encoder_stages.append(
                 AxialStage(
                     [
@@ -640,6 +662,7 @@ class RofNet(nn.Module):
                             attention_impl,
                             self.byblock,
                             self.block_size,
+                            use_frequency_attention,
                         )
                         for _ in range(depth)
                     ]
@@ -656,6 +679,7 @@ class RofNet(nn.Module):
                             attention_impl,
                             self.byblock,
                             self.block_size,
+                            use_frequency_attention,
                         )
                         for _ in range(depth)
                     ]
@@ -980,7 +1004,11 @@ class RofNet(nn.Module):
 
 
 class StatelessStreamingRofNet(nn.Module):
-    """Functional fixed-callback streaming wrapper with one flat state tensor."""
+    """Functional streaming wrapper with one flat state tensor.
+
+    Audio length can vary at runtime in multiples of the STFT hop size.
+    ``callback_samples`` supplies the default export/benchmark shape only.
+    """
 
     def __init__(
         self, model: RofNet, callback_samples: int, mode: str = "forward"
@@ -1128,20 +1156,12 @@ class StatelessStreamingRofNet(nn.Module):
         history = self._cache(state, index)
         signal = torch.cat((history, x), dim=-1)
         updates.append(signal[..., -(self.transform.nfft - self.transform.hop_size) :])
-        frames = torch.stack(
-            [
-                signal[..., start : start + self.transform.nfft]
-                for start in range(
-                    0,
-                    self.frames_per_call * self.transform.hop_size,
-                    self.transform.hop_size,
-                )
-            ],
-            dim=-2,
-        )
-        frames = frames * self.transform.analysis_window
-        real = torch.matmul(frames, self.analysis_cos.t()).transpose(-1, -2)
-        imag = torch.matmul(frames, self.analysis_sin.t()).transpose(-1, -2)
+        # Strided DFT convolutions avoid a Python loop over the callback length,
+        # so a traced Core ML graph retains a dynamic time dimension.
+        real = F.conv1d(signal, (self.analysis_cos * self.transform.analysis_window)[:, None],
+                        stride=self.transform.hop_size).unsqueeze(1)
+        imag = F.conv1d(signal, (self.analysis_sin * self.transform.analysis_window)[:, None],
+                        stride=self.transform.hop_size).unsqueeze(1)
         if self.transform.normalize:
             real, imag = self._normalize(real, imag)
         skip = self.transform.skip_features
@@ -1182,16 +1202,7 @@ class StatelessStreamingRofNet(nn.Module):
         hop = self.transform.hop_size
         first, second = support[..., :hop], support[..., hop:]
         pending = self._cache(state, index)
-        if self.frames_per_call == 1:
-            output = first + pending.unsqueeze(-2)
-        else:
-            output = torch.cat(
-                (
-                    first[..., :1, :] + pending.unsqueeze(-2),
-                    first[..., 1:, :] + second[..., :-1, :],
-                ),
-                dim=-2,
-            )
+        output = first + torch.cat((pending.unsqueeze(-2), second), dim=-2)[..., :-1, :]
         updates.append(second[..., -1, :])
         return output.reshape(batch, channels, frame_count * hop), index + 1
 
@@ -1262,8 +1273,11 @@ class StatelessStreamingRofNet(nn.Module):
         x = self.model.spectral_projection(x).reshape(
             batch, frames, self.model.frequencies[-1], self.model.dims[-1]
         )
+        positions = self.model.frequency_positions
+        if self.model.separate_frequency_positions:
+            positions = self.model.decoder_frequency_positions
         for stage_index in range(len(self.model.decoder_stages) - 1, -1, -1):
-            x = x + self.model.frequency_positions[stage_index]
+            x = x + positions[stage_index]
             for block in self.model.decoder_stages[stage_index]:
                 x, index = self._cached_axial(block, x, state, index, valid, updates)
             if stage_index:
@@ -1300,7 +1314,7 @@ class StatelessStreamingRofNet(nn.Module):
         valid = self._cache(state, index)
         index += 1
         updates.append(
-            torch.clamp(valid + self.frames_per_call, max=self.model.time_window - 1)
+            torch.clamp(valid + x.shape[-1], max=self.model.time_window - 1)
         )
         if self.mode != "decode":
             x, index = self._encode_cached(x, state, index, valid, updates)

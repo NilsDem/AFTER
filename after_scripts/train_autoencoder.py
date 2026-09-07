@@ -6,6 +6,7 @@ import os
 import pathlib
 
 from after.autoencoder import Trainer
+from after.autoencoder.latent_resampling import causal_linear_upsample
 from after.autoencoder.transforms import PhaseMangle, RandomGain, PitchShift, TimeStretch, TransformPipeline
 from after.dataset import SimpleDataset, CombinedDataset
 from after.utils import resolve_device
@@ -74,6 +75,10 @@ flags.DEFINE_bool(
 flags.DEFINE_integer(
     "conditioning_compute_delay", 1024,
     "Extra audio-sample delay added after one teacher codec frame.")
+flags.DEFINE_bool(
+    "causal_conditioning", True,
+    "Use delayed causal linear interpolation for teacher conditioning. Old "
+    "runs without this setting retain their legacy centered interpolation.")
 
 
 def add_gin_extension(config_name: str) -> str:
@@ -89,7 +94,8 @@ def make_collate_fn(num_signal,
                     force_latent=False,
                     latent_hop_size=64,
                     condition_encoder=False,
-                    conditioning_compute_delay=1024):
+                    conditioning_compute_delay=1024,
+                    causal_conditioning=True):
     """Build a collator, preserving dense-latent/audio crop alignment."""
     if condition_encoder and not force_latent:
         raise ValueError("Encoder conditioning is only available in distillation mode")
@@ -152,20 +158,30 @@ def make_collate_fn(num_signal,
                         raise ValueError(
                             "Teacher codec ratio must be present in "
                             "z_dense_window_size and divisible by the student hop")
-                    total_delay = teacher_hop + conditioning_compute_delay
-                    if total_delay % latent_hop_size:
-                        raise ValueError(
-                            "Teacher ratio plus conditioning delay must be "
-                            "divisible by the student hop")
                     teacher_z = torch.from_numpy(
                         np.asarray(item["z"], dtype=np.float32)).unsqueeze(0)
-                    dense_z = torch.nn.functional.interpolate(
-                        teacher_z,
-                        size=available_steps,
-                        mode="linear",
-                        align_corners=False,
-                    )[0]
-                    delay_steps = total_delay // latent_hop_size
+                    if causal_conditioning:
+                        if conditioning_compute_delay % latent_hop_size:
+                            raise ValueError(
+                                "Conditioning compute delay must be divisible "
+                                "by the student hop")
+                        dense_z = causal_linear_upsample(
+                            teacher_z,
+                            teacher_hop // latent_hop_size,
+                            available_steps,
+                        )[0]
+                        delay_steps = (
+                            conditioning_compute_delay // latent_hop_size)
+                    else:
+                        total_delay = teacher_hop + conditioning_compute_delay
+                        if total_delay % latent_hop_size:
+                            raise ValueError(
+                                "Teacher ratio plus conditioning delay must be "
+                                "divisible by the student hop")
+                        dense_z = torch.nn.functional.interpolate(
+                            teacher_z, size=available_steps, mode="linear",
+                            align_corners=False)[0]
+                        delay_steps = total_delay // latent_hop_size
                     dense_z = torch.nn.functional.pad(
                         dense_z, (delay_steps, 0))[..., :dense_z.shape[-1]]
                     encoder_conditioning.append(
@@ -267,6 +283,7 @@ def main(argv):
             "latent_kl_weight": FLAGS.latent_kl_weight,
             "condition_encoder": FLAGS.condition_encoder,
             "conditioning_compute_delay": FLAGS.conditioning_compute_delay,
+            "causal_conditioning": FLAGS.causal_conditioning,
         }
         for parameter, value in distillation_flags.items():
             # On resume, the operative config is authoritative unless the
@@ -342,6 +359,7 @@ def main(argv):
         latent_hop_size=trainer.latent_hop_size,
         condition_encoder=trainer.condition_encoder,
         conditioning_compute_delay=trainer.conditioning_compute_delay,
+        causal_conditioning=trainer.causal_conditioning,
     )
 
     ## DATASET

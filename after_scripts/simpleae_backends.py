@@ -112,13 +112,13 @@ class CoreMLRuntime:
         state: torch.Tensor,
         input_name: str,
         output_name: str,
+        compute_units: str = "all",
     ):
         import coremltools as ct
         compiled_path = path.with_suffix(".mlmodelc")
-        # self.model = ct.models.MLModel(str(path))
         self.model = ct.models.CompiledMLModel(
             str(compiled_path),
-            compute_units=ct.ComputeUnit.ALL,
+            compute_units=getattr(ct.ComputeUnit, compute_units.upper()),
         )
         self.initial_state = state.numpy()
         self.state = self.initial_state.copy()
@@ -135,18 +135,20 @@ class CoreMLRuntime:
 
 
 class CoreMLStatefulRuntime:
-    def __init__(self, path: Path, input_name: str, output_name: str):
+    def __init__(
+        self,
+        path: Path,
+        input_name: str,
+        output_name: str,
+        compute_units: str = "all",
+    ):
         import coremltools as ct
 
-        # self.model = ct.models.MLModel(str(path))
         compiled_path = path.with_suffix(".mlmodelc")
-                # self.model = ct.models.MLModel(str(path))
         self.model = ct.models.CompiledMLModel(
-                    str(compiled_path),
-                    compute_units=ct.ComputeUnit.ALL,
-                )
-
-        
+            str(compiled_path),
+            compute_units=getattr(ct.ComputeUnit, compute_units.upper()),
+        )
         self.state = self.model.make_state()
         self.input_name = input_name
         self.output_name = output_name
@@ -305,7 +307,7 @@ def export_coreml(
             ct.TensorType(name="state_out"),
         ],
         minimum_deployment_target=ct.target.macOS15,
-        compute_units=ct.ComputeUnit.CPU_ONLY,
+        compute_units=ct.ComputeUnit.ALL,
     )
     converted.save(str(path))
     compiled_path = path.with_suffix(".mlmodelc")
@@ -477,6 +479,7 @@ def load_backend(
     model: torch.nn.Module,
     state: torch.Tensor,
     threads: int,
+    coreml_compute_units: str = "all",
 ) -> Runtime:
     if backend == "torch":
         return TorchRuntime(model, state)
@@ -488,10 +491,14 @@ def load_backend(
                 path, state, threads, model.input_name, model.output_name
             )
         if backend == "coreml":
-            return CoreMLRuntime(path, state, model.input_name, model.output_name)
+            return CoreMLRuntime(
+                path, state, model.input_name, model.output_name,
+                coreml_compute_units,
+            )
         if backend == "coreml-stateful":
             return CoreMLStatefulRuntime(
-                path, model.input_name, model.output_name
+                path, model.input_name, model.output_name,
+                coreml_compute_units,
             )
         if backend == "aoti-profile":
             return AOTIProfileRuntime(path, state)

@@ -10,7 +10,7 @@ import cached_conv
 
 # Model
 SR = 44100
-AUDIO_CHANNELS = None
+AUDIO_CHANNELS = 1
 LATENT_SIZE = 16
 TIME_SIZE = 131072
 
@@ -24,16 +24,16 @@ REGULARISATION_WARMUP = 10000
 ## NETWORK 
 CHANNELS = [16, 16, 32, 32, 32, 32, 32]
 KERNEL_SIZE = 3
-TIME_RATIOS = [1, 2, 2, 1, 1, 1, 1]
-FREQ_RATIOS = [4, 2, 2, 2, 2, 2, 2]
-NFFT = 1024
-HOP = 64
+TIME_RATIOS = [1, 1, 1, 1, 1, 1, 1]
+FREQ_RATIOS = [2, 2, 2, 2, 2, 2, 2]
+NFFT = 512
+HOP = 256
 
 audio.CausalMauerSTFT:
     nfft = %NFFT
     hop_size = %HOP
-    synthesis_length = 128
-    zero_length=64
+    synthesis_length = 512
+    zero_length=0
     skip_features = -1
     normalize = True
 

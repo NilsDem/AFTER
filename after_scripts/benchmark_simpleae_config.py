@@ -182,7 +182,13 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--reps", type=int, default=50)
-    parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument("--trials", type=int, default=1)
+    parser.add_argument(
+        "--coreml-compute-units",
+        choices=("all", "cpu_and_gpu", "cpu_only", "cpu_and_ne"),
+        default="all",
+        help="Core ML devices used at runtime; cpu_and_gpu bypasses ANE compilation.",
+    )
     parser.add_argument(
         "--buffer-sizes",
         type=int,
@@ -256,7 +262,8 @@ def main() -> None:
                         raise FileNotFoundError(artifact)
 
                 runtime = load_backend(
-                    backend, artifact, portable, state, args.threads
+                    backend, artifact, portable, state, args.threads,
+                    args.coreml_compute_units,
                 )
                 with quiet_native_output():
                     validate(runtime, portable, x, state, backend)

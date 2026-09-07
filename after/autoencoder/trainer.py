@@ -90,6 +90,7 @@ class Trainer(nn.Module):
                  latent_variance_epsilon: float = 1e-6,
                  condition_encoder: bool = False,
                  conditioning_compute_delay: int = 1024,
+                 causal_conditioning: bool = False,
                  use_compile: bool = False):
 
         super().__init__()
@@ -170,6 +171,7 @@ class Trainer(nn.Module):
         self.latent_variance_epsilon = latent_variance_epsilon
         self.condition_encoder = bool(condition_encoder)
         self.conditioning_compute_delay = int(conditioning_compute_delay)
+        self.causal_conditioning = bool(causal_conditioning)
         if self.condition_encoder and not self.force_latent:
             raise ValueError(
                 "Encoder conditioning is only available with latent distillation")
