@@ -7,6 +7,7 @@ Modes:
   --midi                        → attach MIDI annotations
 """
 import copy
+import json
 import os
 import pathlib
 import pickle
@@ -16,11 +17,13 @@ import librosa
 import lmdb
 import numpy as np
 import pretty_midi
+import soundfile as sf
 import torch
 from absl import app, flags
 from tqdm import tqdm
 
 from after.dataset.audio_example import AudioExample
+from after.dataset.lazy_waveform import LAZY_MANIFEST, LAZY_METADATA
 from after.dataset.parsers import get_parser
 from after.dataset.transforms import AudioAugment, AudioDescriptors, BasicPitchPytorch
 from after.utils import resolve_device
@@ -32,7 +35,7 @@ FLAGS = flags.FLAGS
 flags.DEFINE_multi_string(
     'input_path',
     None,
-    'Input directories; one LMDB is created per directory',
+    'Input directories; one LMDB or lazy manifest is created per directory',
     required=True)
 flags.DEFINE_string('output_path', '.', 'Root output directory')
 flags.DEFINE_string('parser', 'simple_audio',
@@ -53,6 +56,9 @@ flags.DEFINE_bool('normalize', True, 'Peak-normalize each file')
 flags.DEFINE_bool('cut_silences', False, 'Skip silent chunks')
 flags.DEFINE_bool('save_waveform', False,
                   'Store original int16 waveform in DB')
+flags.DEFINE_bool(
+    'lazy', False,
+    'Create a SoundFile waveform manifest instead of an LMDB. Autoencoder only.')
 flags.DEFINE_bool(
     'stereo', False,
     'Store stereo waveforms (2-channel); mono files are duplicated to stereo')
@@ -119,6 +125,13 @@ def normalize_signal(x, max_gain_db=30, gain_margin=0.9):
         return x
     log_gain = min(max_gain_db, -20 * np.log10(peak))
     return gain_margin * x * 10**(log_gain / 20)
+
+
+def normalization_gain(peak, max_gain_db=30, gain_margin=0.9):
+    if peak == 0:
+        return 1.0
+    log_gain = min(max_gain_db, -20 * np.log10(peak))
+    return float(gain_margin * 10**(log_gain / 20))
 
 
 def pad_or_tile(audio, num_signal, pad_mode):
@@ -573,6 +586,106 @@ def flush_chunk_batch(entries, env, cur_index, device, emb_model, z_length,
 # ---------------------------------------------------------------------------
 
 
+def _lazy_channels(audio, channels):
+    audio = audio.T
+    if channels == 1:
+        return audio.mean(axis=0, keepdims=True)
+    if audio.shape[0] == 1:
+        return np.repeat(audio, 2, axis=0)
+    if audio.shape[0] != 2:
+        raise ValueError(
+            f"stereo mode supports mono or stereo files, not {audio.shape[0]} channels")
+    return audio
+
+
+def _lazy_file_gain(path, source_sample_rate, target_sample_rate, channels):
+    """One-time full-file prepass needed for file-level peak normalization."""
+    audio, _ = sf.read(path, dtype="float32", always_2d=True)
+    audio = _lazy_channels(audio, channels)
+    if source_sample_rate != target_sample_rate:
+        from torchaudio.functional import resample
+        audio = resample(torch.from_numpy(np.ascontiguousarray(audio)),
+                         source_sample_rate, target_sample_rate).numpy()
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    return normalization_gain(peak)
+
+
+def process_lazy_dataset(input_path, output_path):
+    """Write one lightweight manifest; no waveforms or crop boundaries."""
+    audio_files, _, _ = get_parser(FLAGS.parser)(input_path, None, FLAGS.ext,
+                                                 FLAGS.exclude, FLAGS.include)
+    input_root = pathlib.Path(input_path).resolve()
+    output_root = pathlib.Path(output_path).resolve()
+    records = []
+    failures = []
+
+    print("Scanning audio metadata (no waveform decoding)...")
+    for file in tqdm(sorted(audio_files), desc=input_root.name):
+        try:
+            info = sf.info(file)
+            target_frames = round(info.frames * FLAGS.sample_rate /
+                                  info.samplerate)
+            if target_frames < 0.5 * FLAGS.num_signal:
+                print(f"Too short, skipping: {file}")
+                continue
+            if FLAGS.stereo and info.channels not in (1, 2):
+                raise ValueError(
+                    f"stereo mode supports mono or stereo files, not {info.channels} channels")
+            records.append({
+                "path": os.path.relpath(pathlib.Path(file).resolve(), input_root),
+                "num_frames": int(info.frames),
+                "sample_rate": int(info.samplerate),
+                "channels": int(info.channels),
+                "duration": float(info.frames / info.samplerate),
+            })
+        except Exception as error:
+            failures.append((file, error))
+
+    if FLAGS.normalize:
+        print("Normalization prepass (one full decode per indexed file)...")
+        normalized_records = []
+        for record in tqdm(records, desc="normalization"):
+            file = input_root / record["path"]
+            try:
+                record["normalization_gain"] = _lazy_file_gain(
+                    file, record["sample_rate"], FLAGS.sample_rate,
+                    2 if FLAGS.stereo else 1)
+                normalized_records.append(record)
+            except Exception as error:
+                failures.append((str(file), error))
+        records = normalized_records
+
+    if not records:
+        raise ValueError(f"No valid audio files found in {input_path}")
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    if (output_root / "data.mdb").exists():
+        raise ValueError(
+            f"{output_path} already contains an LMDB; use a separate lazy output")
+
+    metadata = {
+        "format": "after_lazy_waveform",
+        "version": 1,
+        "source_root": os.path.relpath(input_root, output_root),
+        "sample_rate": FLAGS.sample_rate,
+        "channels": 2 if FLAGS.stereo else 1,
+        "normalized": FLAGS.normalize,
+        "epoch_chunk_size": FLAGS.num_signal,
+    }
+    with open(output_root / LAZY_METADATA, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+        handle.write("\n")
+    with open(output_root / LAZY_MANIFEST, "w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+    duration = sum(record["duration"] for record in records)
+    print(f"  {len(records)} files indexed in {output_path}, "
+          f"representing {duration / 3600:.3f} hours of audio.")
+    for file, error in failures:
+        print(f"  Skipped {file}: {error}")
+
+
 def process_db(input_path, output_path, device, emb_model, z_length, ae_ratio,
                desc_model, bp, structure_aug, timbre_aug):
 
@@ -707,7 +820,24 @@ def process_db(input_path, output_path, device, emb_model, z_length, ae_ratio,
 
 
 def main(_):
-    
+    if FLAGS.lazy:
+        if FLAGS.parser != "simple_audio" or FLAGS.emb_model_path is not None \
+                or FLAGS.midi or FLAGS.descriptors or FLAGS.latent_hop_size:
+            raise ValueError(
+                "--lazy supports waveform-only autoencoder datasets: use the "
+                "simple_audio parser without MIDI, descriptors, embeddings, or "
+                "dense latent statistics")
+        if FLAGS.cut_silences:
+            raise ValueError("--cut_silences is not supported with --lazy")
+        for input_path in FLAGS.input_path:
+            name = pathlib.Path(input_path).name
+            out_dir = os.path.join(
+                FLAGS.output_path,
+                name) if len(FLAGS.input_path) > 1 else FLAGS.output_path
+            print(f"\n--- {name}: {input_path} → {out_dir} ---")
+            process_lazy_dataset(input_path, out_dir)
+        return
+
     device = resolve_device(FLAGS.device, FLAGS.gpu)
 
     print(f"Device: {device}")

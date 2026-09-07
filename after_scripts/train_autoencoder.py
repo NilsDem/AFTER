@@ -8,7 +8,10 @@ import pathlib
 from after.autoencoder import Trainer
 from after.autoencoder.latent_resampling import causal_linear_upsample
 from after.autoencoder.transforms import PhaseMangle, RandomGain, PitchShift, TimeStretch, TransformPipeline
-from after.dataset import SimpleDataset, CombinedDataset
+from after.dataset import (CombinedDataset, CombinedLazyWaveformDataset,
+                           LazyWaveformDataset, SimpleDataset,
+                           is_lazy_waveform_dataset)
+from after.dataset.lazy_waveform import LAZY_MANIFEST
 from after.utils import resolve_device
 
 from absl import app, flags
@@ -369,15 +372,19 @@ def main(argv):
         if not folder.is_dir():
             raise ValueError(
                 f"--db_folder '{FLAGS.db_folder}' is not a directory.")
-        subdirs = sorted([p for p in folder.iterdir() if p.is_dir()])
-        if subdirs:
-            db_paths += [str(p) for p in subdirs]
-        elif (folder / "data.mdb").exists():
+        if is_lazy_waveform_dataset(folder) or (folder / "data.mdb").exists():
             db_paths += [str(folder)]
         else:
-            raise ValueError(
-                f"--db_folder '{FLAGS.db_folder}' contains no sub-directories and "
-                "does not look like an LMDB dataset.")
+            subdirs = sorted([p for p in folder.iterdir() if p.is_dir()])
+            dataset_subdirs = [
+                p for p in subdirs
+                if is_lazy_waveform_dataset(p) or (p / "data.mdb").exists()
+            ]
+            if dataset_subdirs:
+                db_paths += [str(p) for p in dataset_subdirs]
+            else:
+                raise ValueError(
+                    f"--db_folder '{FLAGS.db_folder}' contains no lazy or LMDB datasets.")
 
     if not db_paths:
         raise ValueError("No dataset provided. Use --db_path or --db_folder.")
@@ -388,49 +395,92 @@ def main(argv):
     print("\n=== Datasets ===")
     total_entries = 0
     for p in db_paths:
-        try:
+        if is_lazy_waveform_dataset(p):
+            with open(pathlib.Path(p) / LAZY_MANIFEST,
+                      encoding="utf-8") as handle:
+                n = sum(1 for line in handle if line.strip())
+            label = f"  {n:>7,} files (lazy)"
+        else:
             n = len(SimpleDataset(path=p))
-        except Exception:
-            n = -1
-        label = f"  {n:>7,} entries" if n >= 0 else "  (could not read)"
+            label = f"  {n:>7,} entries"
         print(f"  {pathlib.Path(p).name:<40} {label}  [{p}]")
         if n > 0:
             total_entries += n
-    print(f"  {'TOTAL':<40}   {total_entries:>7,} entries")
+    print(f"  {'TOTAL':<40}   {total_entries:>7,} files/entries")
     print("================\n")
 
-    path_dict = {f: {"name": f, "path": f} for f in db_paths}
     filter_dict = {
         "include": FLAGS.filter_include,
         "exclude": FLAGS.filter_exclude
     }
 
-    dataset_keys = (["waveform", "z_dense_mean", "z_dense_variance"]
-                    if force_latent else ["waveform"])
-    if trainer.condition_encoder:
-        dataset_keys.append("z")
-    dataset = CombinedDataset(
-        path_dict=path_dict,
-        keys=dataset_keys,
-        freqs="estimate" if FLAGS.freqs is None else FLAGS.freqs,
-        config="train",
-        init_cache=FLAGS.use_cache,
-        filter=filter_dict,
-    )
-    train_sampler = dataset.get_sampler()
+    lazy_paths = [path for path in db_paths if is_lazy_waveform_dataset(path)]
+    if lazy_paths and len(lazy_paths) != len(db_paths):
+        raise ValueError("Lazy waveform manifests and LMDB datasets cannot be mixed")
 
-    if use_validation:
-        valset = CombinedDataset(
+    if lazy_paths:
+        if force_latent:
+            raise ValueError("Lazy datasets support waveform autoencoder training only")
+        if FLAGS.use_cache:
+            raise ValueError("--use_cache is not supported for lazy datasets")
+
+        frequencies = "estimate" if FLAGS.freqs is None else FLAGS.freqs
+        train_datasets = [
+            LazyWaveformDataset(
+                path,
+                num_signal=num_signal,
+                sample_rate=sr,
+                audio_channels=audio_channels,
+                split="train",
+                filter=filter_dict,
+            ) for path in lazy_paths
+        ]
+        dataset = CombinedLazyWaveformDataset(train_datasets, frequencies)
+        train_sampler = None
+        if use_validation:
+            validation_datasets = [
+                LazyWaveformDataset(
+                    path,
+                    num_signal=num_signal,
+                    sample_rate=sr,
+                    audio_channels=audio_channels,
+                    split="validation",
+                    filter=filter_dict,
+                ) for path in lazy_paths
+            ]
+            valset = CombinedLazyWaveformDataset(validation_datasets,
+                                                 frequencies)
+        else:
+            valset = None
+        val_sampler = None
+    else:
+        path_dict = {f: {"name": f, "path": f} for f in db_paths}
+        dataset_keys = (["waveform", "z_dense_mean", "z_dense_variance"]
+                        if force_latent else ["waveform"])
+        if trainer.condition_encoder:
+            dataset_keys.append("z")
+        dataset = CombinedDataset(
             path_dict=path_dict,
-            config="validation",
-            freqs="estimate" if FLAGS.freqs is None else FLAGS.freqs,
             keys=dataset_keys,
+            freqs="estimate" if FLAGS.freqs is None else FLAGS.freqs,
+            config="train",
             init_cache=FLAGS.use_cache,
             filter=filter_dict,
         )
-        val_sampler = valset.get_sampler()
-    else:
-        valset, val_sampler = None, None
+        train_sampler = dataset.get_sampler()
+
+        if use_validation:
+            valset = CombinedDataset(
+                path_dict=path_dict,
+                config="validation",
+                freqs="estimate" if FLAGS.freqs is None else FLAGS.freqs,
+                keys=dataset_keys,
+                init_cache=FLAGS.use_cache,
+                filter=filter_dict,
+            )
+            val_sampler = valset.get_sampler()
+        else:
+            valset, val_sampler = None, None
 
     # Weighted samplers overlap across ranks in DDP. Replace with distributed
     # samplers to shard data per rank.
