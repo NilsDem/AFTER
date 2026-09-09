@@ -2,6 +2,7 @@
 
 import bisect
 import json
+import logging
 import random
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from sklearn.model_selection import train_test_split
 
 LAZY_MANIFEST = "audio_manifest.jsonl"
 LAZY_METADATA = "dataset.json"
+LOGGER = logging.getLogger(__name__)
 
 
 def is_lazy_waveform_dataset(path):
@@ -146,27 +148,59 @@ class LazyWaveformDataset(torch.utils.data.Dataset):
         start_frame = self.sample_crop_start(file_index)
         source_frames = self.source_crop_frames(record["sample_rate"])
 
-        with sf.SoundFile(record["resolved_path"], mode="r") as audio_file:
-            audio_file.seek(start_frame)
-            audio = audio_file.read(source_frames,
-                                    dtype="float32",
-                                    always_2d=True).T
+        load_error = None
+        try:
+            with sf.SoundFile(record["resolved_path"], mode="r") as audio_file:
+                audio_file.seek(start_frame)
+                audio = audio_file.read(source_frames,
+                                        dtype="float32",
+                                        always_2d=True).T
 
-        audio = self._convert_channels(audio)
-        audio = self._resample(audio, record["sample_rate"])
-        if audio.shape[-1] < self.num_signal:
-            audio = np.pad(audio,
-                           ((0, 0), (0, self.num_signal - audio.shape[-1])))
-        audio = audio[:, :self.num_signal]
-        audio *= np.float32(record.get("normalization_gain", 1.0))
+            if audio.shape[-1] != source_frames:
+                raise EOFError(
+                    f"requested {source_frames} frames, got {audio.shape[-1]}")
+
+            audio = self._convert_channels(audio)
+            audio = self._resample(audio, record["sample_rate"])
+            if audio.shape[-1] < self.num_signal:
+                audio = np.pad(
+                    audio,
+                    ((0, 0), (0, self.num_signal - audio.shape[-1])))
+            audio = audio[:, :self.num_signal]
+            audio *= np.float32(record.get("normalization_gain", 1.0))
+        except Exception as error:
+            # A corrupt, truncated, temporarily unavailable, or otherwise
+            # undecodable source file must not terminate a multi-day run.
+            # Avoid passing the exception object to logging: some
+            # LibsndfileError instances cannot format themselves after being
+            # transported between DataLoader worker processes.
+            try:
+                error_message = str(error)
+            except Exception:
+                error_message = "<exception could not be formatted>"
+            load_error = f"{type(error).__name__}: {error_message}"
+            worker = torch.utils.data.get_worker_info()
+            worker_id = worker.id if worker is not None else "main"
+            LOGGER.error(
+                "Audio load failed; substituting silence: path=%r, "
+                "start_frame=%d, source_frames=%d, worker=%s, error=%s",
+                record["resolved_path"], start_frame, source_frames,
+                worker_id, load_error)
+            audio = np.zeros((self.audio_channels, self.num_signal),
+                             dtype=np.float32)
+
+        metadata = {
+            "path": record["resolved_path"],
+            "start_frame": start_frame,
+            "source_sample_rate": record["sample_rate"],
+        }
+        if load_error is not None:
+            metadata["audio_load_error"] = load_error
+            metadata["silence_fallback"] = True
 
         return {
             "waveform": np.ascontiguousarray(audio, dtype=np.float32),
-            "metadata": {
-                "path": record["resolved_path"],
-                "start_frame": start_frame,
-                "source_sample_rate": record["sample_rate"],
-            },
+            "metadata": metadata,
         }
 
     def _convert_channels(self, audio):
