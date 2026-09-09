@@ -5,6 +5,93 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, overload
 import math
 
 
+def wrap_phase(x: torch.Tensor) -> torch.Tensor:
+    """Wrap angles to [-pi, pi]."""
+    return torch.atan2(torch.sin(x), torch.cos(x))
+
+
+def phase_derivative_losses(source: torch.Tensor,
+                            target: torch.Tensor):
+    """Instantaneous-frequency and group-delay losses for complex STFTs."""
+    source_phase = torch.angle(source)
+    target_phase = torch.angle(target)
+
+    source_if = torch.diff(source_phase, dim=-1)
+    target_if = torch.diff(target_phase, dim=-1)
+    loss_if = wrap_phase(source_if - target_if).abs().mean()
+
+    source_gd = torch.diff(source_phase, dim=-2)
+    target_gd = torch.diff(target_phase, dim=-2)
+    loss_gd = wrap_phase(source_gd - target_gd).abs().mean()
+    return loss_if, loss_gd
+
+
+def _biquad_coeffs_high_shelf(sample_rate,
+                              f0=1681.974,
+                              gain_db=4.0,
+                              q=0.7071,
+                              device=None,
+                              dtype=None):
+    amplitude = 10**(gain_db / 40.0)
+    w0 = 2 * math.pi * f0 / sample_rate
+    alpha = math.sin(w0) / (2 * q)
+    cos_w0 = math.cos(w0)
+    sqrt_amplitude = math.sqrt(amplitude)
+
+    b0 = amplitude * ((amplitude + 1) + (amplitude - 1) * cos_w0
+                      + 2 * sqrt_amplitude * alpha)
+    b1 = -2 * amplitude * ((amplitude - 1)
+                           + (amplitude + 1) * cos_w0)
+    b2 = amplitude * ((amplitude + 1) + (amplitude - 1) * cos_w0
+                      - 2 * sqrt_amplitude * alpha)
+    a0 = ((amplitude + 1) - (amplitude - 1) * cos_w0
+          + 2 * sqrt_amplitude * alpha)
+    a1 = 2 * ((amplitude - 1) - (amplitude + 1) * cos_w0)
+    a2 = ((amplitude + 1) - (amplitude - 1) * cos_w0
+          - 2 * sqrt_amplitude * alpha)
+
+    b = torch.tensor([b0, b1, b2], device=device, dtype=dtype) / a0
+    a = torch.tensor([1.0, a1 / a0, a2 / a0],
+                     device=device,
+                     dtype=dtype)
+    return b, a
+
+
+def _biquad_coeffs_highpass(sample_rate,
+                            f0=38.135,
+                            q=0.5,
+                            device=None,
+                            dtype=None):
+    w0 = 2 * math.pi * f0 / sample_rate
+    alpha = math.sin(w0) / (2 * q)
+    cos_w0 = math.cos(w0)
+
+    b0 = (1 + cos_w0) / 2
+    b1 = -(1 + cos_w0)
+    b2 = (1 + cos_w0) / 2
+    a0 = 1 + alpha
+    a1 = -2 * cos_w0
+    a2 = 1 - alpha
+
+    b = torch.tensor([b0, b1, b2], device=device, dtype=dtype) / a0
+    a = torch.tensor([1.0, a1 / a0, a2 / a0],
+                     device=device,
+                     dtype=dtype)
+    return b, a
+
+
+def k_weighting(x: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    """Apply the BS.1770-style high shelf and RLB high-pass stages."""
+    b, a = _biquad_coeffs_high_shelf(sample_rate,
+                                     device=x.device,
+                                     dtype=x.dtype)
+    x = torchaudio.functional.lfilter(x, a, b)
+    b, a = _biquad_coeffs_highpass(sample_rate,
+                                   device=x.device,
+                                   dtype=x.dtype)
+    return torchaudio.functional.lfilter(x, a, b)
+
+
 def mod_sigmoid(x):
     return 2 * torch.sigmoid(x)**2.3 + 1e-7
 
@@ -90,26 +177,19 @@ class STFTDistance(nn.Module):
         losstype="rave",
     ) -> None:
         super().__init__()
-        if mel:
-            self.spec = torchaudio.transforms.MelSpectrogram(
-                sampling_rate,
-                n_fft,
-                hop_length=n_fft // 4,
-                n_mels=mel,
-                power=power,
-                normalized=normalized,
-                center=False,
-                pad_mode=None,
-            )
-        else:
-            self.spec = torchaudio.transforms.Spectrogram(
-                n_fft,
-                hop_length=n_fft // 4,
-                power=power,
-                normalized=normalized,
-                center=False,
-                pad_mode=None,
-            )
+        self.spec = torchaudio.transforms.Spectrogram(
+            n_fft,
+            hop_length=n_fft // 4,
+            power=None,
+            normalized=normalized,
+            center=False,
+            pad_mode=None,
+        )
+        self.mel_scale = (torchaudio.transforms.MelScale(
+            n_mels=mel,
+            sample_rate=sampling_rate,
+            n_stft=n_fft // 2 + 1,
+        ) if mel else None)
 
         if isinstance(norm, str):
             norm = (norm, )
@@ -117,10 +197,19 @@ class STFTDistance(nn.Module):
         self.reduction = reduction
         self.losstype = losstype
         self.n_fft = n_fft
+        self.power = power
 
-    def forward(self, x, y):
-        x = self.spec(x)
-        y = self.spec(y)
+    def loss_components(self, x, y, compute_phase: bool = True):
+        x_complex = self.spec(x)
+        y_complex = self.spec(y)
+        x = x_complex.abs()
+        y = y_complex.abs()
+        if self.power is not None and self.power != 1:
+            x = x.pow(self.power)
+            y = y.pow(self.power)
+        if self.mel_scale is not None:
+            x = self.mel_scale(x)
+            y = self.mel_scale(y)
 
         if self.losstype == "rave":
             logx = torch.log1p(x)
@@ -134,7 +223,11 @@ class STFTDistance(nn.Module):
                                            logy,
                                            norm='L2',
                                            reduction=self.reduction)
-            return l_distance + math.sqrt(self.n_fft / 2) * log_distance
+            magnitude = l_distance + math.sqrt(self.n_fft / 2) * log_distance
+            if not compute_phase:
+                return magnitude, None, None
+            loss_if, loss_gd = phase_derivative_losses(x_complex, y_complex)
+            return magnitude, loss_if, loss_gd
 
         elif self.losstype == "diffusion":
             l_distance = mean_difference(x,
@@ -142,7 +235,10 @@ class STFTDistance(nn.Module):
                                          norm='L2',
                                          reduction=self.reduction)
             l_distance = l_distance.mean(dim=(1, 2, 3))
-            return l_distance
+            return l_distance, None, None
+
+    def forward(self, x, y):
+        return self.loss_components(x, y, compute_phase=False)[0]
 
 
 class SpectralDistance(nn.Module):
@@ -153,7 +249,10 @@ class SpectralDistance(nn.Module):
                  mel_bands: Optional[List[int]],
                  distance: nn.Module = STFTDistance,
                  reduction="mean",
-                 losstype="rave") -> None:
+                 losstype="rave",
+                 use_k_weighting: bool = False,
+                 use_phase_losses: bool = False,
+                 phase_loss_weight: float = 1.) -> None:
         super().__init__()
 
         if mel_bands is None:
@@ -169,12 +268,42 @@ class SpectralDistance(nn.Module):
         ])
 
         self.name = "Spectral Distance"
+        self.sr = sr
+        self.use_k_weighting = use_k_weighting
+        self.use_phase_losses = use_phase_losses
+        self.phase_loss_weight = phase_loss_weight
+
+    def loss_components(self, x, y):
+        if self.use_k_weighting:
+            x = k_weighting(x, self.sr)
+            y = k_weighting(y, self.sr)
+
+        magnitude = 0.
+        loss_if = 0.
+        loss_gd = 0.
+        for dist in self.spectral_distances:
+            scale_magnitude, scale_if, scale_gd = dist.loss_components(
+                x, y, compute_phase=self.use_phase_losses)
+            magnitude = magnitude + scale_magnitude
+            if self.use_phase_losses:
+                loss_if = loss_if + scale_if
+                loss_gd = loss_gd + scale_gd
+
+        components = {"magnitude": magnitude}
+        total = magnitude
+        if self.use_phase_losses:
+            weighted_phase = self.phase_loss_weight * (loss_if + loss_gd)
+            components.update({
+                "loss_if": loss_if,
+                "loss_gd": loss_gd,
+                "weighted_phase": weighted_phase,
+            })
+            total = total + weighted_phase
+        components["total"] = total
+        return components
 
     def forward(self, x, y):
-        spectral_distance = 0
-        for dist in self.spectral_distances:
-            spectral_distance = spectral_distance + dist(x, y)
-        return spectral_distance
+        return self.loss_components(x, y)["total"]
 
 
 class MSELoss(nn.Module):

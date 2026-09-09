@@ -48,7 +48,7 @@ flags.DEFINE_bool("compile", False,
 flags.DEFINE_integer("num_workers", 4, "Number of data-loading workers")
 flags.DEFINE_bool("use_cache", False, "Wether to load the dataset in cache")
 flags.DEFINE_bool("use_validation", True, "Use a train/validation split")
-flags.DEFINE_bool("use_psts", True,
+flags.DEFINE_bool("use_psts", False,
                   "Use pitch shift and time stretch augmentation")
 flags.DEFINE_multi_string("filter_include", [],
                           "Glob patterns to include in dataset.")
@@ -289,6 +289,11 @@ def main(argv):
             "causal_conditioning": FLAGS.causal_conditioning,
         }
         for parameter, value in distillation_flags.items():
+            # The codec config defines its latent hop. The CLI flag should
+            # replace it only when the user explicitly supplies the flag.
+            if (parameter == "latent_hop_size" and
+                    not FLAGS[parameter].present):
+                continue
             # On resume, the operative config is authoritative unless the
             # corresponding command-line flag was explicitly supplied.
             if FLAGS.restart is None or FLAGS[parameter].present:

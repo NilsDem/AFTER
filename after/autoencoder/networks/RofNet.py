@@ -799,6 +799,8 @@ class RofNet(nn.Module):
             if (conditioning.shape[0] != x.shape[0]
                     or conditioning.shape[1] != self.bottleneck_size
                     or conditioning.shape[-1] != x.shape[1]):
+                
+                print(f"conditioning.shape={conditioning.shape}, x.shape={x.shape}")
                 raise ValueError(
                     "Encoder conditioning must match the audio batch and frame count")
             conditioning = conditioning.transpose(1, 2).unsqueeze(2)

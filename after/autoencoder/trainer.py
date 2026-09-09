@@ -8,12 +8,14 @@ from einops import rearrange
 
 from torch.optim import AdamW
 from .core import DistanceWrap
+from .transforms import TimeStretch
 import torchaudio
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 
 from tqdm import tqdm
 import gin
+import math
 import os
 import random
 
@@ -91,6 +93,17 @@ class Trainer(nn.Module):
                  condition_encoder: bool = False,
                  conditioning_compute_delay: int = 1024,
                  causal_conditioning: bool = False,
+                 representation_model: Optional[nn.Module] = None,
+                 representation_projector: Optional[nn.Module] = None,
+                 representation_loss_weight: float = 0.,
+                 use_time_stretch_regularisation: bool = False,
+                 time_stretch_min: float = 0.8,
+                 time_stretch_max: float = 1.2,
+                 time_stretch_batch_size: int = -1,
+                 time_stretch_every: int = 1,
+                 latent_prior: Optional[nn.Module] = None,
+                 latent_prior_loss_weight: float = 1.,
+                 latent_prior_warmup_steps: int = 0,
                  use_compile: bool = False):
 
         super().__init__()
@@ -108,6 +121,23 @@ class Trainer(nn.Module):
         ]).to(device) if len(multiband_distances) > 0 else []
 
         self.model = model.to(device)
+        self.representation_model = (
+            None if representation_model is None else
+            representation_model.to(device).requires_grad_(False).eval())
+        self.representation_projector = (
+            None if representation_projector is None else
+            representation_projector.to(device))
+        self.representation_loss_weight = float(representation_loss_weight)
+        self.use_time_stretch_regularisation = \
+            use_time_stretch_regularisation
+        self.time_stretch_min = time_stretch_min
+        self.time_stretch_max = time_stretch_max
+        self.time_stretch_batch_size = time_stretch_batch_size
+        self.time_stretch_every = time_stretch_every
+        self.latent_prior = (None if latent_prior is None else
+                             latent_prior.to(device))
+        self.latent_prior_loss_weight = latent_prior_loss_weight
+        self.latent_prior_warmup_steps = latent_prior_warmup_steps
         self.compile_enabled = bool(use_compile)
         if self.compile_enabled:
             _replace_legacy_weight_norm_for_compile(self.model)
@@ -116,6 +146,10 @@ class Trainer(nn.Module):
         self.is_main_process = is_main_process
         self.model_dp = None
         self.model_ddp = None
+        self.representation_projector_dp = None
+        self.representation_projector_ddp = None
+        self.latent_prior_dp = None
+        self.latent_prior_ddp = None
         if self.distributed:
             self.model_ddp = torch.nn.parallel.DistributedDataParallel(
                 self.model,
@@ -123,10 +157,34 @@ class Trainer(nn.Module):
                 output_device=self.device_ids[0]
                 if self.device_ids is not None else None,
                 find_unused_parameters=True)
+            if self.representation_projector is not None:
+                self.representation_projector_ddp = \
+                    torch.nn.parallel.DistributedDataParallel(
+                        self.representation_projector,
+                        device_ids=self.device_ids,
+                        output_device=self.device_ids[0]
+                        if self.device_ids is not None else None)
+            if self.latent_prior is not None:
+                self.latent_prior_ddp = \
+                    torch.nn.parallel.DistributedDataParallel(
+                        self.latent_prior,
+                        device_ids=self.device_ids,
+                        output_device=self.device_ids[0]
+                        if self.device_ids is not None else None)
         elif self.device_ids and len(self.device_ids) > 1:
             self.model_dp = nn.DataParallel(self.model,
                                             device_ids=self.device_ids,
                                             output_device=self.device_ids[0])
+            if self.representation_projector is not None:
+                self.representation_projector_dp = nn.DataParallel(
+                    self.representation_projector,
+                    device_ids=self.device_ids,
+                    output_device=self.device_ids[0])
+            if self.latent_prior is not None:
+                self.latent_prior_dp = nn.DataParallel(
+                    self.latent_prior,
+                    device_ids=self.device_ids,
+                    output_device=self.device_ids[0])
         self.compiled_model = None
         if self.compile_enabled:
             if not hasattr(torch, "compile"):
@@ -162,6 +220,7 @@ class Trainer(nn.Module):
         self.warmup_steps = warmup_steps
         self.freeze_encoder_step = freeze_encoder_step
         self.step = 0
+        self.autoencoder_updates = 0
         self.device = device
         self.update_discriminator_every = update_discriminator_every
         self.force_latent = force_latent
@@ -285,6 +344,141 @@ class Trainer(nn.Module):
             return self.discriminator_dp(*args, **kwargs)
         return self.discriminator(*args, **kwargs)
 
+    def _project_representation(self, latent):
+        if self.representation_projector_ddp is not None:
+            return self.representation_projector_ddp(latent)
+        if self.representation_projector_dp is not None:
+            return self.representation_projector_dp(latent)
+        return self.representation_projector(latent)
+
+    def _representation_alignment_loss(self, waveform, latent):
+        """Match each projected latent point to its global audio embedding."""
+        target = self.representation_model(waveform)
+        projected = self._project_representation(latent)
+        if projected.shape[0] != target.shape[0]:
+            raise ValueError("Representation target and latent batch sizes differ")
+        if projected.shape[-1] != target.shape[-1]:
+            raise ValueError(
+                "Projected and target representation sizes differ: "
+                f"{projected.shape[-1]} != {target.shape[-1]}")
+        target = target[:, None, :]
+        return (1. - F.cosine_similarity(projected.float(),
+                                         target.float(), dim=-1)).mean()
+
+    def _latent_prior_loss(self, latent):
+        if self.latent_prior_ddp is not None:
+            return self.latent_prior_ddp(latent)
+        if self.latent_prior_dp is not None:
+            return self.latent_prior_dp(latent)
+        return self.latent_prior(latent)
+
+    def _train_latent_prior(self, latent):
+        """Train the prior without propagating its update into the codec."""
+        self.latent_prior.requires_grad_(True)
+        with self._autocast():
+            prior_loss = self._latent_prior_loss(latent.detach())
+        self.scaler.scale(prior_loss).backward()
+        self.scaler.step(self.opt_prior)
+        self.opt_prior.zero_grad(set_to_none=True)
+        return prior_loss.detach()
+
+    def _time_stretch_pair(self, waveform, latent):
+        """Stretch a clean latent and build its correspondingly stretched target."""
+        batch_size = (waveform.shape[0]
+                      if self.time_stretch_batch_size == -1 else
+                      min(self.time_stretch_batch_size, waveform.shape[0]))
+        waveform = waveform[:batch_size]
+        latent = latent[:batch_size]
+
+        num_samples = waveform.shape[-1]
+        min_k = math.ceil((self.time_stretch_min - 1.) * num_samples
+                          / self.latent_hop_size)
+        max_k = math.floor((self.time_stretch_max - 1.) * num_samples
+                           / self.latent_hop_size)
+        k = random.randint(min_k, max_k)
+        target_samples = num_samples + k * self.latent_hop_size
+        target_latent_steps = target_samples // self.latent_hop_size
+
+        # Audiomentations defines rate inversely to the output-length ratio.
+        stretch_rate = num_samples / target_samples
+        transform = TimeStretch(
+            p=1.,
+            min_rate=stretch_rate,
+            max_rate=stretch_rate,
+            leave_length_unchanged=False,
+        )
+        target = np.stack([
+            transform(item, self.sr)
+            for item in waveform.detach().float().cpu().numpy()
+        ])
+        target = torch.from_numpy(target).to(waveform)
+
+        stretched_latent = F.interpolate(
+            latent,
+            size=target_latent_steps,
+            mode="linear",
+            align_corners=False,
+        )
+        prediction = self.model.decode(stretched_latent)
+        return target, prediction
+
+    def _add_latent_losses(self, waveform, latent, loss_ae, loss_out,
+                           apply_latent_prior):
+        if self.representation_model is not None:
+            alignment_loss = self._representation_alignment_loss(
+                waveform, latent)
+            weighted_alignment = (
+                self.representation_loss_weight * alignment_loss)
+            loss_ae = loss_ae + weighted_alignment
+            loss_out["representation_alignment"] = alignment_loss.detach()
+            loss_out["weighted_representation_alignment"] = \
+                weighted_alignment.detach()
+
+        if apply_latent_prior and self.latent_prior is not None:
+            self.latent_prior.requires_grad_(False)
+            prior_loss = self._latent_prior_loss(latent)
+            weighted_prior = self.latent_prior_loss_weight * prior_loss
+            loss_ae = loss_ae + weighted_prior
+            loss_out["latent_prior_loss"] = prior_loss.detach()
+            loss_out["weighted_latent_prior_loss"] = weighted_prior.detach()
+
+        loss_out["total_loss"] = loss_ae.detach()
+        return loss_ae, loss_out
+
+    def _stretched_ae_forward(self, x, encoder_conditioning,
+                              apply_latent_prior):
+        batch_size = (x.shape[0] if self.time_stretch_batch_size == -1 else
+                      min(self.time_stretch_batch_size, x.shape[0]))
+        x = x[:batch_size]
+        if encoder_conditioning is not None:
+            encoder_conditioning = encoder_conditioning[:batch_size]
+
+        z, regularisations = self.model.encode(
+            x, encoder_conditioning=encoder_conditioning)
+        target, y = self._time_stretch_pair(x, z)
+        loss_ae, stretched_losses = self.compute_loss(
+            target, y, regularisations=regularisations)
+        loss_out = {
+            f"time_stretch_{name}": value
+            for name, value in stretched_losses.items()
+        }
+        loss_ae, loss_out = self._add_latent_losses(
+            x, z, loss_ae, loss_out, apply_latent_prior)
+
+        if self.warmup and self.discriminator is not None:
+            self.discriminator.requires_grad_(False)
+            loss_gen, loss_dis, loss_dis_dict = self._discriminator_forward(
+                target, y, use_wrapped=False)
+            del loss_dis
+            loss_dis_dict = {
+                f"time_stretch_{name}": value
+                for name, value in loss_dis_dict.items()
+            }
+        else:
+            loss_gen = x.new_zeros(())
+            loss_dis_dict = {}
+        return loss_out, loss_ae, loss_gen, loss_dis_dict, z, y
+
     def compute_loss(self,
                      x,
                      y,
@@ -302,7 +496,14 @@ class Trainer(nn.Module):
 
         losses = {}
         for dist in self.waveform_losses:
-            loss_value = dist(x, y)
+            if hasattr(dist.distance, "loss_components"):
+                components = dist.distance.loss_components(x, y)
+                loss_value = components["total"]
+                for name, value in components.items():
+                    if name != "total":
+                        losses[f"{dist.name}_{name}"] = value.detach()
+            else:
+                loss_value = dist(x, y)
             losses[dist.name] = loss_value.detach()
             total_loss += loss_value * dist.scale
 
@@ -354,6 +555,14 @@ class Trainer(nn.Module):
         for loss in self.reg_losses + self.waveform_losses:
             names.append(loss.name)
             names.append(loss.name + "_regul")
+            if hasattr(loss.distance, "loss_components"):
+                names.append(loss.name + "_magnitude")
+                if getattr(loss.distance, "use_phase_losses", False):
+                    names.extend([
+                        loss.name + "_loss_if",
+                        loss.name + "_loss_gd",
+                        loss.name + "_weighted_phase",
+                    ])
         names.extend(["total_loss"])
         names.extend(["regularisation_loss"])
         regularisation_names = ["fast_kl", "slow_kl"]
@@ -364,6 +573,12 @@ class Trainer(nn.Module):
             names.append(f"weighted_regularisation_{name}")
         names.extend(["latent_distribution_kl",
                       "weighted_latent_distribution_kl"])
+        if self.representation_model is not None:
+            names.extend(["representation_alignment",
+                          "weighted_representation_alignment"])
+        if self.latent_prior is not None:
+            names.extend(["latent_prior_loss", "weighted_latent_prior_loss",
+                          "latent_prior_training_loss"])
 
         if True:  #self.model.pqmf_bands > 1:
             for loss in self.multiband_distances:
@@ -378,6 +593,8 @@ class Trainer(nn.Module):
         print("warning, putting all models paramters")
 
         parameters = list(self.model.parameters())
+        if self.representation_projector is not None:
+            parameters += list(self.representation_projector.parameters())
 
         self.opt = AdamW(parameters,
                          lr=lr,
@@ -396,6 +613,16 @@ class Trainer(nn.Module):
                 self.opt_dis, gamma=0.999996)
         else:
             self.opt_dis = None
+
+        if self.latent_prior is not None:
+            self.opt_prior = AdamW(self.latent_prior.parameters(),
+                                   lr=lr,
+                                   betas=(0.9, 0.999),
+                                   fused=self.fused_optimizer)
+            self.scheduler_prior = torch.optim.lr_scheduler.ExponentialLR(
+                self.opt_prior, gamma=0.999996)
+        else:
+            self.opt_prior = None
 
     def _normalize_optimizer_execution_mode(self, optimizer):
         """Keep loaded optimizer groups consistent with the current backend."""
@@ -428,11 +655,29 @@ class Trainer(nn.Module):
                 f"cache tensors. Missing keys: {incompatible.missing_keys}; "
                 f"unexpected keys: {incompatible.unexpected_keys}")
 
+        if self.representation_projector is not None:
+            projector_state = d.get("representation_projector_state")
+            if projector_state is None:
+                if self.is_main_process:
+                    print("Checkpoint has no representation projector state; "
+                          "starting with a fresh projector.")
+            else:
+                self.representation_projector.load_state_dict(projector_state)
+
+        if (self.latent_prior is not None and
+                d.get("latent_prior_state") is not None):
+            self.latent_prior.load_state_dict(d["latent_prior_state"])
+
         try:
             self.opt.load_state_dict(d["opt_state"])
             self._normalize_optimizer_execution_mode(self.opt)
         except:
             print("could not load optimizer state")
+
+        if (self.opt_prior is not None and
+                d.get("opt_prior_state") is not None):
+            self.opt_prior.load_state_dict(d["opt_prior_state"])
+            self._normalize_optimizer_execution_mode(self.opt_prior)
 
         if self.use_amp:
             scaler_state = d.get("scaler_state")
@@ -452,6 +697,7 @@ class Trainer(nn.Module):
                 print("could not load discriminator optimizer state")
 
         self.step = step + 1
+        self.autoencoder_updates = d.get("autoencoder_updates", 0)
         self.warmup = self.step > self.warmup_steps
 
     def update_waveform_losses(self, rec_loss_decay):
@@ -488,7 +734,7 @@ class Trainer(nn.Module):
                 **forward_kwargs)
 
         loss_gen, loss_dis, loss_dis_dict = self._discriminator_forward(x, y)
-        return loss_gen, loss_dis, loss_dis_dict
+        return loss_gen, loss_dis, loss_dis_dict, z
 
     # @torch.compile(mode='max-autotune', disable=False)
     def ae_forward(self,
@@ -497,7 +743,13 @@ class Trainer(nn.Module):
                    latent_variance=None,
                    encoder_conditioning=None,
                    use_wrapped=True,
-                   apply_branch_dropout=False):
+                   apply_branch_dropout=False,
+                   stretch_only=False,
+                   apply_latent_prior=False):
+        if stretch_only:
+            return self._stretched_ae_forward(
+                x, encoder_conditioning, apply_latent_prior)
+
         distilling_latent = self.force_latent
         teacher_forcing = self._teacher_forcing_active()
         forward_kwargs = {
@@ -574,12 +826,16 @@ class Trainer(nn.Module):
             loss_out["weighted_latent_distribution_kl"] = weighted_kl.detach()
             loss_out["total_loss"] = loss_ae.detach()
 
+        loss_ae, loss_out = self._add_latent_losses(
+            x, z, loss_ae, loss_out, apply_latent_prior)
+
         if self.warmup and self.discriminator is not None:
             # Generator updates need gradients through the discriminator input,
             # but never through its parameters or DDP reducer.
             self.discriminator.requires_grad_(False)
             loss_gen, loss_dis, loss_dis_dict = self._discriminator_forward(
                 x, y, use_wrapped=False)
+            del loss_dis
         else:
             loss_gen = x.new_zeros(())
             loss_dis_dict = {}
@@ -590,17 +846,25 @@ class Trainer(nn.Module):
         self.train()
         x, latent_mean, latent_variance, encoder_conditioning = self._unpack_batch(batch)
         self._maybe_freeze_encoder()
-        if (self.discriminator is not None and self.warmup
-            ) and self.step % self.update_discriminator_every == 0:
+        loss_prior = {}
+        if self.latent_prior is not None:
+            with torch.no_grad(), self._autocast():
+                z, _ = self.model.encode(
+                    x, encoder_conditioning=encoder_conditioning)
+            prior_loss = self._train_latent_prior(z)
+            self.scaler.update()
+            loss_prior["latent_prior_training_loss"]= prior_loss
 
-            loss_out = {}
-
+        discriminator_update = (
+            self.discriminator is not None and self.warmup and
+            self.step % self.update_discriminator_every == 0)
+        if discriminator_update:
             self.discriminator.requires_grad_(True)
             with self._autocast():
-                loss_gen, loss_dis, loss_dis_dict = self.discrim_forward(
+                loss_gen, loss_dis, loss_out, z = self.discrim_forward(
                     x, latent_mean, latent_variance, encoder_conditioning)
+            del loss_gen
 
-            self.opt_dis.zero_grad(set_to_none=True)
             if loss_dis.ndim > 0:
                 loss_dis = loss_dis.mean()
             self.scaler.scale(loss_dis).backward()
@@ -608,30 +872,44 @@ class Trainer(nn.Module):
             torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(),
                                            2.0)
             self.scaler.step(self.opt_dis)
-            self.scaler.update()
-            loss_out.update(loss_dis_dict)
+            self.opt_dis.zero_grad(set_to_none=True)
+            del loss_dis
 
         else:
-
+            stretch_only = (
+                self.use_time_stretch_regularisation and
+                (self.autoencoder_updates + 1) % self.time_stretch_every == 0)
             with self._autocast():
                 loss_out, loss_ae, loss_gen, loss_dis_dict, z, y = self.ae_forward(
                     x,
                     latent_mean,
                     latent_variance,
                     encoder_conditioning,
-                    apply_branch_dropout=True)
+                    apply_branch_dropout=True,
+                    stretch_only=stretch_only,
+                    apply_latent_prior=self.latent_prior is not None and self.step > self.latent_prior_warmup_steps)
 
             loss_out.update(loss_dis_dict)
             loss_gen = loss_gen + loss_ae
 
-            self.opt.zero_grad(set_to_none=True)
             if loss_gen.ndim > 0:
                 loss_gen = loss_gen.mean()
             self.scaler.scale(loss_gen).backward()
             self.scaler.unscale_(self.opt)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 3.0)
             self.scaler.step(self.opt)
-            self.scaler.update()
+            self.opt.zero_grad(set_to_none=True)
+            self.autoencoder_updates += 1
+            del loss_ae, loss_gen, y
+
+        if self.latent_prior is not None:
+            prior_latent = z.detach()
+            del z
+            loss_out["latent_prior_training_loss"] = \
+                self._train_latent_prior(prior_latent)
+        self.scaler.update()
+        
+        loss_out.update(loss_prior)
 
         return loss_out
 
@@ -796,8 +1074,19 @@ class Trainer(nn.Module):
                     d = {
                         "model_state":
                         self.model.state_dict(),
+                        "representation_projector_state":
+                        self.representation_projector.state_dict()
+                        if self.representation_projector is not None else None,
+                        "latent_prior_state":
+                        self.latent_prior.state_dict()
+                        if self.latent_prior is not None else None,
                         "opt_state":
                         self.opt.state_dict(),
+                        "opt_prior_state":
+                        self.opt_prior.state_dict()
+                        if self.opt_prior is not None else None,
+                        "autoencoder_updates":
+                        self.autoencoder_updates,
                         "dis_state":
                         self.discriminator.state_dict()
                         if self.discriminator is not None else None,

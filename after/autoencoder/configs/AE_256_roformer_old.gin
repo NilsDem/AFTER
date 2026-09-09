@@ -6,8 +6,6 @@ from after.autoencoder.networks import RofNet
 from after.autoencoder.networks import bottlenecks
 from after.autoencoder.networks import discriminators
 from after.autoencoder import audio
-from after.autoencoder import representation_models
-from after.autoencoder import latent_priors
 import cached_conv
 
 SR = 44100
@@ -17,24 +15,9 @@ TIME_SIZE = 32768
 
 FREEZE_ENCODER_STEPS = %MAX_STEPS
 WARMUP_STEPS = 1
-MAX_STEPS = 500000
+MAX_STEPS = 5000000
 REGULARISATION_WEIGHT = 0.005
-REGULARISATION_WARMUP = 1000
-CLAP_ALIGNMENT_WEIGHT = 0.
-USE_K_WEIGHTING = True
-USE_PHASE_LOSSES = False
-PHASE_LOSS_WEIGHT = 0.
-USE_TIME_STRETCH_REGULARISATION = False
-TIME_STRETCH_MIN = 0.8
-TIME_STRETCH_MAX = 1.2
-TIME_STRETCH_BATCH_SIZE = -1
-TIME_STRETCH_EVERY = 4
-LATENT_PRIOR_LAYERS = 4
-LATENT_PRIOR_HIDDEN_DIM = 128
-LATENT_PRIOR_NOISE_LEVELS_DIM = 64
-LATENT_PRIOR_ATTENTION_WINDOW = 64
-LATENT_PRIOR_WARMUP_STEPS = 30000
-LATENT_PRIOR_LOSS_WEIGHT = 1.0
+REGULARISATION_WARMUP = 10000
 
 # 256-sample codec ratio: hop 256 and no encoder temporal downsampling.
 # The first/last frequency ratios stay at two so the decoder remains full-band.
@@ -54,7 +37,7 @@ audio.CausalMauerSTFT:
     normalize = True
 
 RofNet.RofNet:
-    byblock = True
+    byblock=False
     in_size = 2
     out_size = None
     bottleneck_size = %LATENT_SIZE
@@ -62,18 +45,18 @@ RofNet.RofNet:
     dims = %CHANNELS
     freq_size = 256
     freq_ratios = %FREQ_RATIOS
-    depths = [0, 1, 1, 1, 1]
-    heads = [4, 4, 4, 4, 4]
+    depths = [0, 1, 1, 1,1]
+    heads=[4,4,4,4,4]
     middle_dim = 256
-    middle_layers = 2
-    middle_heads = 8
-    time_window = 8
-    ff_mult = 2
+    middle_layers=2
+    middle_heads=8
+    time_window=4
+    ff_mult=2
     smoothing_conv = True
     bottleneck = @bottlenecks.VAEBottleneck()
     time_transform = @audio.CausalMauerSTFT()
-    use_vae = True
-    attention_impl = "manual"
+    use_vae = True	
+    attention_impl="manual"
     # Frequency attention is quadratic in the number of bins. Skip it at the
     # 512- and 128-bin stages, while retaining it at 32, 16, and 8 bins.
     skip_frequency_attention_stages = 1
@@ -82,10 +65,7 @@ autoencoder.core.SpectralDistance:
     scales = [64, 128, 256, 512, 1024, 2048]
     sr = %SR
     mel_bands = [64, 64, 64, 64, 64, 64, 64]
-    use_k_weighting = %USE_K_WEIGHTING
-    use_phase_losses = %USE_PHASE_LOSSES
-    phase_loss_weight = %PHASE_LOSS_WEIGHT
-
+	
 discriminators.SpectroDiscriminator:
     n_ffts = [128, 256, 512, 1024, 2048, 4096]
     hop_lengths = [64, 128, 256, 512, 1024, 2048]
@@ -109,20 +89,6 @@ autoencoder.trainer.Trainer:
     multiband_distances = []
     reg_losses = []
     update_discriminator_every = 4
-    latent_hop_size = %HOP
-    representation_model =None
-    representation_projector = None
-    representation_loss_weight = 0
-    use_time_stretch_regularisation = %USE_TIME_STRETCH_REGULARISATION
-    time_stretch_min = %TIME_STRETCH_MIN
-    time_stretch_max = %TIME_STRETCH_MAX
-    time_stretch_batch_size = %TIME_STRETCH_BATCH_SIZE
-    time_stretch_every = %TIME_STRETCH_EVERY
-    # Swap this for  @latent_priors.RectifiedFlowLatentPrior()to use
-    # continuous next-latent prediction instead of rectified flow.
-    latent_prior =None
-    latent_prior_loss_weight = %LATENT_PRIOR_LOSS_WEIGHT
-    latent_prior_warmup_steps = %LATENT_PRIOR_WARMUP_STEPS
 
 autoencoder.trainer.Trainer.fit:
     steps_display = 100

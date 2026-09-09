@@ -20,10 +20,10 @@ WARMUP_STEPS = 1
 MAX_STEPS = 500000
 REGULARISATION_WEIGHT = 0.005
 REGULARISATION_WARMUP = 1000
-CLAP_ALIGNMENT_WEIGHT = 0.
+CLAP_ALIGNMENT_WEIGHT = 1.0
 USE_K_WEIGHTING = True
-USE_PHASE_LOSSES = False
-PHASE_LOSS_WEIGHT = 0.
+USE_PHASE_LOSSES = True
+PHASE_LOSS_WEIGHT = 1.0
 USE_TIME_STRETCH_REGULARISATION = False
 TIME_STRETCH_MIN = 0.8
 TIME_STRETCH_MAX = 1.2
@@ -98,6 +98,29 @@ discriminators.SpectroDiscriminator:
         "adversarial": 1.0,
     }
 
+representation_models.CLAPAudioEncoder:
+    checkpoint_path = "630k-audioset-best.pt"
+    input_sample_rate = %SR
+    audio_model = "HTSAT-tiny"
+
+representation_models.LatentRepresentationProjector:
+    latent_size = %LATENT_SIZE
+    representation_size = 512
+    hidden_size = 512
+
+latent_priors.RectifiedFlowLatentPrior:
+    latent_size = %LATENT_SIZE
+    num_layers = %LATENT_PRIOR_LAYERS
+    hidden_dim = %LATENT_PRIOR_HIDDEN_DIM
+    noise_levels_dim = %LATENT_PRIOR_NOISE_LEVELS_DIM
+    attention_window = %LATENT_PRIOR_ATTENTION_WINDOW
+
+latent_priors.AutoregressiveLatentPrior:
+    latent_size = %LATENT_SIZE
+    num_layers = %LATENT_PRIOR_LAYERS
+    hidden_dim = %LATENT_PRIOR_HIDDEN_DIM
+    attention_window = %LATENT_PRIOR_ATTENTION_WINDOW
+
 autoencoder.trainer.Trainer:
     model = @RofNet.RofNet()
     discriminator = @discriminators.SpectroDiscriminator()
@@ -110,9 +133,9 @@ autoencoder.trainer.Trainer:
     reg_losses = []
     update_discriminator_every = 4
     latent_hop_size = %HOP
-    representation_model =None
-    representation_projector = None
-    representation_loss_weight = 0
+    representation_model = @representation_models.CLAPAudioEncoder()
+    representation_projector = @representation_models.LatentRepresentationProjector()
+    representation_loss_weight = %CLAP_ALIGNMENT_WEIGHT
     use_time_stretch_regularisation = %USE_TIME_STRETCH_REGULARISATION
     time_stretch_min = %TIME_STRETCH_MIN
     time_stretch_max = %TIME_STRETCH_MAX
@@ -120,7 +143,7 @@ autoencoder.trainer.Trainer:
     time_stretch_every = %TIME_STRETCH_EVERY
     # Swap this for  @latent_priors.RectifiedFlowLatentPrior()to use
     # continuous next-latent prediction instead of rectified flow.
-    latent_prior =None
+    latent_prior =@latent_priors.RectifiedFlowLatentPrior()
     latent_prior_loss_weight = %LATENT_PRIOR_LOSS_WEIGHT
     latent_prior_warmup_steps = %LATENT_PRIOR_WARMUP_STEPS
 

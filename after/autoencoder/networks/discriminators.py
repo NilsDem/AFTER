@@ -64,8 +64,11 @@ class DiscEncoderBlock2D(nn.Module):
             padding=((freq_ratio + 1) // 2 + (1 if freq_ratio > 1 else 0),
                      (ratio + 1) // 2 + (1 if ratio > 1 else 0)),
         )
+        # The strided convolution produces ceil(input / stride) positions.
+        # Match it in the residual branch when stretching creates odd sizes.
         self.proj_pool = nn.AvgPool2d(kernel_size=(freq_ratio, ratio),
-                                      stride=(freq_ratio, ratio))
+                                      stride=(freq_ratio, ratio),
+                                      ceil_mode=True)
         self.proj = nn.Conv2d(in_c, out_c, kernel_size=1, padding=0)
 
     def forward(self, x):

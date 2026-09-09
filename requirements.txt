@@ -1,6 +1,7 @@
 # Core ML / PyTorch
 torch>=2.0
 torchaudio>=2.0
+laion-clap
 torch-ema
 einops
 einops-exts
@@ -43,4 +44,3 @@ packaging
 # Private 
 # soxr
 # pytorch-lightning
-

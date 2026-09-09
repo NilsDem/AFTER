@@ -64,11 +64,12 @@ class TimeStretch:
     def __init__(self,
                  min_rate: float = 0.9,
                  max_rate: float = 1.1,
-                 p: float = 0.2):
+                 p: float = 0.2,
+                 leave_length_unchanged:bool = True):
         self._t = _TimeStretch(min_rate=min_rate,
                                max_rate=max_rate,
                                p=p,
-                               leave_length_unchanged=True)
+                               leave_length_unchanged=leave_length_unchanged)
 
     def __call__(self, x: np.ndarray, sr: int) -> np.ndarray:
         return self._t(x, sr)
