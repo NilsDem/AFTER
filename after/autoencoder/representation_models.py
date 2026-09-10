@@ -67,21 +67,31 @@ class LatentRepresentationProjector(nn.Module):
     def __init__(self,
                  latent_size: int,
                  representation_size: int = 512,
-                 hidden_size: int = 512):
+                 hidden_size: int = 512,
+                 mode = "two_layers"):
         super().__init__()
         self.latent_size = int(latent_size)
         self.representation_size = int(representation_size)
-        self.layers = nn.Sequential(
-            nn.Linear(self.latent_size, hidden_size),
-            nn.GELU(),
-            nn.Linear(hidden_size, self.representation_size),
-        )
+        self.mode = mode
+        
+        if mode =="two_layers":
+            self.layers = nn.Sequential(
+                nn.Linear(self.latent_size, hidden_size),
+                nn.GELU(),
+                nn.Linear(hidden_size, self.representation_size),
+            )
+        elif mode == "single_layer":
+            self.layers = nn.Linear(self.latent_size, self.representation_size)
+            
+        elif mode=="conv":
+            self.layers = nn.Conv1d(self.latent_size,self.representation_size, kernel_size = 9, stride = 4)
+        else:
+            raise NotImplementedError
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        assert latent.ndim == 3, (
-            "Expected latent with shape [batch, channels, time]")
-        if latent.shape[1] != self.latent_size:
-            raise ValueError(
-                f"Expected {self.latent_size} latent channels, got "
-                f"{latent.shape[1]}")
-        return self.layers(latent.transpose(1, 2))
+        if "layer" in self.mode:
+            return self.layers(latent.transpose(1, 2))
+        elif "conv" in self.mode:
+            return self.layers(latent).transpose(1,2)
+        else:
+            raise NotImplementedError
