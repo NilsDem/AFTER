@@ -24,6 +24,7 @@ setuptools.setup(
         'after/diffusion/configs': ['*.gin'],
         'after/autoencoder/configs': ['*.gin'],
         'after/dafter/configs': ['*.gin'],
+        'after/encoder_ssl/configs': ['*.gin'],
     },
     classifiers=[
         "Programming Language :: Python :: 3",

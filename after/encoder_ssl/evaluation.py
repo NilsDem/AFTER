@@ -1,11 +1,12 @@
-import matplotlib.pyplot as plt
 from sklearn.preprocessing import LabelEncoder
-import umap
 
 import torch
 
 
 def plot_embeddings(emb, labels):
+    import matplotlib.pyplot as plt
+    import umap
+
     if type(emb) == torch.Tensor:
         emb = emb.cpu().numpy()
 

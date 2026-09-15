@@ -50,8 +50,11 @@ def train_diffusion(run: AutoencoderRun, latent_cache: dict, output_dir: Path,
                 history.get("ids_digest") == latent_cache["ids_digest"]):
             saved = torch.load(model_path, map_location=device, weights_only=False)
             model.load_state_dict(saved["model_state"])
+            print(f"Reusing trained diffusion model for {run.name}: {model_path}",
+                  flush=True)
             return model.eval(), history
 
+    print(f"Preparing diffusion tensors for {run.name}...", flush=True)
     latents = latent_cache["latents"].float()
     validation = latent_cache["validation"]
     labels = latent_cache["instrument_labels"]
@@ -73,6 +76,12 @@ def train_diffusion(run: AutoencoderRun, latent_cache: dict, output_dir: Path,
     history = [{"step": 0,
                 "validation_loss": _fixed_validation_loss(
                     model, fixed_latents, fixed_labels, fixed_noise, fixed_times)}]
+    print(
+        f"Training {run.name} diffusion for {steps:,} steps on "
+        f"{len(train_indices):,} training examples "
+        f"({len(validation_indices):,} fixed validation examples)...",
+        flush=True,
+    )
     interval_losses = []
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "checkpoints").mkdir(exist_ok=True)
@@ -129,6 +138,8 @@ def train_diffusion(run: AutoencoderRun, latent_cache: dict, output_dir: Path,
                 "model_type": FLOW_MODEL_TYPE}, model_path)
     with history_path.open("w") as handle:
         json.dump(payload, handle, indent=2)
+    print(f"Saved trained diffusion model for {run.name} to {model_path}.",
+          flush=True)
     return model.eval(), payload
 
 
@@ -159,6 +170,8 @@ def evaluate_generation(run: AutoencoderRun,
                 cached.get("model_type") == history.get("model_type") and
                 cached.get("clap_signature") ==
                 clap_cache.get("checkpoint_signature")):
+            print(f"Reusing generation metrics for {run.name}: {metrics_path}",
+                  flush=True)
             return cached
 
     saved = torch.load(run_dir / "diffusion.pt", map_location="cpu",
@@ -177,7 +190,15 @@ def evaluate_generation(run: AutoencoderRun,
     audio_dir = run_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
     saved_per_class = {name: 0 for name in classes}
-    for start in range(0, len(requested), batch_size):
+    generation_batches = range(0, len(requested), batch_size)
+    progress = tqdm(
+        generation_batches,
+        total=(len(requested) + batch_size - 1) // batch_size,
+        desc=f"{run.name}: sampling, decoding, and CLAP scoring",
+        unit="batch",
+        dynamic_ncols=True,
+    )
+    for start in progress:
         label_batch = requested[start:start + batch_size]
         latent = torch.randn(
             len(label_batch), run.latent_size, latent_frames,
@@ -241,6 +262,8 @@ def evaluate_generation(run: AutoencoderRun,
     }
     with metrics_path.open("w") as handle:
         json.dump(metrics, handle, indent=2)
+    print(f"Saved generation metrics for {run.name} to {metrics_path}.",
+          flush=True)
     return metrics
 
 

@@ -14,7 +14,12 @@ from einops import reduce, rearrange
 import warnings
 # from utils import KoLeoLoss
 import math
-from .evaluation import linear_probe_torch, plot_embeddings, knn_classify
+
+
+@gin.configurable
+def build_ssl_model(model, device):
+    """Instantiate the SSL objective selected by the Gin configuration."""
+    return model(device=device)
 
 
 @gin.configurable
@@ -58,6 +63,19 @@ class Base(nn.Module):
         }
         torch.save(d, model_dir + "/checkpoint" + str(self.step) + ".pt")
 
+    def load_model(self, model_dir, step):
+        state_dict = torch.load(
+            f"{model_dir}/checkpoint{step}.pt", map_location="cpu")
+        incompatible = self.load_state_dict(state_dict["model_state"],
+                                            strict=False)
+        missing = [key for key in incompatible.missing_keys
+                   if "emb_model" not in key]
+        if missing or incompatible.unexpected_keys:
+            raise RuntimeError(
+                f"Checkpoint mismatch: missing={missing}, "
+                f"unexpected={incompatible.unexpected_keys}")
+        return state_dict
+
     def prep_data(self, batch):
 
         # return torch.randn((8, 32, 64)).to(self.device), torch.randn(
@@ -66,7 +84,7 @@ class Base(nn.Module):
         nglobal, nlocal = len(global_views), len(local_views)
 
         if self.data_transform is not None:
-            z = self.data_transform(z.to(self.device))
+            # z = self.data_transform(z.to(self.device))
             global_views = torch.cat(global_views, 0).to(self.device)
             global_views = self.data_transform(
                 global_views).float()  #.chunk(nglobal, 0)
@@ -75,11 +93,11 @@ class Base(nn.Module):
             local_views = self.data_transform(
                 local_views).float()  #.chunk(nlocal, 0)
         else:
-            z = z.to(self.device)
+            # z = z.to(self.device)
             global_views = torch.cat(global_views, 0).to(self.device)
             local_views = torch.cat(local_views, 0).to(self.device)
 
-        return z, global_views, local_views, nglobal, nlocal, labels
+        return None, global_views, local_views, nglobal, nlocal, labels
 
     @gin.configurable
     def fit(
@@ -94,16 +112,13 @@ class Base(nn.Module):
         model_dir: str,
         max_steps: int,
         logger: Optional[SummaryWriter] = None,
+        evaluator=None,
     ):
 
         self.init_train(lr=lr)
 
         if restart_step is not None:
-            state_dict = torch.load(f"{model_dir}/checkpoint" +
-                                    str(restart_step) + ".pt",
-                                    map_location="cpu")
-
-            self.load_state_dict(state_dict["model_state"], strict=True)
+            state_dict = self.load_model(model_dir, restart_step)
             try:
                 self.opt.load_state_dict(state_dict["opt_state"])
             except:
@@ -134,8 +149,9 @@ class Base(nn.Module):
                     losses_sum_count[k] = losses_sum_count.get(k, 0) + 1
 
                 if self.step % steps_display == 0:
-                    self.tepoch.set_postfix(loss=losses_sum["total_loss"] /
-                                            steps_display)
+                    self.tepoch.set_postfix(
+                        loss=losses_sum["total_loss"] /
+                        max(1, losses_sum_count["total_loss"]))
                     for k in losses_sum:
 
                         logger.add_scalar("Training/" + k,
@@ -145,58 +161,14 @@ class Base(nn.Module):
                         losses_sum[k] = 0.
                         losses_sum_count[k] = 0
 
-                # if (self.step) % steps_valid == 0:
-                #     print("Validation step")
-
-                #     self.eval()
-                #     with torch.no_grad():
-                #         allemb, alllabels = [], []
-                #         for batch in dataloader:
-                #             batch = self.prep_data(batch)
-                #             z, _, _, _, _, labels = batch
-                #             emb = self.student(z)
-                #             allemb.append(emb.cpu())
-                #             alllabels.extend(labels)
-                #             if len(alllabels) > 5000:
-                #                 break
-                #         allemb = torch.cat(allemb, 0)
-
-                #
-                # counts = Counter(alllabels)
-
-                # allemb = torch.nan_to_num(allemb, nan=0.)
-
-                # # keep only labels with at least 2 samples
-                # valid_labels = {
-                #     label
-                #     for label, count in counts.items() if count > 2
-                # }
-
-                # # filter labels + embeddings together
-                # filtered_labels = []
-                # filtered_emb = []
-
-                # for label, emb in zip(alllabels, allemb):
-                #     if label in valid_labels:
-                #         filtered_labels.append(label)
-                #         filtered_emb.append(emb)
-
-                # # convert back to tensor
-                # filtered_emb = torch.stack(filtered_emb)
-
-                # f = plot_embeddings(emb=filtered_emb.numpy(),
-                #                     labels=filtered_labels)
-
-                # logger.add_figure("UMAP of Embs", f, global_step=self.step)
-
-                # _, _, knn_accuracy = knn_classify(filtered_emb,
-                #                                   filtered_labels,
-                #                                   k=5,
-                #                                   test_size=0.2,
-                #                                   random_state=42)
-                # logger.add_scalar("knn_classification",
-                #                   knn_accuracy,
-                #                   global_step=self.step)
+                if (evaluator is not None and steps_valid > 0 and
+                        self.step % steps_valid == 0):
+                    self.eval()
+                    metrics = evaluator(self.student)
+                    for name, value in metrics.items():
+                        logger.add_scalar("Evaluation/SOL/" + name,
+                                          value,
+                                          global_step=self.step)
                     self.train()
 
                 if self.step % steps_save == 0:
@@ -693,4 +665,107 @@ class SimReg(Base):
             "total_loss": total_loss.item(),
             "distillation_loss": inv_loss.item(),
             "regularisation_loss": reg_loss.item(),
+        }
+
+
+class VISRegLoss(nn.Module):
+
+    def __init__(self, num_projections=256, scale_weight=1.0,
+                 shape_weight=1.0, center_weight=1.0):
+        super().__init__()
+        self.K = num_projections
+        self.scale_weight = scale_weight
+        self.shape_weight = shape_weight
+        self.center_weight = center_weight
+        self._cached_B = -1
+        self._cached_target = None
+
+    def _get_target(self, B, device):
+        if self._cached_B != B:
+            q = torch.linspace(1, B, B, device=device,
+                               dtype=torch.float32) / (B + 1)
+            self._cached_target = torch.erfinv(2 * q - 1) * math.sqrt(2)
+            self._cached_B = B
+        return self._cached_target.to(device=device)
+
+    def components(self, z):
+        """Compute VISReg components for embeddings shaped ``[V, B, D]``."""
+        _, B, D = z.shape
+        mu = z.mean(dim=1, keepdim=True)
+        center_loss = mu.square().mean()
+        z_centered = z - mu
+
+        std = (z_centered.norm(dim=1) / math.sqrt(B)).clamp_min(1e-6)
+        scale_loss = (std - 1.0).square().mean()
+        z_norm = z_centered / std.detach().unsqueeze(1)
+
+        directions = torch.randn(D, self.K, device=z.device, dtype=z.dtype)
+        directions = F.normalize(directions, dim=0)
+        projections = (z_norm @ directions).sort(dim=1).values
+        target = self._get_target(B, z.device).view(1, B, 1)
+        shape_loss = (projections - target).square().mean()
+        return {
+            "scale_loss": scale_loss,
+            "shape_loss": shape_loss,
+            "center_loss": center_loss,
+        }
+
+    def forward(self, z):
+        components = self.components(z)
+        return (
+            self.scale_weight * components["scale_loss"]
+            + self.shape_weight * components["shape_loss"]
+            + self.center_weight * components["center_loss"]
+        )
+
+
+@gin.configurable
+class VisReg(Base):
+
+    def __init__(self, data_transform, projection_head, encoder, device,
+                 reg_weight=0.5, num_projections=256, scale_weight=1.0,
+                 shape_weight=1.0, center_weight=1.0):
+        super().__init__(data_transform, projection_head, encoder, device)
+        self.reg_weight = reg_weight
+        self.student = encoder()
+        self.regloss = VISRegLoss(
+            num_projections=num_projections,
+            scale_weight=scale_weight,
+            shape_weight=shape_weight,
+            center_weight=center_weight,
+        )
+        self.to(device)
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def training_step(self, batch):
+        _, global_views, local_views, nglobal, nlocal, _ = batch
+        student_output = torch.cat([
+            self.student(global_views),
+            self.student(local_views),
+        ], dim=0)
+        student_output = student_output.view(
+            nglobal + nlocal, -1, student_output.shape[-1])
+
+        global_mean = student_output[:nglobal].mean(dim=0, keepdim=True)
+        inv_loss = (student_output - global_mean).square().mean()
+        reg_components = self.regloss.components(student_output)
+        reg_loss = (
+            self.regloss.scale_weight * reg_components["scale_loss"]
+            + self.regloss.shape_weight * reg_components["shape_loss"]
+            + self.regloss.center_weight * reg_components["center_loss"]
+        )
+        total_loss = ((1 - self.reg_weight) * inv_loss
+                      + self.reg_weight * reg_loss)
+
+        self.opt.zero_grad()
+        total_loss.backward()
+        self.opt.step()
+        return {
+            "total_loss": total_loss.item(),
+            "invariance_loss": inv_loss.item(),
+            "regularisation_loss": reg_loss.item(),
+            **{name: loss.item() for name, loss in reg_components.items()},
         }

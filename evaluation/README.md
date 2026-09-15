@@ -43,7 +43,41 @@ probe training. `--instruments` and `--max-instrument-examples` can narrow that
 pool. Alternate takes of the same SOL note are kept in the same train/validation
 split.
 
+Real-SOL CLAP embeddings are reused from compatible sibling output directories,
+so changing `--output-dir` does not encode the same selection again. On a cache
+miss, `--audio-workers` controls parallel loading and preprocessing (default 4)
+to keep the GPU fed. `--overwrite` does not invalidate this dataset-level cache;
+use `--recompute-clap-cache` when it must be rebuilt explicitly.
+
+SOL latent encoding uses the same prefetched audio loader and reuses compatible
+latent caches from sibling output directories. `--overwrite` therefore only
+restarts run-specific work; use `--recompute-latent-cache` to rebuild latents.
+
 The generation model is a non-causal rectified-flow transformer with rotary
 position embeddings. It trains for 100,000 steps by default, reports live loss
 and throughput with tqdm, and saves checkpoints and fixed-validation loss
 history per autoencoder.
+
+## Music2Latent baseline
+
+Music2Latent is an optional baseline for reconstruction, alignment, probing,
+and generation. Install it separately (its pretrained weights are downloaded
+on first use):
+
+```bash
+pip install music2latent
+```
+
+Run Music2Latent by itself with `--music2latent`, or combine the flag with one
+or more explicit `--run` arguments for a comparison:
+
+```bash
+python evaluation/run.py --tasks reconstruction alignment probing \
+  --music2latent \
+  --run jamendo_phase=autoencoder_runs/jamendo_phase \
+  --gpu 0
+```
+
+Pass `--music2latent-checkpoint PATH` to avoid the automatic weight download.
+`--music2latent-inference-batch-size` controls its internal encoder/decoder
+batching independently of the evaluation `--batch-size` and defaults to 4.

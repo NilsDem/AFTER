@@ -21,7 +21,7 @@ from data import (balanced_sol_records, jamendo_records, load_records,
 from generation import (evaluate_generation, plot_diffusion_losses,
                          train_diffusion)
 from latents import ensure_latents
-from models import load_autoencoder
+from models import load_autoencoder, load_music2latent
 from probing import evaluate_probes
 from reconstruction import (evaluate_reconstruction,
                              reference_embeddings)
@@ -73,6 +73,15 @@ def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("--run", action="append", default=None,
                        metavar="[NAME=]PATH", help="Repeat to compare runs")
+    value.add_argument(
+        "--music2latent", action="store_true",
+        help="Include the pretrained Music2Latent model in the evaluation")
+    value.add_argument(
+        "--music2latent-checkpoint", type=Path,
+        help="Optional local Music2Latent checkpoint; otherwise use its default")
+    value.add_argument(
+        "--music2latent-inference-batch-size", type=int, default=4,
+        help="Internal Music2Latent encode/decode batch size")
     value.add_argument("--step", action="append", default=[], metavar="NAME=STEP",
                        help="Checkpoint override; latest is used by default")
     value.add_argument("--tasks", nargs="+",
@@ -86,6 +95,12 @@ def parser() -> argparse.ArgumentParser:
                        help="Tiny datasets and training schedules for a smoke test")
     value.add_argument("--overwrite", action="store_true",
                        help="Recompute artifacts that already exist")
+    value.add_argument(
+        "--recompute-clap-cache", action="store_true",
+        help="Ignore compatible real-SOL CLAP caches and encode them again")
+    value.add_argument(
+        "--recompute-latent-cache", action="store_true",
+        help="Ignore compatible cross-run latent caches and encode them again")
     value.add_argument("--report-only", action="store_true",
                        help="Rebuild report.md only from saved JSON/audio artifacts")
     value.add_argument("--output-dir", type=Path,
@@ -103,6 +118,9 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--seed", type=int, default=0)
     value.add_argument("--num-samples", type=int, default=131072)
     value.add_argument("--batch-size", type=int, default=16)
+    value.add_argument(
+        "--audio-workers", type=int, default=4,
+        help="Parallel audio-loading threads for CLAP and latent encoding")
     value.add_argument("--reconstruction-examples", type=int, default=1000)
     value.add_argument("--alignment-examples", type=int, default=1000)
     value.add_argument("--alignment-epochs", type=int, default=30)
@@ -134,12 +152,14 @@ def apply_test_settings(args) -> None:
         args.generation_examples_per_instrument, 1)
     args.sampling_steps = min(args.sampling_steps, 2)
     args.batch_size = min(args.batch_size, 2)
+    args.audio_workers = 0
 
 
 def validate_args(args, run_paths: dict[str, Path], steps: dict[str, int]) -> None:
     if args.num_samples <= 0 or args.num_samples % 256:
         raise ValueError("--num-samples must be positive and divisible by 256")
-    positive = [args.batch_size, args.reconstruction_examples,
+    positive = [args.batch_size, args.music2latent_inference_batch_size,
+                args.reconstruction_examples,
                 args.alignment_examples, args.alignment_epochs,
                 args.max_instrument_examples, args.classifier_epochs,
                 args.probe_epochs, args.diffusion_steps,
@@ -147,6 +167,8 @@ def validate_args(args, run_paths: dict[str, Path], steps: dict[str, int]) -> No
                 args.generation_examples_per_instrument, args.sampling_steps]
     if any(value <= 0 for value in positive):
         raise ValueError("Evaluation counts, epochs, and steps must be positive")
+    if args.audio_workers < 0:
+        raise ValueError("--audio-workers must be non-negative")
     unknown_steps = set(steps) - set(run_paths)
     if unknown_steps:
         raise ValueError(f"--step names not present in --run: {sorted(unknown_steps)}")
@@ -160,9 +182,19 @@ def main(argv=None) -> None:
         print(f"Wrote {render_report(args.output_dir)}")
         return
 
-    run_paths = named_paths(args.run or DEFAULT_RUNS)
+    run_values = args.run if args.run is not None else (
+        [] if args.music2latent else DEFAULT_RUNS)
+    run_paths = named_paths(run_values)
+    if args.music2latent:
+        if "music2latent" in run_paths:
+            raise ValueError("The run name 'music2latent' is reserved")
+        run_paths["music2latent"] = None
+    if not run_paths:
+        raise ValueError("Specify at least one --run or pass --music2latent")
     steps = named_steps(args.step)
     validate_args(args, run_paths, steps)
+    if "music2latent" in steps:
+        raise ValueError("--step does not apply to the pretrained Music2Latent model")
     if args.gpu >= 0:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is unavailable; pass --gpu -1 to use CPU")
@@ -195,7 +227,10 @@ def main(argv=None) -> None:
 
     evaluation_metadata = {
         "seed": args.seed,
-        "runs": {name: str(path) for name, path in run_paths.items()},
+        "runs": {
+            name: ("pretrained" if path is None else str(path))
+            for name, path in run_paths.items()
+        },
         "tasks": args.tasks,
         "test": args.test,
         "num_samples": args.num_samples,
@@ -276,10 +311,17 @@ def main(argv=None) -> None:
     if "generation" in args.tasks:
         # The real-audio classifier is deliberately prepared before any run
         # evaluation so its scores cannot depend on generated examples.
+        print(
+            f"Preparing real-SOL CLAP cache for {len(instrument_records):,} "
+            f"examples (batch size {args.batch_size})...",
+            flush=True,
+        )
         clap_cache = ensure_sol_embeddings(
             args.output_dir, clap_encoder, instrument_records, args.num_samples,
-            44100, args.batch_size, args.seed, device, args.overwrite,
-            clap_path)
+            44100, args.batch_size, args.seed, device,
+            args.recompute_clap_cache,
+            clap_path, args.audio_workers)
+        print("Preparing CLAP control classifier...", flush=True)
         control_classifier, _ = train_control_classifier(
             args.output_dir, clap_cache, device, args.classifier_epochs,
             max(128, args.batch_size), args.seed, args.overwrite)
@@ -306,9 +348,22 @@ def main(argv=None) -> None:
                 args.batch_size, device, args.overwrite, clap_signature)
             print(f"Reference CLAP embeddings ready for {domain}.", flush=True)
 
+    if clap_encoder is not None and device.type == "cuda":
+        clap_encoder.to("cpu")
+        torch.cuda.empty_cache()
+
     for name, path in run_paths.items():
-        print(f"Loading {name} from {path}...", flush=True)
-        run = load_autoencoder(name, path, device, steps.get(name))
+        if name == "music2latent":
+            print("Loading pretrained Music2Latent...", flush=True)
+            run = load_music2latent(
+                device, args.num_samples,
+                args.music2latent_inference_batch_size,
+                None if args.music2latent_checkpoint is None else
+                args.music2latent_checkpoint.resolve(),
+            )
+        else:
+            print(f"Loading {name} from {path}...", flush=True)
+            run = load_autoencoder(name, path, device, steps.get(name))
         print(
             f"Loaded {name} at checkpoint {run.checkpoint_step} "
             f"(latent size {run.latent_size}).",
@@ -321,6 +376,7 @@ def main(argv=None) -> None:
                 f"--num-samples must be divisible by {name}'s hop {run.hop_size}")
 
         if "reconstruction" in args.tasks:
+            clap_encoder.to(device)
             for domain, records in reconstruction_sets.items():
                 metrics = evaluate_reconstruction(
                     run, domain, records, clap_encoder, reference_clap[domain],
@@ -328,6 +384,9 @@ def main(argv=None) -> None:
                     args.audio_examples, device, args.overwrite,
                     clap_signature)
                 print("reconstruction", name, domain, metrics)
+            if device.type == "cuda":
+                clap_encoder.to("cpu")
+                torch.cuda.empty_cache()
 
         if "alignment" in args.tasks:
             for domain, records in alignment_sets.items():
@@ -350,21 +409,34 @@ def main(argv=None) -> None:
                 print("alignment", name, domain, metrics, flush=True)
 
         if "generation" in args.tasks or "probing" in args.tasks:
+            print(
+                f"Preparing {name} SOL latent cache for "
+                f"{len(instrument_records):,} examples "
+                f"(batch size {args.batch_size})...",
+                flush=True,
+            )
             latent_cache = ensure_latents(
                 run, instrument_records, args.output_dir, args.num_samples,
-                args.batch_size, args.seed, device, args.overwrite)
+                args.batch_size, args.seed, device,
+                args.recompute_latent_cache, args.audio_workers)
         if "generation" in args.tasks:
+            print(f"Preparing {name} diffusion training...", flush=True)
             diffusion, _ = train_diffusion(
                 run, latent_cache, args.output_dir, device,
                 args.diffusion_steps, args.batch_size,
                 args.diffusion_checkpoint_every, args.seed, args.overwrite)
+            print(f"Evaluating generated audio for {name}...", flush=True)
+            clap_encoder.to(device)
             metrics = evaluate_generation(
                 run, diffusion, latent_cache, clap_cache, clap_encoder,
                 control_classifier, args.output_dir,
                 args.generation_examples_per_instrument, args.sampling_steps,
                 args.batch_size, args.audio_examples, device, args.seed,
                 args.overwrite)
-            print("generation", name, metrics)
+            print("generation", name, metrics, flush=True)
+            if device.type == "cuda":
+                clap_encoder.to("cpu")
+                torch.cuda.empty_cache()
         if "probing" in args.tasks:
             metrics = evaluate_probes(
                 run, latent_cache, args.output_dir, device, args.probe_epochs,
@@ -375,9 +447,11 @@ def main(argv=None) -> None:
             torch.cuda.empty_cache()
 
     if "generation" in args.tasks:
+        print("Rendering diffusion-loss plot...", flush=True)
         plot_diffusion_losses(args.output_dir, set(run_paths))
+    print("Rendering evaluation report...", flush=True)
     report_path = render_report(args.output_dir)
-    print(f"Wrote {report_path}")
+    print(f"Wrote {report_path}", flush=True)
 
 
 if __name__ == "__main__":

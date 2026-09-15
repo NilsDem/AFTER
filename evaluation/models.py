@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib.metadata import version
 from pathlib import Path
 
 import cached_conv as cc
@@ -22,7 +23,49 @@ class AutoencoderRun:
     sample_rate: int
     hop_size: int
     latent_size: int
-    checkpoint_step: int
+    checkpoint_step: int | str
+
+
+class Music2LatentAdapter(nn.Module):
+    """Expose Music2Latent through the interface used by this evaluation."""
+
+    def __init__(self, encoder_decoder, num_samples: int,
+                 inference_batch_size: int):
+        super().__init__()
+        self.encoder_decoder = encoder_decoder
+        self.num_samples = num_samples
+        self.inference_batch_size = inference_batch_size
+
+    def encode_stats(self, audio: torch.Tensor) -> tuple[torch.Tensor,
+                                                          torch.Tensor]:
+        assert audio.ndim == 3 and audio.shape[1] == 1, (
+            "Music2Latent expects mono audio with shape [batch, 1, samples]")
+        latent = self.encoder_decoder.encode(
+            audio[:, 0], max_batch_size=self.inference_batch_size)
+        latent = torch.as_tensor(latent, device=audio.device,
+                                 dtype=audio.dtype)
+        return latent, torch.zeros_like(latent)
+
+    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+        decoded = self.encoder_decoder.decode(
+            latent, max_batch_size=self.inference_batch_size)
+        decoded = torch.as_tensor(decoded, device=latent.device,
+                                  dtype=latent.dtype)
+        if decoded.ndim != 2:
+            raise ValueError(
+                f"Music2Latent returned decoded shape {tuple(decoded.shape)}; "
+                "expected [batch, samples]")
+        if decoded.shape[0] != latent.shape[0]:
+            if decoded.shape[1] != latent.shape[0]:
+                raise ValueError(
+                    f"Music2Latent returned decoded shape {tuple(decoded.shape)} "
+                    f"for a batch of {latent.shape[0]}")
+            decoded = decoded.transpose(0, 1)
+        decoded = decoded[:, None, :self.num_samples]
+        if decoded.shape[-1] < self.num_samples:
+            decoded = torch.nn.functional.pad(
+                decoded, (0, self.num_samples - decoded.shape[-1]))
+        return decoded
 
 
 def checkpoint_steps(path: Path) -> list[int]:
@@ -78,6 +121,38 @@ def load_autoencoder(name: str, path: Path, device: torch.device,
         hop_size=int(model.time_transform.hop_size),
         latent_size=int(model.bottleneck_size),
         checkpoint_step=step,
+    )
+
+
+def load_music2latent(device: torch.device, num_samples: int,
+                      inference_batch_size: int,
+                      checkpoint: Path | None = None) -> AutoencoderRun:
+    try:
+        from music2latent import EncoderDecoder
+    except ImportError as error:
+        raise ImportError(
+            "Music2Latent evaluation requires the optional dependency. "
+            "Install it with `pip install music2latent`.") from error
+
+    if checkpoint is not None and not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+    print("Initializing Music2Latent (weights may download on first use)...",
+          flush=True)
+    encoder_decoder = EncoderDecoder(
+        load_path_inference=(None if checkpoint is None else str(checkpoint)),
+        device=device,
+    )
+    adapter = Music2LatentAdapter(
+        encoder_decoder, num_samples, inference_batch_size).eval()
+    model_version = version("music2latent")
+    return AutoencoderRun(
+        name="music2latent",
+        path=checkpoint or Path("music2latent-pretrained"),
+        model=adapter,
+        sample_rate=44_100,
+        hop_size=4_096,
+        latent_size=64,
+        checkpoint_step=f"music2latent-{model_version}",
     )
 
 

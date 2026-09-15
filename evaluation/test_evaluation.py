@@ -6,9 +6,12 @@ from after.autoencoder.latent_priors import SinusoidalEmbedding
 from after.diffusion.networks.rotary_embedding import RotaryEmbedding
 
 from .alignment import evaluate_alignment
-from .data import AudioRecord, validation_mask
+from .clap import ensure_sol_embeddings
+from .data import AudioRecord, audio_batches, ids_digest, validation_mask
+from .latents import ensure_latents
 from .metrics import clap_fad, si_sdr
-from .models import AutoencoderRun, ConditionalRectifiedFlow, LatentProbe
+from .models import (AutoencoderRun, ConditionalRectifiedFlow, LatentProbe,
+                     Music2LatentAdapter)
 
 
 def test_si_sdr_prefers_matching_signal():
@@ -21,6 +24,77 @@ def test_si_sdr_prefers_matching_signal():
 def test_clap_fad_is_zero_for_identical_embeddings():
     embeddings = torch.randn(12, 8)
     assert clap_fad(embeddings, embeddings) < 1e-8
+
+
+def test_sol_clap_cache_is_reused_from_sibling_output_dir(tmp_path):
+    records = [AudioRecord(
+        id="sol:test.wav", path="unused.wav", sample_rate=44100,
+        instrument="test", pitch=60, group="test")]
+    payload = {
+        "ids": [records[0].id],
+        "ids_digest": ids_digest([records[0].id]),
+        "seed": 0,
+        "embeddings": torch.ones(1, 4),
+        "labels": torch.zeros(1, dtype=torch.long),
+        "validation": torch.ones(1, dtype=torch.bool),
+        "classes": ["test"],
+        "num_samples": 1024,
+        "checkpoint_signature": None,
+    }
+    sibling_cache = tmp_path / "previous" / "control" / "sol_clap_embeddings.pt"
+    sibling_cache.parent.mkdir(parents=True)
+    torch.save(payload, sibling_cache)
+
+    cache = ensure_sol_embeddings(
+        tmp_path / "current", None, records, 1024, 44100, 1, 0,
+        torch.device("cpu"), overwrite=False)
+
+    torch.testing.assert_close(cache["embeddings"], payload["embeddings"])
+
+
+def test_latent_cache_is_reused_from_sibling_output_dir(tmp_path):
+    records = [AudioRecord(
+        id="sol:test.wav", path="unused.wav", sample_rate=44100,
+        instrument="test", pitch=60, group="test")]
+    run = AutoencoderRun(
+        "test_model", tmp_path, torch.nn.Identity(), 44100, 256, 4, 12)
+    payload = {
+        "ids": [records[0].id],
+        "ids_digest": ids_digest([records[0].id]),
+        "seed": 0,
+        "latents": torch.ones(1, 4, 2),
+        "instrument_labels": torch.zeros(1, dtype=torch.long),
+        "pitch_class_labels": torch.zeros(1, dtype=torch.long),
+        "validation": torch.ones(1, dtype=torch.bool),
+        "classes": ["test"],
+        "num_samples": 1024,
+        "checkpoint_step": run.checkpoint_step,
+    }
+    sibling_cache = tmp_path / "previous" / "latents" / "test_model.pt"
+    sibling_cache.parent.mkdir(parents=True)
+    torch.save(payload, sibling_cache)
+
+    cache = ensure_latents(
+        run, records, tmp_path / "current", 1024, 1, 0,
+        torch.device("cpu"), overwrite=False)
+
+    torch.testing.assert_close(cache["latents"], payload["latents"])
+
+
+def test_threaded_audio_batches_preserve_record_order(monkeypatch):
+    records = [AudioRecord(str(index), "unused.wav", 44100)
+               for index in range(5)]
+
+    def fake_load_audio(record, num_samples, sample_rate):
+        assert sample_rate == 44100
+        return torch.full((1, num_samples), float(record.id))
+
+    monkeypatch.setattr("evaluation.data.load_audio", fake_load_audio)
+    loaded = torch.cat(list(audio_batches(
+        records, num_samples=4, sample_rate=44100, batch_size=2,
+        workers=2, pin_memory=False)))
+
+    torch.testing.assert_close(loaded[:, 0, 0], torch.arange(5).float())
 
 
 def test_sol_split_keeps_groups_together_and_both_classes_present():
@@ -85,6 +159,27 @@ def test_noise_embedding_is_smooth_and_preserves_unit_interval():
 def test_probe_shape():
     probe = LatentProbe(latent_size=4, num_classes=12)
     assert probe(torch.randn(3, 4, 16)).shape == (3, 12)
+
+
+def test_music2latent_adapter_shapes_and_output_length():
+    class FakeMusic2Latent:
+        def encode(self, audio, max_batch_size):
+            assert audio.shape == (3, 8192)
+            assert max_batch_size == 2
+            return torch.ones(3, 64, 2)
+
+        def decode(self, latent, max_batch_size):
+            assert latent.shape == (3, 64, 2)
+            assert max_batch_size == 2
+            return torch.ones(3, 8000)
+
+    adapter = Music2LatentAdapter(FakeMusic2Latent(), num_samples=8192,
+                                  inference_batch_size=2)
+    latent, scale = adapter.encode_stats(torch.randn(3, 1, 8192))
+    assert latent.shape == scale.shape == (3, 64, 2)
+    reconstruction = adapter.decode(latent)
+    assert reconstruction.shape == (3, 1, 8192)
+    assert torch.count_nonzero(reconstruction[..., 8000:]) == 0
 
 
 def test_linear_alignment_learns_predictable_targets(tmp_path):

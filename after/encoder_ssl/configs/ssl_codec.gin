@@ -1,0 +1,91 @@
+from __gin__ import dynamic_registration
+import after.encoder_ssl.audio_augmentations
+import after.encoder_ssl.data
+import after.encoder_ssl.model
+import after.encoder_ssl.sol_evaluation
+import after.encoder_ssl.transforms
+import after.diffusion.networks.ecapa_encoder
+
+
+REPRESENTATION = "codec"
+IN_SIZE = None
+SR = 44100
+AUDIO_CHANNELS = 1
+
+# The loader reads exactly one 524288-sample waveform chunk.
+after.encoder_ssl.data.SSLViewCollator:
+    n_global = 2
+    n_local = 2
+    n_signal_global = 65536
+    n_signal_local = 32768
+    max_view_separation_seconds = 10.402539682539683
+
+after.encoder_ssl.audio_augmentations.TimbreAugmentation:
+    compressor_p = 0.5
+    reverb_p = 0.5
+    pitch_shift_p = 0.3
+    pitch_shift_min_semitones = -4.0
+    pitch_shift_max_semitones = 4.0
+    loudness_p = 0.5
+    loudness_min_gain_db = -10.0
+    loudness_max_gain_db = 0.0
+    time_stretch_p = 0.3
+    time_stretch_min_rate = 0.8
+    time_stretch_max_rate = 1.2
+    silence_p = 0.25
+    silence_min_fraction = 0.05
+    silence_max_fraction = 0.3
+    min_chunks = 1
+    max_chunks = 3
+    overlap_seconds = 0.05
+# This transform runs after transfer to the GPU. Its output is [B, 128, T].
+
+encoder/after.diffusion.networks.ecapa_encoder.ECAPATDNN:
+    in_size = %IN_SIZE
+    out_dim = 64
+    channels = [512, 512, 512, 1024, 2048]
+    kernel_sizes = [3, 3, 3, 3, 3]
+    dilations = [1, 1, 1, 1, 1]
+    groups = [1, 1, 1, 1, 1]
+    res2net_scale = 8
+    se_channels = 256
+    attention_channels = 256
+    global_context = True
+    pooling = True
+    use_tanh = False
+    spherical_normalisation = False
+    regularisation = "none"
+
+after.encoder_ssl.model.VisReg:
+    data_transform = @after.encoder_ssl.transforms.CodecEncoderTransform
+    projection_head = None
+    encoder = @encoder/after.diffusion.networks.ecapa_encoder.ECAPATDNN
+    reg_weight = 0.75
+    num_projections = 256
+    scale_weight = 1.0
+    shape_weight = 1.0
+    center_weight = 1.0
+
+after.encoder_ssl.model.build_ssl_model:
+    model = @after.encoder_ssl.model.VisReg
+
+after.encoder_ssl.model.Base.fit:
+    lr = 1e-4
+    steps_display = 100
+    steps_valid = 25000
+    steps_save = 25000
+    max_steps = 1000000
+
+after.encoder_ssl.sol_evaluation.SOLProbeEvaluator:
+    path = "/data/datasets/ardbeg_slow-1/waveform/sol-full"
+    sample_rate = %SR
+    num_samples = 131072
+    max_examples = 1000
+    batch_size = 32
+    probe_epochs = 20
+    probe_batch_size = 256
+    probe_learning_rate = 1e-3
+    random_seed = 0
+    num_workers = 0
+    sanity_max_examples = 512
+    sanity_probe_epochs = 2

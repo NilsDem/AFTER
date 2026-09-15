@@ -7,6 +7,7 @@ import json
 import random
 import re
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -182,6 +183,34 @@ def load_batch(records: Sequence[AudioRecord], num_samples: int,
     return torch.stack([
         load_audio(record, num_samples, sample_rate) for record in records
     ])
+
+
+def audio_batches(records: Sequence[AudioRecord], num_samples: int,
+                  sample_rate: int, batch_size: int, workers: int,
+                  pin_memory: bool) -> Iterable[torch.Tensor]:
+    """Load one batch ahead without forking after CUDA initialization."""
+    record_batches = iter(batches(records, batch_size))
+    if not workers:
+        for record_batch in record_batches:
+            yield load_batch(record_batch, num_samples, sample_rate)
+        return
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        def submit(record_batch):
+            return [executor.submit(
+                load_audio, record, num_samples, sample_rate)
+                for record in record_batch]
+
+        futures = submit(next(record_batches))
+        while futures:
+            audio = torch.stack([future.result() for future in futures])
+            try:
+                futures = submit(next(record_batches))
+            except StopIteration:
+                futures = []
+            if pin_memory:
+                audio = audio.pin_memory()
+            yield audio
 
 
 def batches(values: Sequence, batch_size: int) -> Iterable[Sequence]:

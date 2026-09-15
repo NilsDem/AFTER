@@ -1,3 +1,3 @@
 from .evaluation import *
-from .model import SimDino, Base
+from .model import Base, SimDino, VisReg
 from .utils import *

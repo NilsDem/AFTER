@@ -39,7 +39,7 @@ flags.DEFINE_multi_string(
     required=True)
 flags.DEFINE_string('output_path', '.', 'Root output directory')
 flags.DEFINE_string('parser', 'simple_audio',
-                    'File parser: simple_audio or simple_midi')
+                    'File parser: simple_audio, simple_midi, or slakh')
 flags.DEFINE_multi_string('ext', ['wav', 'opus', 'mp3', 'aac', 'flac'],
                           'Audio extensions')
 flags.DEFINE_multi_string('exclude', [], 'Filename substrings to exclude')
@@ -695,10 +695,8 @@ def process_db(input_path, output_path, device, emb_model, z_length, ae_ratio,
                     writemap=False,
                     readahead=False)
 
-    audio_files, midi_files, _ = get_parser(FLAGS.parser)(input_path, FLAGS.midi_folder,
-                                                          FLAGS.ext,
-                                                          FLAGS.exclude,
-                                                          FLAGS.include)
+    audio_files, midi_files, metadatas = get_parser(FLAGS.parser)(
+        input_path, FLAGS.midi_folder, FLAGS.ext, FLAGS.exclude, FLAGS.include)
 
     cur_index = 0
     chunk_entries = []
@@ -714,9 +712,9 @@ def process_db(input_path, output_path, device, emb_model, z_length, ae_ratio,
                                       FLAGS.silence_aug_structure_pct))
 
     try:
-        for file, preloaded_midi_path in zip(
+        for file, preloaded_midi_path, source_metadata in zip(
                 tqdm(audio_files, desc=pathlib.Path(input_path).name),
-                midi_files):
+                midi_files, metadatas):
             try:
                 audio, _ = librosa.load(file,
                                         sr=FLAGS.sample_rate,
@@ -760,8 +758,9 @@ def process_db(input_path, output_path, device, emb_model, z_length, ae_ratio,
                 base_entry = {
                     "chunk": chunk,
                     "metadata": {
+                        **source_metadata,
                         "chunk_index": chunk_idx,
-                        "path": str(file)
+                        "path": str(file),
                     },
                     "midi": midi,
                 }
