@@ -51,6 +51,12 @@ class PriorStreamer(nn_tilde.Module):
         self.register_buffer("active_batch_size",
                              torch.zeros(1, dtype=torch.long))
 
+        self.frozen = False
+        self.register_attribute("frozen_ratio", 0.5)
+        # TODO remove hardcoded 16, we have to get the size of the transformer output
+        self.register_buffer(
+            "frozen_cond_buffer", torch.zeros(max_batch_size, 16))
+
         prior_channels = cond_channels if cond_channels > 0 else 1
         prior_labels = ([
             f"(signal) Timbre condition {i}" for i in range(cond_channels)
@@ -92,6 +98,15 @@ class PriorStreamer(nn_tilde.Module):
     @torch.jit.export
     def set_nb_steps(self, nb_steps: int) -> int:
         self.nb_steps = (nb_steps, )
+        return 0
+
+    @torch.jit.export
+    def get_frozen_ratio(self) -> float:
+        return self.frozen_ratio[0]
+
+    @torch.jit.export
+    def set_frozen_ratio(self, frozen_ratio: float) -> int:
+        self.frozen_ratio = (frozen_ratio, )
         return 0
 
     @torch.jit.export
@@ -144,12 +159,26 @@ class PriorStreamer(nn_tilde.Module):
     def sample_prior(self, z_prior: torch.Tensor, cond: torch.Tensor):
         x = self.noise(z_prior)
         dt = 1.0 / self.nb_steps[0]
+
+        if self.frozen_ratio[0] > 0 and not self.frozen:
+            self.frozen_cond_buffer[:z_prior.shape[0]] = z_prior
+            self.frozen = True
+        elif self.frozen_ratio[0] == 0 and self.frozen:
+            self.frozen = False
+
+        frozen_steps = int(self.frozen_ratio[0] * self.nb_steps[0])
+
         for step in range(self.nb_steps[0]):
             time = torch.full((1, ),
                               float(step) / float(self.nb_steps[0]),
                               device=x.device,
                               dtype=x.dtype).repeat(x.shape[0])
-            x = x + dt * self.predictor(x, z_prior, time, cond=cond)
+
+            if step < frozen_steps:
+                x = x + dt * self.predictor(x, self.frozen_cond_buffer[:z_prior.shape[0]], time, cond=cond)
+            else:
+                x = x + dt * self.predictor(x, z_prior, time, cond=cond)
+            
         return x.unsqueeze(-1)
 
     def sample_listen(self, z_prior: torch.Tensor, z_listen: torch.Tensor,
