@@ -62,6 +62,8 @@ flags.DEFINE_string(
 )
 flags.DEFINE_bool("use_cache", False, "Whether to cache the dataset.")
 flags.DEFINE_integer("num_workers", 0, "Number of workers.")
+flags.DEFINE_integer("prefetch_factor", 2, "Prefetch factor")
+
 flags.DEFINE_float("adv", None, "Adversarial strengh - overides config if set")
 flags.DEFINE_bool("use_validation", True, "Use a train/validation split")
 flags.DEFINE_bool(
@@ -416,14 +418,17 @@ def main(argv):
             shift_tc=(gin.query_parameter("diffusion.utils.collate_fn.shift_tc")
                       if structure_type == "midi" else 0),
             filter=filter)
+        # Lazy items are fresh random crops, so use long virtual epochs to
+        # avoid draining and refilling the prefetch queue every few batches.
+        train_sampler = torch.utils.data.RandomSampler(
+            dataset, replacement=True,
+            num_samples=max(len(dataset), 10000 * FLAGS.batch_size))
     else:
         dataset, valset, train_sampler, val_sampler = get_datasets(
             data_keys=data_keys, freqs=FLAGS.freqs, use_cache=FLAGS.use_cache,
             use_validation=FLAGS.use_validation, filter=filter)
     diffusion_collator = collate_online if online else collate_fn
 
-    print(len(dataset))
-    exit()
 
     train_loader = torch.utils.data.DataLoader(
         dataset,
@@ -435,6 +440,7 @@ def main(argv):
         collate_fn=diffusion_collator,
         sampler=train_sampler, 
         persistent_workers=FLAGS.num_workers > 0,
+        prefetch_factor=FLAGS.prefetch_factor,
         )
 
     if FLAGS.use_validation:
