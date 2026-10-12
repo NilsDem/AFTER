@@ -430,7 +430,9 @@ def main(argv):
         drop_last=True,
         pin_memory=torch.device(device).type == "cuda",
         collate_fn=diffusion_collator,
-        sampler=train_sampler)
+        sampler=train_sampler, 
+        persistent_workers=FLAGS.num_workers > 0,
+        )
 
     if FLAGS.use_validation:
         valid_loader = torch.utils.data.DataLoader(
