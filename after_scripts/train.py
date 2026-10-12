@@ -82,6 +82,7 @@ flags.DEFINE_string("ssl_config", None,
                     "defaults to config.gin beside that checkpoint.")
 flags.DEFINE_bool("skip_ssl", False, "Start diffusion without inline SSL pretraining.")
 flags.DEFINE_enum("precision", "fp32", ["fp32", "bf16"], "Training autocast precision.")
+flags.DEFINE_bool("compile", False, "Compile the diffusion network with torch.compile.")
 
 
 def add_gin_extension(config_name: str) -> str:
@@ -476,6 +477,9 @@ def main(argv):
 
     if FLAGS.ssl_checkpoint or FLAGS.ssl_config or FLAGS.skip_ssl:
         d["timbre_warmup"] = 0
+    if FLAGS.compile:
+        # Compile in place to preserve module identity and checkpoint keys.
+        blender.net.compile()
     blender.fit(**d)
 
 
