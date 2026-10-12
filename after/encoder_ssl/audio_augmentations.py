@@ -5,11 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import random
+import math
 import time
 from typing import Callable, Sequence
 
 from audiomentations import (ApplyImpulseResponse, Gain, PitchShift, TimeMask,
                              TimeStretch)
+from audiomentations.core.transforms_interface import BaseWaveformTransform
 import gin
 import numpy as np
 from pedalboard import Compressor as PedalboardCompressor
@@ -65,6 +67,7 @@ class PedalPitchShift:
         return effect(samples, sample_rate).astype(np.float32, copy=False)
 
 
+@gin.configurable
 def compressor(p: float = 1.0) -> RandomCompressor:
     return RandomCompressor(p=p)
 
@@ -73,6 +76,7 @@ def pedal_pitchshift(p: float = 1.0) -> PedalPitchShift:
     return PedalPitchShift(p=p)
 
 
+@gin.configurable
 def reverb(ir_path: str | Path = DEFAULT_IR_PATH,
            p: float = 1.0) -> ApplyImpulseResponse:
     ir_files = sorted(Path(ir_path).expanduser().resolve().rglob("*.wav"))
@@ -82,24 +86,74 @@ def reverb(ir_path: str | Path = DEFAULT_IR_PATH,
                                 leave_length_unchanged=True, p=p)
 
 
+@gin.configurable
 def pitch_shift(min_semitones=-3.0, max_semitones=3.0,
                 p=1.0) -> PitchShift:
     return PitchShift(min_semitones=min_semitones,
                       max_semitones=max_semitones, p=p)
 
 
+@gin.configurable
 def loudness(min_gain_db=-10.0, max_gain_db=0.0, p=1.0) -> Gain:
     return Gain(min_gain_db=min_gain_db, max_gain_db=max_gain_db, p=p)
 
 
-def time_stretch(min_rate=0.8, max_rate=1.2, p=1.0) -> TimeStretch:
+@gin.configurable
+def time_stretch(min_rate=0.8, max_rate=1.2, p=1.0,
+                 leave_length_unchanged=True) -> TimeStretch:
     return TimeStretch(min_rate=min_rate, max_rate=max_rate,
-                       leave_length_unchanged=True, p=p)
+                       leave_length_unchanged=leave_length_unchanged, p=p)
 
 
+@gin.configurable
 def silence(min_fraction=0.05, max_fraction=0.3, p=1.0) -> TimeMask:
     return TimeMask(min_band_part=min_fraction, max_band_part=max_fraction,
                     fade=True, p=p)
+
+
+@gin.configurable
+@dataclass
+class WholeAudioAugmentation:
+    """Apply shared transforms once to a whole crop, returning MIDI geometry.
+
+    TimeStretch must keep its natural output length: the loader provides extra
+    context, then crops the result without padding. Other transforms use the
+    same implementations as TimbreAugmentation.
+    """
+
+    transforms: Sequence[Callable] = ()
+
+    def __post_init__(self):
+        for transform in self.transforms:
+            if isinstance(transform, TimeStretch) and transform.leave_length_unchanged:
+                raise ValueError("Whole-crop time_stretch requires leave_length_unchanged=False")
+
+    @property
+    def max_stretch_rate(self):
+        # Include the skipped-transform case when its probability is below 1.
+        return math.prod(max(1., transform.max_rate) for transform in self.transforms
+                         if isinstance(transform, TimeStretch) and transform.p > 0)
+
+    def __call__(self, audio, sample_rate, midi=False):
+        audio = np.asarray(audio, dtype=np.float32).copy()
+        rate, semitones = 1., 0
+        for transform in self.transforms:
+            if isinstance(transform, BaseWaveformTransform):
+                transform.randomize_parameters(audio, sample_rate)
+                if not transform.parameters["should_apply"]:
+                    continue
+                if isinstance(transform, PitchShift):
+                    if midi:
+                        # MIDI rolls encode discrete pitches; audio must use the same shift.
+                        transform.parameters["num_semitones"] = random.randint(
+                            math.ceil(transform.min_semitones), math.floor(transform.max_semitones))
+                    semitones += transform.parameters["num_semitones"]
+                elif isinstance(transform, TimeStretch):
+                    rate *= transform.parameters["rate"]
+                audio = transform.apply(audio, sample_rate)
+            else:
+                audio = transform(audio, sample_rate=sample_rate)
+        return np.ascontiguousarray(audio, dtype=np.float32), rate, semitones
 
 
 def _fixed_length(audio: np.ndarray, length: int) -> np.ndarray:

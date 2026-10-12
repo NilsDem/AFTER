@@ -1,7 +1,6 @@
 """Worker-side aligned waveform/MIDI augmentation; codec runs in the trainer."""
 from functools import lru_cache
 from pathlib import Path
-import random
 
 import gin
 import numpy as np
@@ -9,6 +8,7 @@ import pretty_midi
 import torch
 
 from after.dataset import LazyWaveformDataset, CombinedLazyWaveformDataset
+from after.encoder_ssl.audio_augmentations import WholeAudioAugmentation
 
 
 @lru_cache(maxsize=32)
@@ -42,10 +42,9 @@ def cropped_piano_roll(notes, start, rate, semitones, frames, hop):
 class OnlineWaveformDataset(LazyWaveformDataset):
     def __init__(self, path, n_signal, ae_ratio, sample_rate, structure_type,
                  audio_channels=1, compress_tc=1, shift_tc=0, split=None,
-                 filter=None, augment=True, stretch_range=(0.8, 1.2),
-                 pitch_range=(-4, 4), augmentation_probability=0.5):
+                 filter=None, augment=True, structure_augmentation=None,
+                 timbre_augmentation=None):
         assert structure_type in ('audio', 'midi')
-        assert 0 < stretch_range[0] <= stretch_range[1]
         self.target_samples = n_signal * ae_ratio
         self.structure_type = structure_type
         self.n_signal = n_signal
@@ -53,14 +52,14 @@ class OnlineWaveformDataset(LazyWaveformDataset):
         self.shift_tc = shift_tc
         self.ae_ratio = ae_ratio
         self.augment = augment
-        self.stretch_range = stretch_range
-        self.pitch_range = pitch_range
-        self.augmentation_probability = augmentation_probability
+        self.structure_augmentation = structure_augmentation or WholeAudioAugmentation(transforms=())
+        self.timbre_augmentation = timbre_augmentation or WholeAudioAugmentation(transforms=())
         # Read enough source context even for the fastest sampled stretch.
-        load_samples = int(np.ceil((n_signal + max(0, shift_tc)) * ae_ratio *
-                                   max(1., stretch_range[1] if augment else 1.)))
+        max_rate = max(self.structure_augmentation.max_stretch_rate,
+                       self.timbre_augmentation.max_stretch_rate) if augment else 1.
+        load_samples = int(np.ceil((n_signal + max(0, shift_tc)) * ae_ratio * max_rate))
         super().__init__(path, load_samples, sample_rate, audio_channels,
-                         split=split, filter=filter)
+                         split=split, filter=filter, pad_short_audio=False)
         self.midi_paths = {}
         if structure_type == 'midi':
             root = (Path(self.path) / self.metadata['source_root']).resolve()
@@ -72,21 +71,24 @@ class OnlineWaveformDataset(LazyWaveformDataset):
                     raise FileNotFoundError(midi_path)
                 self.midi_paths[record['resolved_path']] = str(midi_path)
 
+    def source_crop_frames(self, source_sample_rate):
+        # Round up so resampling never needs a padding sample at the crop end.
+        return int(np.ceil(self.num_signal * source_sample_rate / self.sample_rate))
+
     def __getitem__(self, index):
         item = super().__getitem__(index)
         if 'audio_load_error' in item['metadata']:
             raise RuntimeError(f"Failed to load paired training audio: {item['metadata']}")
         waveform = item['waveform']
-        timbre = waveform[:, :self.target_samples].copy()
+        timbre = waveform.copy()
         rate, semitones = 1., 0
-        if self.augment and random.random() < self.augmentation_probability:
-            import librosa
-            rate = random.uniform(*self.stretch_range)
-            semitones = random.randint(*self.pitch_range)
-            waveform = librosa.effects.time_stretch(waveform, rate=rate)
-            if semitones:
-                waveform = librosa.effects.pitch_shift(
-                    waveform, sr=self.sample_rate, n_steps=semitones)
+        if self.augment:
+            timbre, _, _ = self.timbre_augmentation(timbre, self.sample_rate)
+            waveform, rate, semitones = self.structure_augmentation(
+                waveform, self.sample_rate, midi=self.structure_type == 'midi')
+        assert timbre.shape[-1] >= self.target_samples, 'Timbre augmentation returned too little audio'
+        assert waveform.shape[-1] >= self.target_samples, 'Structure augmentation returned too little audio'
+        timbre = np.ascontiguousarray(timbre[:, :self.target_samples])
         waveform = np.ascontiguousarray(waveform[:, :self.target_samples])
         assert waveform.shape[-1] == self.target_samples
         result = {'waveform': waveform, 'timbre_waveform': timbre,

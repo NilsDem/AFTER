@@ -43,12 +43,14 @@ class LazyWaveformDataset(torch.utils.data.Dataset):
                  audio_channels=1,
                  split=None,
                  validation_size=0.02,
-                 filter=None):
+                 filter=None,
+                 pad_short_audio=True):
         super().__init__()
         self.path = str(Path(path).resolve())
         self.num_signal = int(num_signal)
         self.sample_rate = int(sample_rate)
         self.audio_channels = int(audio_channels)
+        self.pad_short_audio = pad_short_audio
 
         with open(Path(self.path) / LAZY_METADATA, encoding="utf-8") as handle:
             self.metadata = json.load(handle)
@@ -163,6 +165,8 @@ class LazyWaveformDataset(torch.utils.data.Dataset):
             audio = self._convert_channels(audio)
             audio = self._resample(audio, record["sample_rate"])
             if audio.shape[-1] < self.num_signal:
+                if not self.pad_short_audio:
+                    raise EOFError(f"Resampled crop has {audio.shape[-1]} samples; expected {self.num_signal}")
                 audio = np.pad(
                     audio,
                     ((0, 0), (0, self.num_signal - audio.shape[-1])))
