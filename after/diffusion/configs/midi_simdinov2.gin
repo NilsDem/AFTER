@@ -121,13 +121,13 @@ import after.encoder_ssl.audio_augmentations
 structure/after.encoder_ssl.audio_augmentations.time_stretch:
     min_rate = 0.8
     max_rate = 1.2
-    p = 0.5
+    p = 0.15
     leave_length_unchanged = False
 
 structure/after.encoder_ssl.audio_augmentations.pitch_shift:
     min_semitones = -3
     max_semitones = 3
-    p = 0.5
+    p = 0.15
 
 structure/after.encoder_ssl.audio_augmentations.WholeAudioAugmentation:
     transforms = [@structure/after.encoder_ssl.audio_augmentations.time_stretch(),
