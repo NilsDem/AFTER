@@ -185,10 +185,29 @@ It returns the regularizer through the existing `cond_reg` loss path and does
 not sample a VAE latent. Its statistic runs in FP32 during BF16 training.
 `after.regularisation.SIGReg` exposes `knots` and `num_projections` for tuning.
 
-Online augmentations are configured on `diffusion.online_data.OnlineWaveformDataset`:
-`stretch_range=(0.8,1.2)`, `pitch_range=(-4,4)` (integer semitones), and
-`augmentation_probability=0.5`. They jointly transform the generation target
-and its MIDI/audio structure. Timbre uses an unaugmented waveform crop.
+Online augmentations reuse `after.encoder_ssl.audio_augmentations` with
+`WholeAudioAugmentation`, applying each transform once to the whole crop.
+`OnlineWaveformDataset.structure_augmentation` jointly transforms the generation
+target and its MIDI/audio structure; `timbre_augmentation` is independent.
+The `midi_simdinov2` config uses separate Gin scopes: structure time stretch
+(`min_rate=0.8`, `max_rate=1.2`, `p=0.5`) and pitch shift
+(`min_semitones=-3`, `max_semitones=3`, `p=0.5`), and an empty timbre list.
+MIDI-paired pitch shifts sample integer semitones. Pitch and stretch use the
+shared Signalsmith backend. Whole-crop time stretch requires
+`leave_length_unchanged=False`; the loader reads enough context for the maximum
+stretch rate of either branch and crops after augmentation without padding.
+To enable timbre loudness augmentation, for example:
+
+```gin
+timbre/after.encoder_ssl.audio_augmentations.loudness:
+    min_gain_db = -6.0
+    max_gain_db = 0.0
+    p = 0.5
+timbre/after.encoder_ssl.audio_augmentations.WholeAudioAugmentation:
+    transforms = [@timbre/after.encoder_ssl.audio_augmentations.loudness()]
+```
+
+An empty transform list disables that branch's waveform augmentation.
 Validation disables augmentation. File splitting happens before random crops.
 Each worker caches at most 32 sparse MIDI note arrays; only the selected crop's
 piano roll is allocated. Waveforms are read with enough context for stretching,

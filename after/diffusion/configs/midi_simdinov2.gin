@@ -11,7 +11,7 @@ N_SIGNAL = None
 ZS_CHANNELS = 64
 ZT_CHANNELS = 6
 
-SR = 48000
+SR = 44100
 STRUCTURE_TYPE = "midi"
 MAX_STEPS = 1000000
 SHUFFLE = None
@@ -88,7 +88,7 @@ diffusion.model.Base.fit:
     structure_noise_aug = 0.
 
     ## Encoder regularisation
-    regularisation_weight_cond = 0.0002
+    regularisation_weight_cond = 1.
     regularisation_weight_time_cond = 1
 
 
