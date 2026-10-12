@@ -612,8 +612,9 @@ def _lazy_file_gain(path, source_sample_rate, target_sample_rate, channels):
 
 def process_lazy_dataset(input_path, output_path):
     """Write one lightweight manifest; no waveforms or crop boundaries."""
-    audio_files, _, _ = get_parser(FLAGS.parser)(input_path, None, FLAGS.ext,
-                                                 FLAGS.exclude, FLAGS.include)
+    audio_files, midi_files, _ = get_parser(FLAGS.parser)(
+        input_path, FLAGS.midi_folder, FLAGS.ext, FLAGS.exclude, FLAGS.include)
+    midi_by_audio = dict(zip(audio_files, midi_files))
     input_root = pathlib.Path(input_path).resolve()
     output_root = pathlib.Path(output_path).resolve()
     records = []
@@ -640,6 +641,14 @@ def process_lazy_dataset(input_path, output_path):
             })
         except Exception as error:
             failures.append((file, error))
+
+    for record in records:
+        midi_path = midi_by_audio[str(input_root / record["path"])]
+        if midi_path is not None:
+            if not pathlib.Path(midi_path).is_file():
+                raise FileNotFoundError(midi_path)
+            record["midi_path"] = os.path.relpath(
+                pathlib.Path(midi_path).resolve(), input_root)
 
     if FLAGS.normalize:
         print("Normalization prepass (one full decode per indexed file)...")
@@ -820,12 +829,10 @@ def process_db(input_path, output_path, device, emb_model, z_length, ae_ratio,
 
 def main(_):
     if FLAGS.lazy:
-        if FLAGS.parser != "simple_audio" or FLAGS.emb_model_path is not None \
-                or FLAGS.midi or FLAGS.descriptors or FLAGS.latent_hop_size:
+        if FLAGS.emb_model_path is not None or FLAGS.midi or FLAGS.descriptors or FLAGS.latent_hop_size:
             raise ValueError(
-                "--lazy supports waveform-only autoencoder datasets: use the "
-                "simple_audio parser without MIDI, descriptors, embeddings, or "
-                "dense latent statistics")
+                "--lazy indexes waveforms and paired MIDI paths; do not request "
+                "MIDI extraction, descriptors, embeddings, or dense latent statistics")
         if FLAGS.cut_silences:
             raise ValueError("--cut_silences is not supported with --lazy")
         for input_path in FLAGS.input_path:

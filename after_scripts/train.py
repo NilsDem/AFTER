@@ -10,11 +10,17 @@ from tqdm import tqdm
 from absl import flags, app
 from torch.utils.tensorboard import SummaryWriter
 
-from after.dataset import SimpleDataset
+from after.dataset import (SimpleDataset, is_lazy_waveform_dataset,
+                           LazyWaveformDataset, CombinedLazyWaveformDataset)
 from after.diffusion.utils import collate_fn, get_datasets
 from after.encoder_ssl.utils import collate_fn_simdino
-from after.diffusion.model import RectifiedFlow
+from after.encoder_ssl.data import SSLViewCollator
+from after.encoder_ssl.audio_augmentations import TimbreAugmentation
+from after.encoder_ssl.transforms import CodecEncoderTransform
+from after.diffusion.model import build_diffusion
+from after.diffusion.online_data import get_online_datasets, collate_online
 from after.encoder_ssl.model import SimDino
+from after.diffusion.ssl_loading import resolve_ssl_config, pretrain_ssl_encoder
 from after.utils import resolve_device
 
 FLAGS = flags.FLAGS
@@ -67,11 +73,21 @@ flags.DEFINE_multi_string("filter_include", [],
 flags.DEFINE_multi_string("filter_exclude", [],
                           "Glob patterns to exclude from dataset.")
 
+flags.DEFINE_string("ssl_checkpoint", None, "Student checkpoint from train_ssl.py; skips inline SSL.")
+flags.DEFINE_string("ssl_config", None,
+                    "SSL Gin config used to build and pretrain the timbre encoder. "
+                    "Use --skip_ssl for random initialization. With a checkpoint, "
+                    "defaults to config.gin beside that checkpoint.")
+flags.DEFINE_bool("skip_ssl", False, "Start diffusion without inline SSL pretraining.")
+flags.DEFINE_enum("precision", "fp32", ["fp32", "bf16"], "Training autocast precision.")
+
 
 def add_gin_extension(config_name: str) -> str:
     if config_name[-4:] != '.gin':
         config_name += '.gin'
-    return config_name
+    path = pathlib.Path(config_name)
+    packaged = pathlib.Path(__file__).parents[1] / "after/diffusion/configs" / path
+    return str(packaged) if not path.is_file() and packaged.is_file() else config_name
 
 
 def validate_diffusion_signal_length(db_paths, n_signal):
@@ -110,6 +126,8 @@ def main(argv):
     except:
         ssl_steps = None
         
+    if FLAGS.ssl_checkpoint or FLAGS.ssl_config or FLAGS.skip_ssl:
+        ssl_steps = None
     print(ssl_steps)
 
     if FLAGS.restart is not None:
@@ -124,7 +142,8 @@ def main(argv):
     db_paths = list(FLAGS.db_path)
     if FLAGS.db_folder is not None:
         folder = pathlib.Path(FLAGS.db_folder)
-        subdirs = sorted([p for p in folder.iterdir() if p.is_dir()])
+        subdirs = ([folder] if is_lazy_waveform_dataset(folder) else
+                   sorted([p for p in folder.iterdir() if p.is_dir()]))
         if not subdirs:
             raise ValueError(
                 f"--db_folder '{FLAGS.db_folder}' contains no sub-directories."
@@ -134,12 +153,18 @@ def main(argv):
     if not db_paths:
         raise ValueError("No dataset provided. Use --db_path or --db_folder.")
 
+    lazy = [is_lazy_waveform_dataset(path) for path in db_paths]
+    if any(lazy) and not all(lazy):
+        raise ValueError("Use either lazy waveform manifests or latent LMDBs in one run")
+    online = all(lazy)
+
     # Dataset summary
     print("\n=== Datasets ===")
     total_entries = 0
     for p in db_paths:
         try:
-            n = len(SimpleDataset(path=p))
+            n = (sum(1 for _ in open(pathlib.Path(p) / "audio_manifest.jsonl"))
+                 if online else len(SimpleDataset(path=p)))
         except Exception:
             n = -1
         label = f"  {n:>7,} entries" if n >= 0 else "  (could not read)"
@@ -153,7 +178,7 @@ def main(argv):
     device = resolve_device(FLAGS.device, FLAGS.gpu)
 
     ######### BUILD MODEL #########
-    emb_model = torch.jit.load(FLAGS.emb_model_path)  #.to(device)
+    emb_model = torch.jit.load(FLAGS.emb_model_path, map_location="cpu").eval()  #.to(device)
     try:
         audio_channels = emb_model.model.audio_channels
     except:
@@ -199,9 +224,24 @@ def main(argv):
             gin.bind_parameter("diffusion.utils.collate_fn.precomp_pr",
                                FLAGS.use_cache)
 
-    validate_diffusion_signal_length(db_paths, gin.query_parameter("%N_SIGNAL"))
+    if not online:
+        validate_diffusion_signal_length(db_paths, gin.query_parameter("%N_SIGNAL"))
+    else:
+        emb_model.to(device)
+        for parameter in emb_model.parameters():
+            parameter.requires_grad_(False)
 
-    blender = RectifiedFlow(device=device, emb_model=emb_model)
+    with gin.unlock_config():
+        if FLAGS.ssl_checkpoint or FLAGS.ssl_config:
+            checkpoint = (str(pathlib.Path(FLAGS.ssl_checkpoint).resolve())
+                          if FLAGS.ssl_checkpoint else None)
+            config = resolve_ssl_config(FLAGS.ssl_config, checkpoint)
+            gin.bind_parameter("diffusion.model.Base.ssl_checkpoint", checkpoint)
+            gin.bind_parameter("diffusion.model.Base.ssl_config", config)
+            gin.bind_parameter("diffusion.model.Base.ssl_codec_path", FLAGS.emb_model_path)
+    blender = build_diffusion(device=device, emb_model=emb_model)
+    if blender.ssl_representation == "mel" and not online:
+        raise ValueError("Mel SSL encoders require lazy waveform datasets")
 
     ######### GET THE DATASET #########
 
@@ -209,7 +249,9 @@ def main(argv):
     augmentation_keys = FLAGS.augmentation_keys
     filter = {"include": FLAGS.filter_include, "exclude": FLAGS.filter_exclude}
 
-    if augmentation_keys == "detect":
+    if online:
+        structure_keys = timbre_keys = midi_keys = []
+    elif augmentation_keys == "detect":
         allkeys = SimpleDataset(path=db_paths[0]).get_keys()
         structure_keys = [
             k for k in allkeys if "structure" in k and "midi" not in k
@@ -279,16 +321,43 @@ def main(argv):
     # Train the SimDino Model  #########
 
     logger = None
-    if ssl_steps is not None and (FLAGS.restart is None
-                                  or FLAGS.restart < ssl_steps):
+    if (FLAGS.ssl_config and not FLAGS.ssl_checkpoint and not FLAGS.skip_ssl
+            and FLAGS.restart is None):
+        if not online:
+            raise ValueError("Configured SSL pretraining requires lazy waveform datasets")
+        blender.encoder, blender.ssl_representation = pretrain_ssl_encoder(
+            resolve_ssl_config(FLAGS.ssl_config), FLAGS.emb_model_path,
+            gin.query_parameter("%SR"), db_paths, device, FLAGS.batch_size_ssl,
+            FLAGS.num_workers, FLAGS.freqs, filter, FLAGS.use_validation,
+            os.path.join(model_dir, "encoder"), FLAGS.precision)
+    elif ssl_steps is not None and (FLAGS.restart is None
+                                   or FLAGS.restart < ssl_steps):
 
-        dataset, valset, train_sampler, val_sampler = get_datasets(
-            data_keys=[k for k in data_keys if "midi" not in k],
-            freqs=FLAGS.freqs,
-            use_cache=FLAGS.use_cache,
-            use_validation=FLAGS.use_validation,
-            filter=filter,
-        )
+        if online:
+            ssl_collator = SSLViewCollator(
+                sample_rate=gin.query_parameter("%SR"),
+                n_signal_global=gin.query_parameter("%N_SIGNAL") * ae_ratio,
+                n_signal_local=max(1, gin.query_parameter("%N_SIGNAL") // 2) * ae_ratio,
+                max_view_separation_seconds=0., augmentation=TimbreAugmentation())
+            def ssl_dataset(split):
+                return CombinedLazyWaveformDataset([
+                    LazyWaveformDataset(path, ssl_collator.load_num_samples,
+                                        gin.query_parameter("%SR"), audio_channels,
+                                        split=split, filter=filter)
+                    for path in db_paths], "estimate" if FLAGS.freqs is None else FLAGS.freqs)
+            dataset = ssl_dataset("train" if FLAGS.use_validation else None)
+            valset = ssl_dataset("validation") if FLAGS.use_validation else None
+            train_sampler = val_sampler = None
+        else:
+            dataset, valset, train_sampler, val_sampler = get_datasets(
+                data_keys=[k for k in data_keys if "midi" not in k],
+                freqs=FLAGS.freqs,
+                use_cache=FLAGS.use_cache,
+                use_validation=FLAGS.use_validation,
+                filter=filter,
+            )
+
+            ssl_collator = collate_fn_simdino
 
         train_loader = torch.utils.data.DataLoader(
             dataset,
@@ -296,8 +365,8 @@ def main(argv):
             shuffle=True if train_sampler is None else False,
             num_workers=FLAGS.num_workers,
             drop_last=True,
-            collate_fn=collate_fn_simdino,
-            pin_memory=True,
+            collate_fn=ssl_collator,
+            pin_memory=torch.device(device).type == "cuda",
             sampler=train_sampler)
 
         if FLAGS.use_validation:
@@ -307,13 +376,16 @@ def main(argv):
                 shuffle=False,
                 num_workers=FLAGS.num_workers,
                 drop_last=True,
-                collate_fn=collate_fn_simdino,
-                pin_memory=True,
+                collate_fn=ssl_collator,
+                pin_memory=torch.device(device).type == "cuda",
                 sampler=val_sampler)
         else:
             valid_loader = None
 
         timbreEncoder = SimDino(device=device)
+        if online:
+            timbreEncoder.data_transform = CodecEncoderTransform(
+                model_path=FLAGS.emb_model_path, device=device)
 
         os.makedirs(model_dir + "/encoder", exist_ok=True)
         logger = SummaryWriter(log_dir=model_dir + "/logs")
@@ -323,7 +395,8 @@ def main(argv):
             "dataloader": train_loader,
             "validloader": valid_loader,
             "restart_step": FLAGS.restart,
-            "logger": logger
+            "logger": logger,
+            "precision": FLAGS.precision
         }
 
         timbreEncoder.fit(**d)
@@ -332,13 +405,22 @@ def main(argv):
         blender.encoder = timbreEncoder.student
 
     # Train the After Model  #########
-    dataset, valset, train_sampler, val_sampler = get_datasets(
-        data_keys=data_keys,
-        freqs=FLAGS.freqs,
-        use_cache=FLAGS.use_cache,
-        use_validation=FLAGS.use_validation,
-        filter=filter,
-    )
+    if online:
+        dataset, valset, train_sampler, val_sampler = get_online_datasets(
+            db_paths, FLAGS.freqs, FLAGS.use_validation,
+            n_signal=gin.query_parameter("%N_SIGNAL"), ae_ratio=ae_ratio,
+            sample_rate=gin.query_parameter("%SR"), audio_channels=audio_channels,
+            structure_type=structure_type,
+            compress_tc=(gin.query_parameter("diffusion.utils.collate_fn.compress_tc")
+                         if structure_type == "midi" else 1),
+            shift_tc=(gin.query_parameter("diffusion.utils.collate_fn.shift_tc")
+                      if structure_type == "midi" else 0),
+            filter=filter)
+    else:
+        dataset, valset, train_sampler, val_sampler = get_datasets(
+            data_keys=data_keys, freqs=FLAGS.freqs, use_cache=FLAGS.use_cache,
+            use_validation=FLAGS.use_validation, filter=filter)
+    diffusion_collator = collate_online if online else collate_fn
 
     train_loader = torch.utils.data.DataLoader(
         dataset,
@@ -346,8 +428,8 @@ def main(argv):
         shuffle=True if train_sampler is None else False,
         num_workers=FLAGS.num_workers,
         drop_last=True,
-        pin_memory=True,
-        collate_fn=collate_fn,
+        pin_memory=torch.device(device).type == "cuda",
+        collate_fn=diffusion_collator,
         sampler=train_sampler)
 
     if FLAGS.use_validation:
@@ -357,8 +439,8 @@ def main(argv):
             shuffle=False,
             num_workers=FLAGS.num_workers,
             drop_last=True,
-            pin_memory=True,
-            collate_fn=collate_fn,
+            pin_memory=torch.device(device).type == "cuda",
+            collate_fn=diffusion_collator,
             sampler=val_sampler)
     else:
         valid_loader = None
@@ -377,9 +459,12 @@ def main(argv):
         "validloader": valid_loader,
         "restart_step": restart_step,
         "init_step": ssl_steps if ssl_steps is not None else 0,
+        "precision": FLAGS.precision,
         "logger": logger
     }
 
+    if FLAGS.ssl_checkpoint or FLAGS.ssl_config or FLAGS.skip_ssl:
+        d["timbre_warmup"] = 0
     blender.fit(**d)
 
 

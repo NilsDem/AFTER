@@ -5,7 +5,8 @@ import torch
 import argparse
 import os
 import pathlib
-from after.diffusion import RectifiedFlow
+from after.diffusion import build_diffusion
+from after.diffusion.networks.transformerv3 import DenoiserV3
 from after.dataset import CombinedDataset
 from after.diffusion.latent_plot import prepare_training, train_autoencoder, generate_plot
 
@@ -16,6 +17,9 @@ import cached_conv as cc
 from absl import flags, app
 
 cc.use_cached_conv(True)
+# nn_tilde's single-stream API checks this legacy cached_conv constant.
+if not hasattr(cc, "MAX_BATCH_SIZE"):
+    cc.MAX_BATCH_SIZE = 1
 parser = argparse.ArgumentParser()
 
 FLAGS = flags.FLAGS
@@ -163,8 +167,11 @@ def main(argv):
                 f"Streaming codec not found at '{stream_path}'.\n"
                 f"Please provide one explicitly with --emb_model_path.")
 
+    with gin.unlock_config():
+        gin.bind_parameter("transformerv3.DenoiserV3.streaming", True)
+
     # Instantiate model
-    blender = RectifiedFlow()
+    blender = build_diffusion()
 
     # Load checkpoints
     state_dict = torch.load(checkpoint_path, map_location="cpu")["model_state"]
@@ -255,11 +262,15 @@ def main(argv):
         project_model = DummyIdentity()
 
     class Streamer(nn_tilde.Module):
+        __constants__ = ["meanflow", "v3", "baked_guidance"]
 
         def __init__(self) -> None:
             super().__init__()
 
             self.net = blender.net
+            self.v3 = isinstance(self.net, DenoiserV3)
+            self.meanflow = self.v3 and self.net.meanflow
+            self.baked_guidance = self.meanflow and self.net.guidance_embed
             self.encoder = blender.encoder
             self.post_encoder = blender.post_encoder
             self.encoder_time = blender.encoder_time
@@ -512,7 +523,17 @@ def main(argv):
 
         @torch.jit.export
         def set_guidance_structure(self, guidance_structure: float) -> int:
+            if self.baked_guidance:
+                assert guidance_structure > 0., "Omega guidance must be positive"
+            if self.v3:
+                self.net.reset_stream()
             self.guidance_structure = (guidance_structure, )
+            return 0
+
+        @torch.jit.export
+        def reset_stream(self) -> int:
+            if self.v3:
+                self.net.reset_stream()
             return 0
 
         @torch.jit.export
@@ -521,6 +542,9 @@ def main(argv):
 
         @torch.jit.export
         def set_nb_steps(self, nb_steps: int) -> int:
+            assert nb_steps > 0
+            if self.v3:
+                self.net.reset_stream()
             self.nb_steps = (nb_steps, )
             self.t_values_cache = torch.linspace(0,
                                                  1,
@@ -532,28 +556,29 @@ def main(argv):
                           cond: torch.Tensor, time_cond: torch.Tensor,
                           cache_index: int) -> torch.Tensor:
 
-            if self.guidance_structure[0] == 1.:
-                dx = self.net(x,
-                              time=time,
-                              cond=cond,
-                              time_cond=time_cond,
-                              cache_index=cache_index)
-                return dx
+            if self.baked_guidance:
+                return self.net(x, time=time, cond=cond, time_cond=time_cond,
+                                cache_index=cache_index,
+                                interval=torch.full_like(time, 1. / self.nb_steps[0]),
+                                omega=torch.full_like(time, self.guidance_structure[0]))
+            guided = self.guidance_structure[0] != 1.
+            if guided:
+                x = x.repeat(2, 1, 1)
+                time = time.repeat(2, 1, 1)
+                cond = cond.repeat(2, 1)
+                time_cond = torch.cat((time_cond,
+                                       torch.full_like(time_cond, self.drop_value)))
+            if self.meanflow:
+                dx = self.net(x, time=time, cond=cond, time_cond=time_cond,
+                              cache_index=cache_index,
+                              interval=torch.full_like(time, 1. / self.nb_steps[0]))
             else:
-                dx = self.net(x.repeat(2, 1, 1),
-                              time=time.repeat(2, 1, 1),
-                              cond=cond.repeat(2, 1),
-                              time_cond=torch.cat([
-                                  time_cond,
-                                  self.drop_value * torch.ones_like(time_cond),
-                              ]),
+                dx = self.net(x, time=time, cond=cond, time_cond=time_cond,
                               cache_index=cache_index)
-
+            if guided:
                 dx_full, dx_none = torch.chunk(dx, 2, dim=0)
-
                 dx = dx_none + self.guidance_structure[0] * (dx_full - dx_none)
-
-                return dx
+            return dx
 
         def sample(self, x_last: torch.Tensor, cond: torch.Tensor,
                    time_cond: torch.Tensor):
@@ -713,6 +738,8 @@ def main(argv):
     out_name = os.path.join(folder,
                             "after.audio." + folder.split("/")[-1] + ".ts")
 
+    if streamer.v3:
+        streamer.net.reset_stream()
     streamer.export_to_ts(out_name)
 
     out_name_plot = os.path.join(

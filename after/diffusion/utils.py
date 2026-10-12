@@ -140,8 +140,7 @@ def collate_fn(batch,
             x_full = np.pad(x_full, ((0, 0), (0, pad)), mode="constant")
             i0 = 0
         else:
-            i0 = np.random.randint(0,
-                                   x_full.shape[-1] - n_signal - 1 - shift_tc)
+            i0 = np.random.randint(0, max(1, x_full.shape[-1] - n_signal - shift_tc + 1))
         x_target = x_full[..., i0:i0 + n_signal]
         x_list.append(x_target)
 

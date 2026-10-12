@@ -14,6 +14,7 @@ from einops import reduce, rearrange
 import warnings
 # from utils import KoLeoLoss
 import math
+from after.regularisation import SIGReg
 
 
 @gin.configurable
@@ -113,8 +114,13 @@ class Base(nn.Module):
         max_steps: int,
         logger: Optional[SummaryWriter] = None,
         evaluator=None,
+        precision="fp32",
     ):
 
+        if precision not in {"fp32", "bf16"}:
+            raise ValueError(f"Unknown precision: {precision}")
+        if precision == "bf16" and self.device.type not in {"cpu", "cuda"}:
+            raise ValueError("bf16 training requires CPU or CUDA")
         self.init_train(lr=lr)
 
         if restart_step is not None:
@@ -136,13 +142,15 @@ class Base(nn.Module):
         losses_sum, losses_sum_count = {}, {}
 
         with open(os.path.join(model_dir, "config.gin"), "w") as config_out:
-            config_out.write(gin.operative_config_str())
+            config_out.write(gin.config_str())
 
         for e in range(n_epochs):
             for batch in dataloader:
                 batch = self.prep_data(batch)
 
-                lossdict = self.training_step(batch)
+                with torch.autocast(self.device.type, dtype=torch.bfloat16,
+                                    enabled=precision == "bf16"):
+                    lossdict = self.training_step(batch)
 
                 for k in lossdict:
                     losses_sum[k] = losses_sum.get(k, 0.) + lossdict[k]
@@ -176,8 +184,8 @@ class Base(nn.Module):
 
                 self.tepoch.update(1)
                 self.step += 1
-                if self.step > max_steps:
-                    break
+                if self.step >= max_steps:
+                    return
 
 
 from info_nce import InfoNCE
@@ -588,29 +596,6 @@ class SimDino(Base):
             #"cosine_loss": cosine_loss.item(),
             "model_ema": self.model_ema,
         }
-
-
-class SIGReg(torch.nn.Module):
-
-    def __init__(self, knots=17):
-        super().__init__()
-        t = torch.linspace(0, 3, knots, dtype=torch.float32)
-        dt = 3 / (knots - 1)
-        weights = torch.full((knots, ), 2 * dt, dtype=torch.float32)
-        weights[[0, -1]] = dt
-        window = torch.exp(-t.square() / 2.0)
-        self.register_buffer("t", t)
-        self.register_buffer("phi", window)
-        self.register_buffer("weights", weights * window)
-
-    def forward(self, proj):
-        A = torch.randn(proj.size(-1), 64, device="cuda")
-        A = A.div_(A.norm(p=2, dim=0))
-        x_t = (proj @ A).unsqueeze(-1) * self.t
-        err = (x_t.cos().mean(-3) -
-               self.phi).square() + x_t.sin().mean(-3).square()
-        statistic = (err @ self.weights) * proj.size(-2)
-        return statistic.mean()
 
 
 @gin.configurable

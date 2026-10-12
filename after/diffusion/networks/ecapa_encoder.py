@@ -603,6 +603,9 @@ class ECAPATDNN(nn.Module):
         if self.use_tanh:
             Z = torch.tanh(Z)
 
+        mean = Z
+        kl = Z.new_zeros(())
+
         if self.spherical_normalisation:
             Z = Z / torch.norm(Z, dim=-1, keepdim=True)
             mean = Z

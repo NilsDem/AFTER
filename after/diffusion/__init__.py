@@ -1,3 +1,3 @@
 from .networks import *
-from .model import RectifiedFlow
+from .model import RectifiedFlow, MeanFlow, build_diffusion
 from .utils import *

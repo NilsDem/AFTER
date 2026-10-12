@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import cached_conv as cc
 import gin
+from after.regularisation import SIGReg
 
 
 def __prepare_scriptable__(self):
@@ -371,6 +372,7 @@ class LinearEncoder(nn.Module):
         #**kwargs):
         super().__init__()
         self.use_tanh = use_tanh
+        channels = list(channels)
         module_list = []
         module_list.append(nn.Linear(in_size, channels[0]))
 
@@ -385,6 +387,7 @@ class LinearEncoder(nn.Module):
         self.net = nn.Sequential(*module_list)
 
         self.regularisation = regularisation
+        self.sigreg = SIGReg() if regularisation == "sigreg" else None
 
     def calc_expansion(self, z, eps=0.5) -> torch.Tensor:
         """
@@ -415,7 +418,11 @@ class LinearEncoder(nn.Module):
         else:
             x = self.net(x)
 
-        if self.regularisation == "wasserstein":
+        if self.sigreg is not None:
+            kl = self.sigreg(x)
+            mean = x
+
+        elif self.regularisation == "wasserstein":
             kl = compute_mmd(x, torch.randn_like(x)).mean()
             mean = x
 

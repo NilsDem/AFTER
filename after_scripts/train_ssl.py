@@ -17,6 +17,7 @@ from after.utils import resolve_device
 
 
 FLAGS = flags.FLAGS
+flags.DEFINE_bool("evaluate_sol", True, "Run the SOL representation probe during training.")
 flags.DEFINE_string("name", "ssl", "Name of the SSL run.")
 flags.DEFINE_string("out_path", "./ssl_runs", "Output directory.")
 flags.DEFINE_multi_string("config", None, "Gin configuration file.",
@@ -28,6 +29,7 @@ flags.DEFINE_multi_float("freqs", None,
                          "Sampling frequencies for multiple datasets.")
 flags.DEFINE_string("emb_model_path", None,
                     "TorchScript codec used by the latent configuration.")
+flags.DEFINE_enum("precision", "fp32", ["fp32", "bf16"], "Training autocast precision.")
 flags.DEFINE_integer("restart", None, "Checkpoint step to resume.")
 flags.DEFINE_integer("batch_size", 32, "Training batch size.")
 flags.DEFINE_integer("num_workers", 4, "DataLoader worker count.")
@@ -148,8 +150,9 @@ def main(argv):
     )
 
     trainer = build_ssl_model(device=device)
-    evaluator = SOLProbeEvaluator(
+    evaluator = (SOLProbeEvaluator(
         representation_transform=trainer.data_transform, device=device)
+        if FLAGS.evaluate_sol else None)
     model_dir = os.path.join(FLAGS.out_path, FLAGS.name)
     os.makedirs(model_dir, exist_ok=True)
 
@@ -161,7 +164,7 @@ def main(argv):
     print(f"ECAPA parameters: {parameters / 1_000_000:.2f} M")
     trainer.fit(dataloader=dataloader, validloader=None,
                 restart_step=FLAGS.restart, model_dir=model_dir,
-                evaluator=evaluator)
+                evaluator=evaluator, precision=FLAGS.precision)
 
 
 if __name__ == "__main__":
