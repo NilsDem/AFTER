@@ -1,0 +1,129 @@
+from __gin__ import dynamic_registration
+
+import after
+from after import diffusion
+import after.diffusion.model
+import after.diffusion.networks.transformerv3
+
+IN_SIZE = None
+N_SIGNAL = None
+
+ZS_CHANNELS = 64
+ZT_CHANNELS = 6
+
+SR = 44100
+STRUCTURE_TYPE = "midi"
+MAX_STEPS = 1000000
+SHUFFLE = None
+
+LOCAL_ATTENTION_SIZE = 8
+ATTENTION_CHUNK_SIZE = 1
+
+# Data
+diffusion.utils.get_datasets:
+    db_list = None
+    emb_model_path = None
+
+diffusion.utils.collate_fn:
+    n_signal = %N_SIGNAL
+    structure_type = %STRUCTURE_TYPE
+    compress_tc = 8
+    shift_tc = 0
+
+### ARCHITECTURE ### 
+diffusion.networks.LinearEncoder:
+    channels=[512, 1024, 1024, 256, %ZT_CHANNELS]
+    drop_out=0.15
+    use_tanh=False
+    regularisation="sigreg"
+
+
+encoder_time/diffusion.networks.Encoder1D:
+    in_size = 128
+    channels = [128, 128, 128, %ZS_CHANNELS]
+    ratios = [2, 2, 2]
+    ac_regularisation = False
+    norm_type = "none"
+    causal=True
+
+diffusion.networks.transformerv3.DenoiserV3:
+    n_channels = %IN_SIZE
+    embed_dim = 384
+    cond_dim = %ZT_CHANNELS
+    noise_embed_dims = 64
+    n_layers = 6
+    mlp_multiplier = 3
+    dropout  = 0.0
+    causal = True
+    tcond_dim = %ZS_CHANNELS
+    local_attention_size = %LOCAL_ATTENTION_SIZE
+    meanflow = False
+    guidance_embed = False
+    num_heads = 8
+
+
+diffusion.model.Base:
+    sr = %SR
+    net= @diffusion.networks.transformerv3.DenoiserV3()
+    encoder = None  # Supplied by --ssl_config / --ssl_checkpoint.
+    encoder_time = @encoder_time/diffusion.networks.Encoder1D()    
+    post_encoder = @diffusion.networks.LinearEncoder
+    time_transform = None
+    drop_value = -4.
+    drop_rate = 0.3
+
+ 
+diffusion.model.Base.fit: 
+    max_steps = %MAX_STEPS
+
+    ## Adversarial
+    timbre_warmup = 0
+    adversarial_weight = 0.
+    adversarial_warmup = 1
+
+    drop_targets = [0]
+
+    # Noise augmentation to smooth the latent space
+    timbre_noise_aug = 0.05
+    structure_noise_aug = 0.
+
+    ## Encoder regularisation
+    regularisation_weight_cond = 1.
+    regularisation_weight_time_cond = 1
+
+
+    ## Log ## 
+    steps_valid = 10000
+    steps_save = 50000
+    lr = 1e-4
+
+
+# MIDI starts at codec_hop / 8 (128 samples for a 1024-hop codec).
+# encoder_time ratios [2, 2, 2] bring it to the diffusion/codec rate.
+diffusion.model.build_diffusion.model = @diffusion.model.RectifiedFlow
+
+import after.diffusion.online_data
+import after.encoder_ssl.audio_augmentations
+
+# Each transform samples independently, once for the whole waveform crop.
+structure/after.encoder_ssl.audio_augmentations.time_stretch:
+    min_rate = 0.8
+    max_rate = 1.2
+    p = 0.15
+    leave_length_unchanged = False
+
+structure/after.encoder_ssl.audio_augmentations.pitch_shift:
+    min_semitones = -3
+    max_semitones = 3
+    p = 0.15
+
+structure/after.encoder_ssl.audio_augmentations.WholeAudioAugmentation:
+    transforms = [@structure/after.encoder_ssl.audio_augmentations.time_stretch(),
+                  @structure/after.encoder_ssl.audio_augmentations.pitch_shift()]
+
+timbre/after.encoder_ssl.audio_augmentations.WholeAudioAugmentation:
+    transforms = []
+
+after.diffusion.online_data.OnlineWaveformDataset:
+    structure_augmentation = @structure/after.encoder_ssl.audio_augmentations.WholeAudioAugmentation()
+    timbre_augmentation = @timbre/after.encoder_ssl.audio_augmentations.WholeAudioAugmentation()
