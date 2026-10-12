@@ -422,6 +422,9 @@ def main(argv):
             use_validation=FLAGS.use_validation, filter=filter)
     diffusion_collator = collate_online if online else collate_fn
 
+    print(len(dataset))
+    exit()
+
     train_loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=FLAGS.batch_size,
