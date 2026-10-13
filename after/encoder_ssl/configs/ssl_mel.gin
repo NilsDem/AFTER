@@ -18,7 +18,7 @@ after.encoder_ssl.data.SSLViewCollator:
     max_view_separation_seconds = 10.402539682539683
 after.encoder_ssl.audio_augmentations.TimbreAugmentation:
     compressor_p = 0.5
-    reverb_p = 0.5
+    reverb_p = 0
     pitch_shift_p = 0.3
     pitch_shift_min_semitones = -4.0
     pitch_shift_max_semitones = 4.0
