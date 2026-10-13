@@ -217,7 +217,7 @@ class TimbreAugmentation:
 
     ir_path: str | Path = DEFAULT_IR_PATH
     compressor_p: float = 0.5
-    reverb_p: float = 0.5
+    reverb_p: float = 0
     pitch_shift_p: float = 0.5
     pitch_shift_min_semitones: float = -3.0
     pitch_shift_max_semitones: float = 3.0

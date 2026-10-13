@@ -76,7 +76,7 @@ after.encoder_ssl.model.Base.fit:
     steps_display = 100
     steps_valid = 25000
     steps_save = 25000
-    max_steps = 1000000
+    max_steps = 100000
 after.encoder_ssl.sol_evaluation.SOLProbeEvaluator:
     path = "/data/datasets/ardbeg_slow-1/waveform/sol-full"
     sample_rate = %SR
