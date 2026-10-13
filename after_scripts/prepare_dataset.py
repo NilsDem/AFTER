@@ -18,6 +18,7 @@ import lmdb
 import numpy as np
 import pretty_midi
 import soundfile as sf
+from after.autoencoder.codecs import load_codec
 import torch
 from absl import app, flags
 from tqdm import tqdm
@@ -66,6 +67,8 @@ flags.DEFINE_bool(
 # --- Embedding model ---
 flags.DEFINE_string('emb_model_path', None,
                     'TorchScript (.pt) embedding model')
+flags.DEFINE_enum('codec', 'torchscript', ['torchscript', 'sage'],
+                  'Embedding codec; SAGE downloads its checkpoint when no path is supplied.')
 flags.DEFINE_integer('batch_size', 8, 'Chunk batch size for embedding')
 flags.DEFINE_integer(
     'latent_hop_size', 0,
@@ -829,7 +832,7 @@ def process_db(input_path, output_path, device, emb_model, z_length, ae_ratio,
 
 def main(_):
     if FLAGS.lazy:
-        if FLAGS.emb_model_path is not None or FLAGS.midi or FLAGS.descriptors or FLAGS.latent_hop_size:
+        if FLAGS.codec != "torchscript" or FLAGS.emb_model_path is not None or FLAGS.midi or FLAGS.descriptors or FLAGS.latent_hop_size:
             raise ValueError(
                 "--lazy indexes waveforms and paired MIDI paths; do not request "
                 "MIDI extraction, descriptors, embeddings, or dense latent statistics")
@@ -852,17 +855,20 @@ def main(_):
     emb_model = z_length = ae_ratio = None
     if FLAGS.latent_hop_size < 0:
         raise ValueError("latent_hop_size must be non-negative")
-    if FLAGS.emb_model_path is not None:
-        emb_model = torch.jit.load(FLAGS.emb_model_path).to(device).eval()
+    if FLAGS.emb_model_path is not None or FLAGS.codec == "sage":
+        if FLAGS.codec == "sage" and (not FLAGS.stereo or FLAGS.sample_rate != 44100):
+            raise ValueError("SAGE requires --stereo and --sample_rate=44100")
+        emb_model = load_codec(FLAGS.emb_model_path, device=device, codec_type=FLAGS.codec)
         with torch.no_grad():
             dummy = torch.randn(1, 1 if not FLAGS.stereo else 2,
                                 FLAGS.num_signal).to(device)
             z_length = emb_model.encode(dummy).shape[-1]
-        if FLAGS.num_signal % z_length:
+        if not hasattr(emb_model, "compression_ratio") and FLAGS.num_signal % z_length:
             raise ValueError(
                 f"num_signal ({FLAGS.num_signal}) must be divisible by the "
                 f"model latent length ({z_length})")
-        ae_ratio = FLAGS.num_signal // z_length
+        ae_ratio = (emb_model.compression_ratio if hasattr(emb_model, "compression_ratio")
+                    else FLAGS.num_signal // z_length)
         print(f"Embedding model loaded; z_length={z_length} "
               f"(ae_ratio={ae_ratio})")
 

@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import gin
+from after.autoencoder.codecs import load_codec
 import torch
 from absl import app, flags
 
@@ -72,7 +73,7 @@ def _dataset_paths():
 
 
 def _codec_channels(model_path, audio_channels):
-    codec = torch.jit.load(model_path, map_location="cpu").eval()
+    codec = load_codec(model_path)
     with torch.no_grad():
         encoded = codec.encode(torch.zeros(1, audio_channels, 32768))
     if encoded.ndim != 3:
@@ -90,8 +91,8 @@ def main(argv):
     audio_channels = gin.query_parameter("%AUDIO_CHANNELS")
     representation = gin.query_parameter("%REPRESENTATION")
 
-    if representation == "codec":
-        if FLAGS.emb_model_path is None:
+    if representation in {"codec", "sage"}:
+        if representation == "codec" and FLAGS.emb_model_path is None:
             raise ValueError(
                 "The codec configuration requires --emb_model_path")
         input_channels = _codec_channels(FLAGS.emb_model_path, audio_channels)

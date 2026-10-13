@@ -1,0 +1,4 @@
+include "after/diffusion/configs/audio_simdino.gin"
+import after.autoencoder.codecs
+
+after.autoencoder.codecs.load_codec.codec_type = "sage"

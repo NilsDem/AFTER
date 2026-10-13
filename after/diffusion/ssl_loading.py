@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import gin
+from after.autoencoder.codecs import load_codec
 import torch
 from torch import nn
 
@@ -56,8 +57,8 @@ def ssl_configuration(config, codec_path, sample_rate):
         if sample_rate is not None and gin.query_parameter('%SR') != sample_rate:
             raise ValueError('SSL and diffusion sample rates must match')
         representation = gin.query_parameter('%REPRESENTATION')
-        if representation == 'codec':
-            codec = torch.jit.load(codec_path, map_location='cpu').eval()
+        if representation in {'codec', 'sage'}:
+            codec = load_codec(codec_path)
             with torch.no_grad():
                 audio_channels = gin.query_parameter('%AUDIO_CHANNELS')
                 channels = codec.encode(torch.zeros(1, audio_channels, 32768)).shape[1]

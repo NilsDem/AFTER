@@ -144,10 +144,16 @@ class Base(nn.Module):
             timbre = batch["timbre_waveform"].to(device)
             self.emb_model.eval()
             x1 = self.emb_model.encode(waveform).float()
+            if hasattr(self.emb_model, "compression_ratio"):
+                # Centered STFT padding adds a boundary frame to SAGE chunks.
+                x1 = x1[..., :waveform.shape[-1] // self.emb_model.compression_ratio]
             x1_cond = (timbre if self.ssl_representation == "mel" else
                        self.emb_model.encode(timbre).float())
             time_cond = batch.get("x_time_cond")
-            time_cond = x1 if time_cond is None else time_cond.to(device)
+            if getattr(self.encoder_time, "input_representation", None) == "waveform":
+                time_cond = waveform
+            else:
+                time_cond = x1 if time_cond is None else time_cond.to(device)
             return x1, x1_cond, time_cond
 
         if self.ssl_representation == "mel":

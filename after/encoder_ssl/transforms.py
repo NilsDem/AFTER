@@ -1,6 +1,7 @@
 """GPU-side input representations for self-supervised encoder training."""
 
 import gin
+from after.autoencoder.codecs import load_codec
 import torch
 from torch import nn
 from torchaudio.transforms import MelSpectrogram
@@ -8,15 +9,11 @@ from torchaudio.transforms import MelSpectrogram
 
 @gin.configurable
 class CodecEncoderTransform(nn.Module):
-    """Run a frozen TorchScript audio codec encoder on the training device."""
+    """Run a frozen audio codec encoder on the training device."""
 
-    def __init__(self, model_path, device="cpu"):
+    def __init__(self, model_path=None, device="cpu"):
         super().__init__()
-        if model_path is None:
-            raise ValueError(
-                "CodecEncoderTransform.model_path must be set with "
-                "--emb_model_path")
-        self.emb_model = torch.jit.load(model_path, map_location=device)
+        self.emb_model = load_codec(model_path, device=device)
         for parameter in self.emb_model.parameters():
             parameter.requires_grad_(False)
         self.emb_model.eval()

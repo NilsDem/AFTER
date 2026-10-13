@@ -2,6 +2,7 @@ import gin
 import cached_conv as cc
 # gin.config.enable_dynamic_registration()
 #gin.add_config_file_search_path('./after/diffusion/configs')
+from after.autoencoder.codecs import load_codec
 import torch
 import os
 import pathlib
@@ -181,17 +182,22 @@ def main(argv):
     device = resolve_device(FLAGS.device, FLAGS.gpu)
 
     ######### BUILD MODEL #########
-    emb_model = torch.jit.load(FLAGS.emb_model_path, map_location="cpu").eval()  #.to(device)
+    emb_model = load_codec(FLAGS.emb_model_path)
     try:
-        audio_channels = emb_model.model.audio_channels
+        audio_channels = (emb_model.audio_channels if hasattr(emb_model, "audio_channels")
+                          else emb_model.model.audio_channels)
     except:
         audio_channels = 1
+
+    if hasattr(emb_model, "sample_rate") and gin.query_parameter("%SR") != emb_model.sample_rate:
+        raise ValueError("SAGE requires SR = 44100")
 
     dummy = torch.randn(1, audio_channels, 8192)  #.to(device)
     with torch.no_grad():
         z = emb_model.encode(dummy)
     ae_emb_size = z.shape[1]
-    ae_ratio = dummy.shape[-1] // z.shape[-1]
+    ae_ratio = (emb_model.compression_ratio if hasattr(emb_model, "compression_ratio")
+                else dummy.shape[-1] // z.shape[-1])
 
     print("using a codec with - compression ratio : ", ae_ratio,
           " - emb size : ", ae_emb_size)
@@ -210,6 +216,10 @@ def main(argv):
             gin.bind_parameter("%ADV_WEIGHT", FLAGS.adv)
 
         structure_type = gin.query_parameter("%STRUCTURE_TYPE")
+        if structure_type == "mel":
+            gin.bind_parameter(
+                "encoder_time/after.diffusion.networks.mel_structure.CausalMelStructureEncoder.codec_hop",
+                ae_ratio)
 
         gin.bind_parameter("diffusion.utils.get_datasets.db_list", db_paths)
         gin.bind_parameter("diffusion.utils.get_datasets.emb_model_path",
@@ -271,7 +281,16 @@ def main(argv):
     else:
         structure_keys = timbre_keys = midi_keys = []
 
+    if structure_type == "mel" and not online:
+        if structure_keys or FLAGS.use_timbre_augments_structure:
+            raise ValueError("Offline mel structure requires unaugmented targets; use lazy waveform datasets for structure augmentation")
+        for path in db_paths:
+            if "waveform" not in SimpleDataset(path=path).get_keys():
+                raise ValueError("Mel structure requires offline datasets prepared with --save_waveform")
+
     data_keys = ["z"] + structure_keys + timbre_keys + midi_keys
+    if structure_type == "mel":
+        data_keys.append("waveform")
 
     # Prepare collate functions
     with gin.unlock_config():

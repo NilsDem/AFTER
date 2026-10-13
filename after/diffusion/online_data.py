@@ -44,7 +44,7 @@ class OnlineWaveformDataset(LazyWaveformDataset):
                  audio_channels=1, compress_tc=1, shift_tc=0, split=None,
                  filter=None, augment=True, structure_augmentation=None,
                  timbre_augmentation=None):
-        assert structure_type in ('audio', 'midi')
+        assert structure_type in ('audio', 'midi', 'mel')
         self.target_samples = n_signal * ae_ratio
         self.structure_type = structure_type
         self.n_signal = n_signal

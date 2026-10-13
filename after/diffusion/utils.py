@@ -20,6 +20,8 @@ def make_key_sampler(structure_type, structure_keys, timbre_keys):
         target_key = np.random.choice(["z"] * 3 + structure_keys)
         timbre_key = np.random.choice(timbre_keys) if timbre_keys else "z"
         needed = {"metadata", target_key, timbre_key}
+        if structure_type == "mel":
+            needed.add("waveform")
         if structure_type == "midi":
             midi_key = ("midi" if target_key == "z" else target_key.replace(
                 "z", "midi"))
@@ -174,6 +176,16 @@ def collate_fn(batch,
         # -------------------------
         if structure_type == "audio":
             time_cond = x_target
+
+        elif structure_type == "mel":
+            if key != "z":
+                raise ValueError("Mel structure requires waveforms matching the target; use lazy augmentation")
+            waveform = np.asarray(b["waveform"])
+            # AudioExample already converts stored PCM to float waveforms.
+            start = i0 * ae_ratio
+            time_cond = waveform[..., start:start + n_signal * ae_ratio]
+            if time_cond.shape[-1] < n_signal * ae_ratio:
+                time_cond = np.pad(time_cond, ((0, 0), (0, n_signal * ae_ratio - time_cond.shape[-1])))
 
         elif structure_type == "midi":
             # --- determine MIDI key to use ---

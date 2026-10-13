@@ -36,6 +36,13 @@ setuptools.setup(
             "after = after_scripts.main_cli:main",
         ]
     },
+    extras_require={
+        "sage": [
+            "einops>=0.8.1", "hydra-core>=1.3.2,<1.4", "numpy>=1.26",
+            "omegaconf>=2.3.0,<2.4", "pyyaml>=6.0", "rich>=14.0",
+            "soundfile>=0.13.1", "timm>=1.0.0", "huggingface-hub>=0.24,<1",
+        ],
+    },
     install_requires=requirements.split("\n"),
     python_requires='>=3.9',
     include_package_data=True,

@@ -1,0 +1,20 @@
+include "after/diffusion/configs/audio_simdino_sage.gin"
+import after.diffusion.networks.mel_structure
+
+# SAGE diffusion target and timbre; waveform log-mel structure.
+STRUCTURE_TYPE = "mel"
+
+encoder_time/after.diffusion.networks.mel_structure.CausalMelStructureEncoder:
+    sample_rate = %SR
+    # codec_hop is bound to the loaded codec's temporal ratio by train.py.
+    n_fft = 2048
+    hop_length = 256
+    n_mels = 128
+    f_min = 20.0
+    f_max = 20000.0
+    log_offset = 1e-5
+    channels = [32, 64, 128, 192, 256]
+    out_dim = %ZS_CHANNELS
+    ac_regularisation = True
+
+diffusion.model.Base.encoder_time = @encoder_time/after.diffusion.networks.mel_structure.CausalMelStructureEncoder()

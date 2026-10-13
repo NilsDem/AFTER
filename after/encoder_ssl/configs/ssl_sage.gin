@@ -1,0 +1,6 @@
+include "after/encoder_ssl/configs/ssl_codec.gin"
+import after.autoencoder.codecs
+
+REPRESENTATION = "sage"
+AUDIO_CHANNELS = 2
+after.autoencoder.codecs.load_codec.codec_type = "sage"
