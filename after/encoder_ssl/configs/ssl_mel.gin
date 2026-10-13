@@ -8,7 +8,7 @@ import after.diffusion.networks.ecapa_encoder
 REPRESENTATION = "mel"
 IN_SIZE = 128
 SR = 44100
-AUDIO_CHANNELS = 1
+AUDIO_CHANNELS = 2
 # The loader reads exactly one 524288-sample waveform chunk.
 after.encoder_ssl.data.SSLViewCollator:
     n_global = 2
