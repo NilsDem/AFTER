@@ -30,7 +30,7 @@ class CodecEncoderTransform(nn.Module):
 
 @gin.configurable
 class MelSpectrogramTransform(nn.Module):
-    """Convert mono waveforms to log-mel sequences on the training device."""
+    """Downmix waveforms to mono and compute log-mel sequences on the training device."""
 
     def __init__(
         self,
@@ -59,7 +59,7 @@ class MelSpectrogramTransform(nn.Module):
         ).to(device)
 
     def forward(self, waveform):
-        if waveform.ndim != 3 or waveform.shape[1] != 1:
-            raise ValueError("Expected mono waveform with shape [B, 1, T]")
-        mel = self.mel(waveform[:, 0])
+        if waveform.ndim != 3:
+            raise ValueError("Expected waveform with shape [B, C, T]")
+        mel = self.mel(waveform.mean(dim=1))
         return torch.log(mel + self.log_offset)
