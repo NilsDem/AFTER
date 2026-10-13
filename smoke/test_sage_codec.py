@@ -14,17 +14,22 @@ from after.diffusion.model import Base
 from after.encoder_ssl.transforms import CodecEncoderTransform
 
 
-class FakeSAGE(nn.Module):
+class FakeSAGE:
     def __init__(self, folded=False):
-        super().__init__()
-        self.weight = nn.Parameter(torch.zeros(()))
         self.device = "cpu"
-        self.autoencoder = types.SimpleNamespace(
-            encoder=types.SimpleNamespace(
+        self.autoencoder = nn.Module()
+        self.autoencoder.weight = nn.Parameter(torch.zeros(()))
+        self.autoencoder.register_buffer("window", torch.ones(4))
+        self.autoencoder.encoder = types.SimpleNamespace(
                 fold_freq_to_channels=folded, _final_resolution=(4, 32),
                 depths=[2, 6, 2],
-                patch_embed=types.SimpleNamespace(patch_size=(64, 1))),
-            _stft_config=types.SimpleNamespace(hop_length=512))
+                patch_embed=types.SimpleNamespace(patch_size=(64, 1)))
+        self.autoencoder._stft_config = types.SimpleNamespace(hop_length=512)
+
+    def to(self, device):
+        self.autoencoder.to(device)
+        self.device = torch.device(device)
+        return self
 
     def pad(self, audio):
         frames = audio.shape[-1] // 512 + 1
@@ -63,6 +68,12 @@ def test_sage_preprocessing(monkeypatch, folded):
     assert codec.compression_ratio == 2048
     codec.to("cpu")
     assert model.device == torch.device("cpu")
+    assert next(codec.parameters()) is model.autoencoder.weight
+    assert not model.autoencoder.weight.requires_grad
+    codec.train()
+    assert not model.autoencoder.training
+    codec.to(dtype=torch.float64)
+    assert model.autoencoder.window.dtype == torch.float64
     transform = CodecEncoderTransform("unused.ckpt")
     torch.testing.assert_close(transform(audio), latent)
     trainer = Base.__new__(Base)

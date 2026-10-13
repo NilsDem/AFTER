@@ -21,14 +21,17 @@ class SAGECodec(nn.Module):
                     repo_id="francescobrigante/SAGE",
                     filename="SAGE_FTe992.ckpt", local_dir="models")
         self.model = SAGE.from_checkpoint(str(checkpoint_path), device="cpu")
+        # SAGE is an inference facade, not an nn.Module. Register its network
+        # so freezing, device transfers, and parameter discovery reach it.
+        self.autoencoder = self.model.autoencoder
         self.requires_grad_(False)
         self.eval()
 
     def _apply(self, fn, recurse=True):
         super()._apply(fn, recurse)
-        # Upstream inference also uses a plain device attribute.
-        if "device" in vars(self.model):
-            self.model.device = next(self.model.parameters()).device
+        device = next(self.autoencoder.parameters()).device
+        self.model.to(device)
+        self.model.device = device
         return self
 
     def train(self, mode=True):
