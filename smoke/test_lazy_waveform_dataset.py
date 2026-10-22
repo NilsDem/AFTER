@@ -151,7 +151,7 @@ def test_simple_lmdb_dataset_still_loads(tmp_path):
 
 def test_raw_folder_index_and_online_crop(tmp_path):
     from after.dataset.folder import index_audio_folder
-    from after.diffusion.online_data import OnlineWaveformDataset, collate_online
+    from after_scripts.train_autoencoder import make_collate_fn
 
     source = tmp_path / "audio" / "nested"
     source.mkdir(parents=True)
@@ -164,12 +164,12 @@ def test_raw_folder_index_and_online_crop(tmp_path):
     assert record["sample_rate"] == 16000
     assert "normalization_gain" not in record
     assert json.loads((output / LAZY_METADATA).read_text())["normalized"] is False
-    dataset = OnlineWaveformDataset(path, n_signal=100, ae_ratio=8,
-                                    sample_rate=8000, structure_type="audio",
-                                    augment=False)
-    batch = collate_online([dataset[0]])
-    assert batch["waveform"].shape == (1, 1, 800)
-    np.testing.assert_allclose(batch["waveform"].numpy()[..., 20:-20], 0.125, atol=1e-4)
+    dataset = LazyWaveformDataset(path, num_signal=800, sample_rate=8000,
+                                  audio_channels=1)
+    collate = make_collate_fn(800, 8000, 1)
+    batch = collate([dataset[0]])
+    assert batch.shape == (1, 1, 800)
+    np.testing.assert_allclose(batch.numpy()[..., 20:-20], 0.125, atol=1e-4)
     # Reindex on each launch so newly added files become visible.
     sf.write(source / "second.wav", audio, 16000)
     index_audio_folder(source.parent, output, 8000, 1, 800)

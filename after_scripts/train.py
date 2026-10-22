@@ -13,7 +13,6 @@ from torch.utils.tensorboard import SummaryWriter
 
 from after.dataset import (SimpleDataset, is_lazy_waveform_dataset,
                            LazyWaveformDataset, CombinedLazyWaveformDataset)
-from after.dataset.folder import index_audio_folder
 from after.diffusion.utils import collate_fn, get_datasets
 from after.encoder_ssl.utils import collate_fn_simdino
 from after.encoder_ssl.data import SSLViewCollator
@@ -43,8 +42,6 @@ flags.DEFINE_integer("n_signal", 64,
                      "Training length in number of latent steps")
 
 # DATASET
-flags.DEFINE_multi_string("folder", [], "Raw audio folders to index and train online, without normalization.")
-flags.DEFINE_integer("sr", None, "Override the Gin SR macro (sample rate in Hz).", lower_bound=1)
 flags.DEFINE_multi_string(
     "db_path", [], "Database path. Use multiple for combined datasets.")
 flags.DEFINE_string(
@@ -145,32 +142,6 @@ def main(argv):
         with gin.unlock_config():
             gin.parse_config_files_and_bindings([config_path], [])
 
-    if FLAGS.sr is not None:
-        with gin.unlock_config():
-            gin.bind_parameter("%SR", FLAGS.sr)
-
-    ######### BUILD MODEL #########
-    emb_model = load_codec(FLAGS.emb_model_path)
-    try:
-        audio_channels = (emb_model.audio_channels if hasattr(emb_model, "audio_channels")
-                          else emb_model.model.audio_channels)
-    except:
-        audio_channels = 1
-
-    if hasattr(emb_model, "sample_rate") and gin.query_parameter("%SR") != emb_model.sample_rate:
-        raise ValueError(f"Codec requires SR = {emb_model.sample_rate}, got {gin.query_parameter('%SR')}")
-
-    dummy = torch.randn(1, audio_channels, 8192)  #.to(device)
-    with torch.no_grad():
-        z = emb_model.encode(dummy)
-    ae_emb_size = z.shape[1]
-    ae_ratio = (emb_model.compression_ratio if hasattr(emb_model, "compression_ratio")
-                else dummy.shape[-1] // z.shape[-1])
-
-    print("using a codec with - compression ratio : ", ae_ratio,
-          " - emb size : ", ae_emb_size)
-
-
     # Resolve DB paths: merge --db_path and --db_folder sub-directories
     db_paths = list(FLAGS.db_path)
     if FLAGS.db_folder is not None:
@@ -183,18 +154,8 @@ def main(argv):
             )
         db_paths += [str(p) for p in subdirs]
 
-    if FLAGS.folder:
-        if gin.query_parameter("%STRUCTURE_TYPE") == "midi":
-            raise ValueError("--folder supports audio/mel conditioning; use paired manifests for MIDI")
-        chunk_size = (gin.query_parameter("%N_SIGNAL") or FLAGS.n_signal) * ae_ratio
-        # Epoch sizing only: online crops are sampled independently of these chunks.
-        for index, folder in enumerate(FLAGS.folder):
-            db_paths.append(index_audio_folder(
-                folder, pathlib.Path(FLAGS.out_path) / FLAGS.name / "datasets" / f"folder_{index:03d}",
-                gin.query_parameter("%SR"), audio_channels, chunk_size))
-
     if not db_paths:
-        raise ValueError("No dataset provided. Use --folder, --db_path or --db_folder.")
+        raise ValueError("No dataset provided. Use --db_path or --db_folder.")
 
     lazy = [is_lazy_waveform_dataset(path) for path in db_paths]
     if any(lazy) and not all(lazy):
@@ -219,6 +180,27 @@ def main(argv):
     
     
     device = resolve_device(FLAGS.device, FLAGS.gpu)
+
+    ######### BUILD MODEL #########
+    emb_model = load_codec(FLAGS.emb_model_path)
+    try:
+        audio_channels = (emb_model.audio_channels if hasattr(emb_model, "audio_channels")
+                          else emb_model.model.audio_channels)
+    except:
+        audio_channels = 1
+
+    if hasattr(emb_model, "sample_rate") and gin.query_parameter("%SR") != emb_model.sample_rate:
+        raise ValueError("SAGE requires SR = 44100")
+
+    dummy = torch.randn(1, audio_channels, 8192)  #.to(device)
+    with torch.no_grad():
+        z = emb_model.encode(dummy)
+    ae_emb_size = z.shape[1]
+    ae_ratio = (emb_model.compression_ratio if hasattr(emb_model, "compression_ratio")
+                else dummy.shape[-1] // z.shape[-1])
+
+    print("using a codec with - compression ratio : ", ae_ratio,
+          " - emb size : ", ae_emb_size)
 
     with gin.unlock_config():
         gin.bind_parameter("diffusion.utils.collate_fn.ae_ratio", ae_ratio)

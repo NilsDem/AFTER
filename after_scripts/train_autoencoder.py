@@ -11,6 +11,7 @@ from after.autoencoder.transforms import PhaseMangle, RandomGain, PitchShift, Ti
 from after.dataset import (CombinedDataset, CombinedLazyWaveformDataset,
                            LazyWaveformDataset, SimpleDataset,
                            is_lazy_waveform_dataset)
+from after.dataset.folder import index_audio_folder
 from after.dataset.lazy_waveform import LAZY_MANIFEST
 from after.utils import resolve_device
 
@@ -28,6 +29,8 @@ flags.DEFINE_string(
     "db_folder", None,
     "Folder containing multiple LMDB databases (one sub-directory per "
     "dataset). Sub-directories are added on top of any --db_path entries.")
+flags.DEFINE_multi_string("folder", [], "Raw audio folders to index for online waveform training without normalization.")
+flags.DEFINE_integer("sr", None, "Override the Gin SR macro (sample rate in Hz).", lower_bound=1)
 flags.DEFINE_multi_float("freqs", None,
                          "Sampling frequencies for multiple datasets.")
 flags.DEFINE_multi_string("config", [], "List of config files")
@@ -263,6 +266,9 @@ def main(argv):
         gin.parse_config_files_and_bindings(
             map(add_gin_extension, FLAGS.config), [])
 
+    if FLAGS.sr is not None:
+        with gin.unlock_config():
+            gin.bind_parameter("%SR", FLAGS.sr)
     sr = gin.query_parameter("%SR")
 
     audio_channels = 1 if not FLAGS.stereo else 2
@@ -391,8 +397,20 @@ def main(argv):
                 raise ValueError(
                     f"--db_folder '{FLAGS.db_folder}' contains no lazy or LMDB datasets.")
 
+    if FLAGS.folder:
+        if force_latent:
+            raise ValueError("--folder supports waveform training only, not latent distillation")
+        folder_paths = [str(pathlib.Path(output_root) / model_name / "datasets" /
+                            f"folder_{index:03d}") for index in range(len(FLAGS.folder))]
+        if rank == 0:
+            for folder, path in zip(FLAGS.folder, folder_paths):
+                index_audio_folder(folder, path, sr, audio_channels, num_signal)
+        if ddp_enabled:
+            torch.distributed.barrier()
+        db_paths += folder_paths
+
     if not db_paths:
-        raise ValueError("No dataset provided. Use --db_path or --db_folder.")
+        raise ValueError("No dataset provided. Use --folder, --db_path or --db_folder.")
 
     # De-duplicate while preserving order.
     db_paths = list(dict.fromkeys(db_paths))
@@ -436,7 +454,7 @@ def main(argv):
                 num_signal=num_signal,
                 sample_rate=sr,
                 audio_channels=audio_channels,
-                split="train",
+                split="train" if use_validation else None,
                 filter=filter_dict,
             ) for path in lazy_paths
         ]
