@@ -20,7 +20,7 @@ REGULARISATION_WEIGHT = 0.0005
 REGULARISATION_WARMUP = 10000
 
 # 4096-sample codec ratio: hop 512 and 8x encoder time downsampling.
-CHANNELS = [32, 32, 64, 64, 64, 128, 128, 128]
+CHANNELS = [32, 32, 64, 64, 128, 128, 128, 256]
 TIME_RATIOS = [1, 2, 2, 1, 1, 1, 1, 1]
 FREQ_RATIOS = [2, 2, 2, 2, 2, 2, 2, 2]
 NFFT = 1024
