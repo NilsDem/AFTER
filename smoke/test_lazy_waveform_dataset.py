@@ -147,3 +147,30 @@ def test_simple_lmdb_dataset_still_loads(tmp_path):
     dataset = SimpleDataset(lmdb_path)
     assert len(dataset) == 1
     assert dataset[0]["waveform"].shape == (1, 128)
+
+
+def test_raw_folder_index_and_online_crop(tmp_path):
+    from after.dataset.folder import index_audio_folder
+    from after.diffusion.online_data import OnlineWaveformDataset, collate_online
+
+    source = tmp_path / "audio" / "nested"
+    source.mkdir(parents=True)
+    audio = np.full(32000, 0.125, dtype=np.float32)
+    sf.write(source / "tone.WAV", audio, 16000, subtype="FLOAT")
+    output = tmp_path / "run" / "datasets" / "folder_000"
+    path = index_audio_folder(source.parent, output, 8000, 1, 800)
+    record = json.loads((output / LAZY_MANIFEST).read_text())
+    assert record["path"] == "nested/tone.WAV"
+    assert record["sample_rate"] == 16000
+    assert "normalization_gain" not in record
+    assert json.loads((output / LAZY_METADATA).read_text())["normalized"] is False
+    dataset = OnlineWaveformDataset(path, n_signal=100, ae_ratio=8,
+                                    sample_rate=8000, structure_type="audio",
+                                    augment=False)
+    batch = collate_online([dataset[0]])
+    assert batch["waveform"].shape == (1, 1, 800)
+    np.testing.assert_allclose(batch["waveform"].numpy()[..., 20:-20], 0.125, atol=1e-4)
+    # Reindex on each launch so newly added files become visible.
+    sf.write(source / "second.wav", audio, 16000)
+    index_audio_folder(source.parent, output, 8000, 1, 800)
+    assert len((output / LAZY_MANIFEST).read_text().splitlines()) == 2

@@ -25,6 +25,7 @@ from tqdm import tqdm
 
 from after.dataset.audio_example import AudioExample
 from after.dataset.lazy_waveform import LAZY_MANIFEST, LAZY_METADATA
+from after.dataset.folder import audio_file_record
 from after.dataset.parsers import get_parser
 from after.dataset.transforms import AudioAugment, AudioDescriptors, BasicPitchPytorch
 from after.utils import resolve_device
@@ -635,13 +636,7 @@ def process_lazy_dataset(input_path, output_path):
             if FLAGS.stereo and info.channels not in (1, 2):
                 raise ValueError(
                     f"stereo mode supports mono or stereo files, not {info.channels} channels")
-            records.append({
-                "path": os.path.relpath(pathlib.Path(file).resolve(), input_root),
-                "num_frames": int(info.frames),
-                "sample_rate": int(info.samplerate),
-                "channels": int(info.channels),
-                "duration": float(info.frames / info.samplerate),
-            })
+            records.append(audio_file_record(file, input_root))
         except Exception as error:
             failures.append((file, error))
 

@@ -299,3 +299,27 @@ audio. `--latent_project=false` avoids the optional LMDB-based timbre-map
 training when the run uses online datasets. V3 can also be scripted directly
 with `torch.jit.script(net)`; call `reset_stream()` before a new sequence or
 changing device, dtype, batch layout, or solver schedule.
+
+### Training directly from audio folders
+
+Pass `--folder` once per source folder to recursively index audio and train
+online without a separate preparation step:
+
+```bash
+python -m after_scripts.train --config=audio_simdino \
+  --folder=/data/audio_a --folder=/data/audio_b \
+  --sr=44100 --name=folder_run
+```
+
+Use your usual codec and SSL options with this command. `--sr` overrides the
+Gin `SR` macro, including on restart; it must remain compatible with the codec
+and any separately configured SSL encoder. Source crops are resampled at load
+time. No peak or loudness normalization is applied and source files are unchanged.
+
+Manifests are rebuilt at startup under `<out_path>/<name>/datasets/folder_000`,
+`folder_001`, etc. Files added during training are indexed on the next launch.
+Existing `--freqs`, `--filter_include`, `--filter_exclude`, and validation options
+apply. Each folder is one dataset; folders can be combined with prepared lazy
+manifests, but not latent LMDBs. Raw folders support audio/mel conditioning;
+MIDI conditioning still requires prepared manifests with explicit MIDI pairs.
+Unreadable files fail indexing with the offending file's SoundFile error.
