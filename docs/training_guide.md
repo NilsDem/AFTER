@@ -321,5 +321,6 @@ Existing `--freqs`, `--filter_include`, `--filter_exclude`, `--stereo`, and
 validation options apply. Each folder is one dataset. In DDP, rank zero indexes
 before all ranks load the manifests. Folders can be combined with prepared lazy
 manifests, but not LMDBs. Raw folders support waveform autoencoder training,
-not latent distillation or `--use_cache`. Unreadable files fail indexing with
-the offending file's SoundFile error.
+not latent distillation or `--use_cache`. Unreadable or empty files are skipped during indexing with a warning and a
+skipped-file count. Indexing fails if no readable files remain. Decode errors
+later during waveform loading use the existing logged silence fallback.

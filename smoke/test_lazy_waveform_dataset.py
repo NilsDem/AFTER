@@ -174,3 +174,31 @@ def test_raw_folder_index_and_online_crop(tmp_path):
     sf.write(source / "second.wav", audio, 16000)
     index_audio_folder(source.parent, output, 8000, 1, 800)
     assert len((output / LAZY_MANIFEST).read_text().splitlines()) == 2
+
+
+def test_folder_index_skips_bad_files(tmp_path, caplog):
+    from after.dataset.folder import index_audio_folder
+
+    source = tmp_path / "audio"
+    source.mkdir()
+    sf.write(source / "good.wav", np.full(1600, 0.125), 8000)
+    sf.write(source / "empty.wav", np.empty(0), 8000)
+    (source / "bad.mp3").write_bytes(b"invalid audio data")
+    output = tmp_path / "index"
+    index_audio_folder(source, output, 8000, 1, 800)
+    records = [json.loads(line) for line in (output / LAZY_MANIFEST).read_text().splitlines()]
+    assert [record["path"] for record in records] == ["good.wav"]
+    assert "bad.mp3" in caplog.text
+    assert "empty.wav" in caplog.text
+    batch = LazyWaveformDataset(output, 800, 8000)[0]
+    assert batch["waveform"].shape == (1, 800)
+    assert "audio_load_error" not in batch["metadata"]
+
+
+def test_folder_index_rejects_all_bad_files(tmp_path):
+    import pytest
+    from after.dataset.folder import index_audio_folder
+
+    (tmp_path / "bad.mp3").write_bytes(b"invalid audio data")
+    with pytest.raises(ValueError, match="No readable audio files.*1 skipped"):
+        index_audio_folder(tmp_path, tmp_path / "index", 8000, 1, 800)
