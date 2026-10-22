@@ -324,3 +324,7 @@ manifests, but not LMDBs. Raw folders support waveform autoencoder training,
 not latent distillation or `--use_cache`. Unreadable or empty files are skipped during indexing with a warning and a
 skipped-file count. Indexing fails if no readable files remain. Decode errors
 later during waveform loading use the existing logged silence fallback.
+
+The startup dataset summary shows source folder names and indexed audio duration
+in `HH:MM:SS` and hours, plus totals. Durations precede filtering and splitting;
+they are header-based source durations, not the usable crop weights for balancing.

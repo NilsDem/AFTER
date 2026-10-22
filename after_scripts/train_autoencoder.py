@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import cached_conv as cc
 import gin
+import json
 import os
 import pathlib
 
@@ -12,7 +13,7 @@ from after.dataset import (CombinedDataset, CombinedLazyWaveformDataset,
                            LazyWaveformDataset, SimpleDataset,
                            is_lazy_waveform_dataset)
 from after.dataset.folder import index_audio_folder
-from after.dataset.lazy_waveform import LAZY_MANIFEST
+from after.dataset.lazy_waveform import LAZY_MANIFEST, LAZY_METADATA
 from after.utils import resolve_device
 
 from absl import app, flags
@@ -224,6 +225,43 @@ def make_collate_fn(num_signal,
     return collate_fn
 
 
+def report_datasets(paths):
+    """Report indexed source audio duration, before filtering and splitting."""
+    print("\n=== Datasets (indexed audio, before filters/split) ===")
+    total_entries = 0
+    total_duration = 0.
+    has_duration = False
+    for path in map(pathlib.Path, paths):
+        name = path.name
+        source = path
+        if is_lazy_waveform_dataset(path):
+            with (path / LAZY_METADATA).open(encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            source = (path / metadata["source_root"]).resolve()
+            name = source.name
+            with (path / LAZY_MANIFEST).open(encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+            count = len(records)
+            duration = sum(record["duration"] for record in records)
+            total_duration += duration
+            has_duration = True
+            seconds = round(duration)
+            duration_text = f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+            label = f"{count:>7,} files    {duration_text} ({duration / 3600:.2f} h)"
+        else:
+            count = len(SimpleDataset(path=str(path)))
+            label = f"{count:>7,} entries  duration unavailable"
+        total_entries += count
+        print(f"  {name:<40} {label}  [{source}]")
+    total_label = f"{total_entries:>7,} files/entries"
+    if has_duration:
+        seconds = round(total_duration)
+        total_label += (f"    {seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+                        f" ({total_duration / 3600:.2f} h indexed audio)")
+    print(f"  {'TOTAL':<40} {total_label}")
+    print("================\n")
+
+
 def main(argv):
     model_name = FLAGS.name
     output_root = FLAGS.out_path
@@ -415,22 +453,8 @@ def main(argv):
     # De-duplicate while preserving order.
     db_paths = list(dict.fromkeys(db_paths))
 
-    print("\n=== Datasets ===")
-    total_entries = 0
-    for p in db_paths:
-        if is_lazy_waveform_dataset(p):
-            with open(pathlib.Path(p) / LAZY_MANIFEST,
-                      encoding="utf-8") as handle:
-                n = sum(1 for line in handle if line.strip())
-            label = f"  {n:>7,} files (lazy)"
-        else:
-            n = len(SimpleDataset(path=p))
-            label = f"  {n:>7,} entries"
-        print(f"  {pathlib.Path(p).name:<40} {label}  [{p}]")
-        if n > 0:
-            total_entries += n
-    print(f"  {'TOTAL':<40}   {total_entries:>7,} files/entries")
-    print("================\n")
+    if rank == 0:
+        report_datasets(db_paths)
 
     filter_dict = {
         "include": FLAGS.filter_include,

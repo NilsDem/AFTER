@@ -202,3 +202,21 @@ def test_folder_index_rejects_all_bad_files(tmp_path):
     (tmp_path / "bad.mp3").write_bytes(b"invalid audio data")
     with pytest.raises(ValueError, match="No readable audio files.*1 skipped"):
         index_audio_folder(tmp_path, tmp_path / "index", 8000, 1, 800)
+
+
+def test_dataset_report_uses_source_name_and_duration(tmp_path, capsys):
+    from after.dataset.folder import index_audio_folder
+    from after_scripts.train_autoencoder import report_datasets
+
+    source = tmp_path / "synth"
+    source.mkdir()
+    sf.write(source / "tone.wav", np.zeros(16000), 8000)
+    manifest = index_audio_folder(source, tmp_path / "folder_000", 8000, 1, 800)
+    capsys.readouterr()
+    report_datasets([manifest])
+    report = capsys.readouterr().out
+    assert "synth" in report
+    assert "folder_000" not in report
+    assert "00:00:02" in report
+    assert "TOTAL" in report
+    assert "before filters/split" in report
