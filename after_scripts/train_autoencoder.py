@@ -389,7 +389,7 @@ def main(argv):
     ## TRANSFORMS
     transforms = [
         PhaseMangle(p=0.8),
-        RandomGain(db=20, p=0.8),
+        RandomGain(db=20, p=0.3),
     ]
 
     if FLAGS.use_psts:

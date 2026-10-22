@@ -16,22 +16,22 @@ TIME_SIZE = 131072
 FREEZE_ENCODER_STEPS = %WARMUP_STEPS
 WARMUP_STEPS = 100000
 MAX_STEPS = 5000000
-REGULARISATION_WEIGHT = 0.0005
+REGULARISATION_WEIGHT = 0.0001
 REGULARISATION_WARMUP = 10000
 
 # 4096-sample codec ratio: hop 512 and 8x encoder time downsampling.
 CHANNELS = [32, 32, 64, 64, 128, 128, 128, 256]
-TIME_RATIOS = [1, 2, 2, 1, 1, 1, 1, 1]
+TIME_RATIOS = [1, 2, 2, 2, 1, 1, 1, 1]
 FREQ_RATIOS = [2, 2, 2, 2, 2, 2, 2, 2]
 NFFT = 1024
-HOP = 256
+HOP = 128
 KERNEL_SIZE = 3
 
 audio.CausalMauerSTFT:
     nfft = %NFFT
     hop_size = %HOP
-    synthesis_length = 512
-    zero_length = 0
+    synthesis_length = 256
+    zero_length = 128
     skip_features = -1
     normalize = True
 
