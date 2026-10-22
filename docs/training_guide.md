@@ -161,8 +161,9 @@ training schedule, then starts diffusion at step zero. Add `--skip_ssl` to skip
 SSL pretraining and train diffusion with a randomly initialized ECAPA built from
 the same config. `midi_simdinov2.gin` contains neither ECAPA architecture nor SSL
 training settings. Older configs retain their legacy inline SimDino path.
-`train_ssl.py --evaluate_sol=false` disables the optional SOL probe when its
-dataset is unavailable; configured inline pretraining does not run that probe.
+The SOL probe is disabled by default in `train_ssl.py`. Pass `--evaluate_sol=true`
+to enable it when the SOL dataset is available; configured inline pretraining
+does not run that probe.
 
 `midi_simdinov2.gin` uses `DenoiserV3` and MeanFlow. Its raw MIDI has four frames
 per codec latent (`compress_tc=4`): a 256-sample hop with a 1024-hop codec.

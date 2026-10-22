@@ -14,13 +14,13 @@ LATENT_SIZE = 32
 TIME_SIZE = 131072
 
 FREEZE_ENCODER_STEPS = %WARMUP_STEPS
-WARMUP_STEPS = 200000
-MAX_STEPS = 1000000
-REGULARISATION_WEIGHT = 0.001
-REGULARISATION_WARMUP = 25000
+WARMUP_STEPS = 100000
+MAX_STEPS = 5000000
+REGULARISATION_WEIGHT = 0.0005
+REGULARISATION_WARMUP = 10000
 
 # 4096-sample codec ratio: hop 512 and 8x encoder time downsampling.
-CHANNELS = [16, 32, 64, 64, 64, 128, 128, 256]
+CHANNELS = [32, 32, 64, 64, 64, 128, 128, 128]
 TIME_RATIOS = [1, 2, 2, 1, 1, 1, 1, 1]
 FREQ_RATIOS = [2, 2, 2, 2, 2, 2, 2, 2]
 NFFT = 1024
@@ -30,7 +30,7 @@ KERNEL_SIZE = 3
 audio.CausalMauerSTFT:
     nfft = %NFFT
     hop_size = %HOP
-    synthesis_length = None
+    synthesis_length = 512
     zero_length = 0
     skip_features = -1
     normalize = True
@@ -86,4 +86,4 @@ autoencoder.trainer.Trainer.fit:
     rec_loss_decay = 1.0
     weight_regularisation_loss = %REGULARISATION_WEIGHT
     warmup_regularisation_loss = %REGULARISATION_WARMUP
-    look_ahead_steps = 0
+    look_ahead_steps = 1

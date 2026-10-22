@@ -18,7 +18,8 @@ from after.utils import resolve_device
 
 
 FLAGS = flags.FLAGS
-flags.DEFINE_bool("evaluate_sol", True, "Run the SOL representation probe during training.")
+flags.DEFINE_bool("evaluate_sol", False,
+                  "Run the SOL representation probe during training (requires the SOL dataset).")
 flags.DEFINE_string("name", "ssl", "Name of the SSL run.")
 flags.DEFINE_string("out_path", "./ssl_runs", "Output directory.")
 flags.DEFINE_multi_string("config", None, "Gin configuration file.",
