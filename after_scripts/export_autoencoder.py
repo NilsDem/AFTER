@@ -78,6 +78,19 @@ class ExportedAutoencoder(nn_tilde.Module):
                              output_labels=audio_outputs,
                              test_buffer_size=self.comp_ratio)
 
+    def export_to_ts(self, path):
+        scripted = torch.jit.script(self.eval())
+        # Specialize interpolation modes before saving: recent Torch versions
+        # otherwise serialize unused branches with operators absent in nn~'s
+        # older LibTorch (for example _upsample_lanczos2d_aa).
+        preserved = list(scripted._c._method_names())
+        for method in self.get_methods():
+            preserved.extend([f"{method}_params", f"{method}_input_labels",
+                              f"{method}_output_labels"])
+        for attribute in scripted.get_attributes():
+            preserved.append(f"{attribute}_params")
+        torch.jit.freeze(scripted, preserved_attrs=preserved).save(path)
+
     @torch.jit.export
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         if self.streaming:
