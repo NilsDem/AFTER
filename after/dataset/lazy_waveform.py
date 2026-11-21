@@ -71,6 +71,13 @@ class LazyWaveformDataset(torch.utils.data.Dataset):
 
         filters = filter or {"include": [], "exclude": []}
         files = [record for record in files if self._matches_filter(record, filters)]
+        # Drop files too short for one crop *before* splitting, otherwise the
+        # small validation split can end up made only of unusable files.
+        files = [
+            record for record in files
+            if record["num_frames"] >= self.source_crop_frames(
+                record["sample_rate"])
+        ]
         files = self._split_files(files, split, validation_size)
 
         source_root = (Path(self.path) / self.metadata["source_root"]).resolve()
